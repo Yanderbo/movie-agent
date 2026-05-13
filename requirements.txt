@@ -1,0 +1,13 @@
+pydantic>=2.0
+python-dotenv
+requests
+scenedetect[opencv]
+opencv-python
+insightface
+onnxruntime
+numpy
+scikit-learn
+
+# 可选：向量检索索引（推荐安装以获得最佳检索效果）
+# pip install faiss-cpu
+# faiss-cpu
