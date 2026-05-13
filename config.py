@@ -19,7 +19,7 @@ EDITPLANS_DIR = DATA_DIR / "editplans"
 RENDERS_DIR = DATA_DIR / "renders"
 
 # ─── LLM API 配置（中转 API，OpenAI 兼容格式） ─────────────
-LLM_API_KEY = os.getenv("LLM_API_KEY", "sk-4PuajBlBMr71SnM7jeem2WgCe56ZiRtmrzP3NMTJLkS")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_API_BASE = os.getenv("LLM_API_BASE", "https://live-turing.cn.llm.tcljd.com/api/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "turing/gemini-3.1-flash-lite-latest")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "300"))
