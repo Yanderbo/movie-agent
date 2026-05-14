@@ -7,14 +7,14 @@
 
 | 文件 | 涵盖模块 | 内容 |
 |------|----------|------|
-| [01_pipeline_understand.md](01_pipeline_understand.md) | `understand.py` + 10 个子模块 | 理解流水线 10 步详解、数据流、断点续跑 |
-| [02_models_schemas.md](02_models_schemas.md) | `schemas.py` | 所有 Pydantic 数据模型定义、字段说明、向后兼容性 |
+| [01_pipeline_understand.md](01_pipeline_understand.md) | `understand.py` + 14 个子模块 | 理解流水线 14 步详解、叙事层级、数据流、断点续跑 |
+| [02_models_schemas.md](02_models_schemas.md) | `schemas.py` | 所有 Pydantic 数据模型定义（含 v2 新增：Shot/Beat/StoryScene/EventGraph/EditSignal/CharacterDeep） |
 | [03_search_engine.md](03_search_engine.md) | `search.py` | 三层漏斗检索详解（Embedding + 关键词 + LLM Reranker） |
 | [04_director_agent.md](04_director_agent.md) | `director.py` + `prompts.py` | Director Agent 短视频/长视频规划、证据填充、Prompt 设计 |
 | [05_reviewer_agent.md](05_reviewer_agent.md) | `reviewer.py` | Reviewer Agent 三层校验（规则 + Grounding + LLM）、评分逻辑 |
 | [06_render_engine.md](06_render_engine.md) | `engine.py` + `validator.py` + `ffmpeg_ops.py` | 渲染 5 步流水线、FFmpeg 操作封装 |
 | [07_utils.md](07_utils.md) | `llm_client.py` + `ffmpeg_utils.py` + `logger.py` | LLM 客户端、FFmpeg 工具、日志系统 |
-| [08_store_cli_config.md](08_store_cli_config.md) | `store.py` + `main.py` + `config.py` | 存储层、命令行接口、全局配置、目录结构 |
+| [08_store_cli_config.md](08_store_cli_config.md) | `store.py` + `main.py` + `config.py` | 存储层（v2 多层结构）、命令行接口、全局配置、目录结构 |
 
 ---
 
@@ -22,21 +22,23 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                         UNDERSTAND 阶段                                 │
+│                         UNDERSTAND 阶段（14步）                          │
 │                                                                         │
 │  video.mp4                                                              │
 │    ├─[1 ingest]──→ meta.json                                           │
-│    ├─[2 scene_detect]──→ scenes.json  ◄─── 时间轴锚点                   │
-│    ├─[3 keyframe]──→ keyframes/*.jpg                                    │
-│    ├─[4 asr]──→ transcripts.json  (每条带 scene_index)                  │
-│    ├─[5 vision]──→ ocr.json + vision.json                              │
-│    ├─[6 character]──→ characters.json                                   │
+│    ├─[2 shot_detect]──→ scenes.json  ◄─── 时间轴锚点                   │
+│    ├─[3 multi_keyframe]──→ keyframes/*_f0~f5.jpg (多帧)                │
+│    ├─[4 asr_windowed]──→ transcripts.json  (长窗口ASR + 回填shot)      │
+│    ├─[5 vision]──→ ocr.json + vision.json (多帧画面理解)               │
+│    ├─[6 character_deep]──→ characters.json (CharacterDeep)             │
 │    ├─[7 speaker_bind]──→ speaker_map.json                              │
-│    │    + 更新 transcripts (character_id) + characters (speaker_ids)    │
-│    ├─[8 event]──→ events.json  (每个带 scene_indices)                   │
-│    ├─[9 memory_builder]──→ memory.json                                  │
-│    │    含 MemoryUnit[] + 角色判定 (role)                               │
-│    └─[10 indexer]──→ search_index.json + faiss.index + id_map.json     │
+│    ├─[8 beat_detect]──→ beats.json  (shot → beat 聚合)                 │
+│    ├─[9 story_scene_detect]──→ story_scenes.json (beat → scene 聚合)   │
+│    ├─[10 event_graph]──→ events.json + event_graph.json (含关系边)     │
+│    ├─[11 character_arc]──→ character_arcs.json + character_relations   │
+│    ├─[12 edit_signal]──→ edit_signals.json (8维剪辑信号)               │
+│    ├─[13 build_memory]──→ memory.json (三层MemoryUnit + 角色判定)      │
+│    └─[14 indexer]──→ index/ (7种索引文件)                              │
 │                                                                         │
 └──────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -51,6 +53,8 @@
 │         │                                                               │
 │         └──→ SearchResult[] (含 matched_modalities + source_refs)       │
 │                                                                         │
+│  v2 新增索引维度: 角色/事件/关系/情绪/剪辑信号                            │
+│                                                                         │
 └──────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -58,7 +62,7 @@
 │                         EDIT 阶段                                       │
 │                                                                         │
 │  Director Agent                                                         │
-│    ├─ 构造候选信息 Prompt（含多模态融合文本 + 证据来源）                     │
+│    ├─ 构造候选信息 Prompt（含多模态融合文本 + 证据来源 + EditSignal）       │
 │    ├─ LLM 生成 clips JSON                                              │
 │    ├─ 解析 + 白名单校验 + 证据自动填充                                    │
 │    └─ Reviewer Agent 审核                                               │
@@ -94,27 +98,35 @@
 
 ## 关键设计决策
 
-### 1. 先切后提
+### 1. 先切后提 → 层层聚合
 
 > 所有模态数据必须以 `scene_index` 为锚点，不允许仅依赖时间戳模糊匹配。
 
-ASR 不再整体提取音频后整体转写，而是先切分镜头，再按 shot 段提取音频并转写。这保证每条 `TranscriptSegment` 天然携带 `scene_index`。
+v2 在此基础上增加了 **层层聚合** 原则：shot → beat → story_scene 逐级构建更高层叙事单元。每个层级都有对应的 MemoryUnit。
 
-### 2. MemoryUnit 多模态融合
+### 2. 多层 MemoryUnit
 
-> 检索的最小单元是 MemoryUnit，而非单一模态的 list。
+> 检索不再局限于 shot 级别，可在 shot / beat / story_scene 三个粒度上进行。
 
-MemoryUnit 将一个 shot 内的所有信息（台词、画面、OCR、人物、事件）融合为一个对象，配合预计算的 `combined_text` 和 `embedding` 实现一站式检索。
+| 层级 | 模型 | 粒度 | 典型用途 |
+|------|------|------|---------|
+| Shot | `MemoryUnit` | 单个镜头 | 精确片段定位 |
+| Beat | `BeatMemoryUnit` | 叙事微单元 | 情节片段检索 |
+| StoryScene | `SceneMemoryUnit` | 完整场景 | 场景级别匹配 |
 
-### 3. 证据驱动的 EditPlan
+### 3. EditSignal 驱动的剪辑决策
+
+> 不再仅凭 "相关性" 选择片段，而是综合 8 维剪辑信号做出更专业的选择。
+
+EditSignal 为 Director Agent 提供了量化的选材依据：哪些片段适合做开头（hook_score）、哪些不能剧透（spoiler_level）、哪些可以独立剪出（independence_score）。
+
+### 4. 证据驱动的 EditPlan
 
 > Director 不允许自造片段，每个 EditClip 必须有 `evidence_refs`。
 
-- Director 的候选列表由 search 系统提供，Prompt 明确要求只能从候选中选择
-- `_parse_editplan()` 自动从 SearchResult 填充证据字段
-- Reviewer 的 Grounding 校验确保证据链完整
+v2 新增 `edit_signal_ref` / `source_beat_index` / `source_story_scene_index` 字段，进一步强化证据链。
 
-### 4. 容错与降级
+### 5. 容错与降级
 
 全系统设计了多层 fallback：
 
@@ -123,10 +135,14 @@ MemoryUnit 将一个 shot 内的所有信息（台词、画面、OCR、人物、
 | InsightFace 不可用 | Gemini Vision 替代人脸检测 |
 | FAISS 不可用 | 跳过 Embedding 检索层 |
 | Embedding API 不可用 | 跳过向量索引 |
-| LLM Reranker 失败 | 使用 Layer 2 关键词结果 |
+| Beat 检测 LLM 失败 | 每 4 shot 一组默认分组 |
+| StoryScene 检测 LLM 失败 | 每 3 beat 一组默认分组 |
+| 事件关系推理 LLM 失败 | 返回空边列表（仅保留事件节点） |
+| 人物弧线 LLM 失败 | 跳过弧线，保留基础人物信息 |
+| 剪辑信号 LLM 失败 | 跳过该批次，不阻塞流程 |
 | LLM 角色判定失败 | 按出镜时长排序自动分配 |
 | LLM 审核失败 | 仅使用规则审核结果 |
 
-### 5. 断点续跑
+### 6. 断点续跑
 
-每步完成后在 `progress.json` 打标记。恢复时自动跳到第一个未完成的步骤。子模块内部也有输出文件存在性检查。
+每步完成后在 `progress.json` 打标记。恢复时自动跳到第一个未完成的步骤。v2 通过 `_STEP_ALIASES` 映射旧步骤名（如 `scene_detect` → `shot_detect`），确保旧进度文件可正常续跑。

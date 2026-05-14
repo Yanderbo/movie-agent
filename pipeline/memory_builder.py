@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-MemoryUnit 构建 & 角色判定
+多层 MemoryUnit 构建 & 角色判定（v2）
 
-- build_memory_units(): 将各模态数据按 scene_index 融合为 MemoryUnit 列表
-- assign_character_roles(): 调用 LLM 判定业务角色（male_lead / female_lead / villain / ...）
+v2 变更:
+- 从单一 shot-level MemoryUnit 升级为三层: shot / beat / story_scene
+- MemoryUnit 携带 edit_signal 引用
+- combined_text 包含剪辑信号摘要
+- 角色判定增加 importance_score 参考
 """
 import json
 from collections import defaultdict
 
 import config
 from models.schemas import (
-    Scene, TranscriptSegment, OCRResult, VisionSummary,
-    Character, Event, MemoryUnit,
+    Shot, Beat, StoryScene, TranscriptSegment, OCRResult, VisionSummary,
+    Character, CharacterDeep, Event, EventGraph, EditSignal,
+    MemoryUnit, BeatMemoryUnit, SceneMemoryUnit,
 )
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
@@ -45,26 +49,31 @@ ROLE_PROMPT_TEMPLATE = """你是一个专业的影视分析师。请根据以下
 
 
 def build_memory_units(
-    scenes: list[Scene],
+    shots: list[Shot],
     transcripts: list[TranscriptSegment],
     ocr_results: list[OCRResult],
     vision_summaries: list[VisionSummary],
     characters: list[Character],
     events: list[Event],
+    beats: list[Beat] = None,
+    story_scenes: list[StoryScene] = None,
+    edit_signals: list[EditSignal] = None,
 ) -> list[MemoryUnit]:
     """
-    将各模态数据按 scene_index 融合为 MemoryUnit 列表。
+    将各模态数据按 shot 融合为 MemoryUnit 列表。
 
-    每个 MemoryUnit 对应一个 scene，汇聚了该 shot 内的所有模态信息，
-    并生成 combined_text 用于后续 embedding。
+    v2: 同时关联 beat_index / story_scene_index / edit_signal。
 
     Args:
-        scenes: 镜头列表
+        shots: 镜头列表
         transcripts: 台词列表（已带 scene_index）
         ocr_results: OCR 结果列表
         vision_summaries: 画面摘要列表
         characters: 人物列表
         events: 事件列表
+        beats: Beat 列表（可选）
+        story_scenes: StoryScene 列表（可选）
+        edit_signals: EditSignal 列表（可选）
 
     Returns:
         MemoryUnit 列表
@@ -76,7 +85,7 @@ def build_memory_units(
             trans_by_scene[t.scene_index].append(t)
         else:
             # 旧数据可能没有 scene_index，用时间反查
-            for s in scenes:
+            for s in shots:
                 if s.start_time <= t.start_time < s.end_time:
                     trans_by_scene[s.scene_index].append(t)
                     break
@@ -97,17 +106,24 @@ def build_memory_units(
     # 事件与 scene 的关联：事件时间段与 scene 时间段有重叠
     events_by_scene = defaultdict(list)
     for e in events:
-        for s in scenes:
+        for s in shots:
             if e.start_time < s.end_time and e.end_time > s.start_time:
                 events_by_scene[s.scene_index].append(e)
                 # 同时更新 event 的 scene_indices
                 if s.scene_index not in e.scene_indices:
                     e.scene_indices.append(s.scene_index)
 
+    # EditSignal 索引
+    signal_by_shot = {}
+    if edit_signals:
+        for sig in edit_signals:
+            if sig.unit_type == "shot":
+                signal_by_shot[sig.unit_index] = sig
+
     # 构建 MemoryUnit
     memory_units = []
-    for scene in scenes:
-        si = scene.scene_index
+    for shot in shots:
+        si = shot.scene_index
 
         scene_trans = trans_by_scene.get(si, [])
         scene_vision = vision_by_scene.get(si)
@@ -132,6 +148,8 @@ def build_memory_units(
                 text_parts.append(f"类型: {scene_vision.scene_type}")
             if scene_vision.objects:
                 text_parts.append(f"物体: {', '.join(scene_vision.objects)}")
+            if scene_vision.action_description:
+                text_parts.append(f"动作: {scene_vision.action_description}")
 
         # OCR
         if scene_ocr and scene_ocr.texts:
@@ -147,12 +165,14 @@ def build_memory_units(
 
         combined_text = " | ".join(text_parts)
 
+        signal = signal_by_shot.get(si)
+
         unit = MemoryUnit(
             scene_index=si,
-            start_time=scene.start_time,
-            end_time=scene.end_time,
-            duration=scene.duration,
-            keyframe_path=scene.keyframe_path,
+            start_time=shot.start_time,
+            end_time=shot.end_time,
+            duration=shot.duration,
+            keyframe_path=shot.keyframe_path,
             transcripts=scene_trans,
             vision=scene_vision,
             ocr=scene_ocr,
@@ -160,11 +180,149 @@ def build_memory_units(
             events=scene_events,
             combined_text=combined_text,
             embedding=[],  # 在 indexer 步骤中填充
+            beat_index=shot.beat_index,
+            story_scene_index=shot.story_scene_index,
+            edit_signal=signal,
         )
         memory_units.append(unit)
 
-    logger.info(f"MemoryUnit 构建完成: {len(memory_units)} 个单元")
+    logger.info(f"Shot MemoryUnit 构建完成: {len(memory_units)} 个单元")
     return memory_units
+
+
+def build_beat_memory_units(
+    beats: list[Beat],
+    shots: list[Shot],
+    transcripts: list[TranscriptSegment],
+    vision_summaries: list[VisionSummary],
+    edit_signals: list[EditSignal] = None,
+) -> list[BeatMemoryUnit]:
+    """构建 Beat 级别的 MemoryUnit"""
+    if not beats:
+        return []
+
+    trans_by_scene = defaultdict(list)
+    for t in transcripts:
+        if t.scene_index >= 0:
+            trans_by_scene[t.scene_index].append(t)
+    vision_by_scene = {v.scene_index: v for v in vision_summaries}
+
+    signal_by_beat = {}
+    if edit_signals:
+        for sig in edit_signals:
+            if sig.unit_type == "beat":
+                signal_by_beat[sig.unit_index] = sig
+
+    beat_units = []
+    for beat in beats:
+        # 聚合台词
+        all_trans = []
+        for si in beat.shot_indices:
+            all_trans.extend(trans_by_scene.get(si, []))
+        trans_summary = " ".join([t.text for t in all_trans[:10]])
+
+        # 聚合画面
+        vision_parts = []
+        for si in beat.shot_indices:
+            v = vision_by_scene.get(si)
+            if v:
+                vision_parts.append(v.description[:50])
+
+        # combined_text
+        parts = []
+        if beat.description:
+            parts.append(f"节拍: {beat.description}")
+        if beat.beat_type:
+            parts.append(f"类型: {beat.beat_type}")
+        if trans_summary:
+            parts.append(f"台词: {trans_summary[:200]}")
+        if vision_parts:
+            parts.append(f"画面: {'; '.join(vision_parts[:5])}")
+        if beat.emotion:
+            parts.append(f"情绪: {beat.emotion}")
+        if beat.characters:
+            parts.append(f"人物: {', '.join(beat.characters)}")
+
+        bmu = BeatMemoryUnit(
+            beat_index=beat.beat_index,
+            start_time=beat.start_time,
+            end_time=beat.end_time,
+            duration=beat.duration,
+            shot_indices=beat.shot_indices,
+            beat_type=beat.beat_type,
+            description=beat.description,
+            emotion=beat.emotion,
+            intensity=beat.intensity,
+            characters=beat.characters,
+            transcript_summary=trans_summary[:500],
+            combined_text=" | ".join(parts),
+            edit_signal=signal_by_beat.get(beat.beat_index),
+        )
+        beat_units.append(bmu)
+
+    logger.info(f"Beat MemoryUnit 构建完成: {len(beat_units)} 个单元")
+    return beat_units
+
+
+def build_scene_memory_units(
+    story_scenes: list[StoryScene],
+    beats: list[Beat],
+    edit_signals: list[EditSignal] = None,
+) -> list[SceneMemoryUnit]:
+    """构建 StoryScene 级别的 MemoryUnit"""
+    if not story_scenes:
+        return []
+
+    signal_by_scene = {}
+    if edit_signals:
+        for sig in edit_signals:
+            if sig.unit_type == "story_scene":
+                signal_by_scene[sig.unit_index] = sig
+
+    beat_map = {b.beat_index: b for b in beats} if beats else {}
+
+    scene_units = []
+    for ss in story_scenes:
+        # 聚合 beat 信息
+        beat_descs = []
+        all_chars = set()
+        for bi in ss.beat_indices:
+            b = beat_map.get(bi)
+            if b:
+                if b.description:
+                    beat_descs.append(f"[{b.beat_type}] {b.description}")
+                all_chars.update(b.characters)
+
+        parts = []
+        if ss.description:
+            parts.append(f"场景: {ss.description}")
+        if ss.location:
+            parts.append(f"地点: {ss.location}")
+        if ss.plot_function:
+            parts.append(f"功能: {ss.plot_function}")
+        if beat_descs:
+            parts.append(f"节拍: {'; '.join(beat_descs[:5])}")
+        if ss.characters:
+            parts.append(f"人物: {', '.join(ss.characters)}")
+
+        smu = SceneMemoryUnit(
+            story_scene_index=ss.story_scene_index,
+            start_time=ss.start_time,
+            end_time=ss.end_time,
+            duration=ss.duration,
+            beat_indices=ss.beat_indices,
+            shot_indices=ss.shot_indices,
+            location=ss.location,
+            description=ss.description,
+            characters=ss.characters or sorted(all_chars),
+            plot_function=ss.plot_function,
+            combined_text=" | ".join(parts),
+            edit_signal=signal_by_scene.get(ss.story_scene_index),
+        )
+        scene_units.append(smu)
+
+    logger.info(f"StoryScene MemoryUnit 构建完成: {len(scene_units)} 个单元")
+    return scene_units
 
 
 def assign_character_roles(
@@ -209,9 +367,13 @@ def assign_character_roles(
     char_lines = []
     for c in characters:
         screen_pct = (c.total_screen_time / video_duration * 100) if video_duration > 0 else 0
+        importance = ""
+        if hasattr(c, "importance_score"):
+            importance = f"重要性: {c.importance_score:.2f}, "
         char_lines.append(
             f"- {c.character_id} ({c.display_name}): {c.description}\n"
             f"  出镜: {c.total_screen_time:.0f}s ({screen_pct:.1f}%), "
+            f"{importance}"
             f"台词: {char_transcript_count.get(c.character_id, 0)}句, "
             f"事件: {char_event_count.get(c.character_id, 0)}个 "
             f"(重要事件: {char_important_event_count.get(c.character_id, 0)}个)"

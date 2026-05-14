@@ -45,6 +45,10 @@ KEYFRAME_QUALITY = int(os.getenv("KEYFRAME_QUALITY", "2"))  # FFmpeg -qscale:v
 
 # ─── ASR 参数 ─────────────────────────────────────────────────
 ASR_CHUNK_DURATION = int(os.getenv("ASR_CHUNK_DURATION", "600"))  # 音频分段长度（秒）
+ASR_WINDOW_DURATION = int(os.getenv("ASR_WINDOW_DURATION", "300"))  # 长窗口 ASR 窗口(秒)
+
+# ─── 多帧采样参数 ─────────────────────────────────────────────
+MULTI_KEYFRAME_MAX = int(os.getenv("MULTI_KEYFRAME_MAX", "6"))  # 每个 shot 最大采样帧数
 
 # ─── 日志配置 ─────────────────────────────────────────────────
 LOG_DIR = Path(os.getenv("LOG_DIR", str(PROJECT_ROOT / "logs")))

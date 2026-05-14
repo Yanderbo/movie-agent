@@ -1,22 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-检索索引构建（重构版）
+多维检索索引构建（v2）
 
-基于 MemoryUnit 构建检索索引：
+基于多层 MemoryUnit 构建检索索引：
 1. 文本索引（关键词 + 2-gram）— 兼容旧逻辑
 2. Embedding 向量索引 — 调用 Embedding API 为每个 MemoryUnit 生成向量
 3. FAISS 本地向量索引 — 用于快速近似最近邻检索
+4. 角色索引 — character_id → shot/beat 列表
+5. 事件索引 — event_type → event + 关联 shot 列表
+6. 关系索引 — (char_a, char_b) → 互动 shot 列表
+7. 情绪索引 — emotion → shot 列表 (按 intensity 排序)
+8. 剪辑信号索引 — signal_type → top-N unit 列表
 
 输出：
 - search_index.json: 文本索引（向后兼容）
 - memory_units.json: 带 embedding 的 MemoryUnit 列表
 - faiss.index: FAISS 向量索引文件
 - id_map.json: FAISS index → scene_index 映射
+- character_index.json: 角色索引
+- event_index.json: 事件索引
+- relation_index.json: 关系索引
+- emotion_index.json: 情绪索引
+- edit_signal_index.json: 剪辑信号索引
 """
 import json
 import time
 import numpy as np
 from pathlib import Path
+from collections import defaultdict
 
 import config
 from memory.store import load_memory
@@ -35,17 +46,18 @@ except ImportError:
 
 def build_search_index(video_id: str) -> str:
     """
-    为指定视频构建检索索引。
+    为指定视频构建多维检索索引。
 
     1. 构建传统文本索引 (search_index.json)
     2. 为每个 MemoryUnit 生成 embedding
     3. 构建 FAISS 向量索引
+    4. 构建角色/事件/关系/情绪/剪辑信号索引
 
     Args:
         video_id: 视频 ID
 
     Returns:
-        索引文件路径
+        索引目录路径
     """
     memory = load_memory(video_id)
 
@@ -58,15 +70,36 @@ def build_search_index(video_id: str) -> str:
     # ════ Part 2: Embedding + FAISS 索引 ════
     _build_embedding_index(memory, index_dir)
 
-    return str(text_index_path)
+    # ════ Part 3: 角色索引 ════
+    _build_character_index(memory, index_dir)
 
+    # ════ Part 4: 事件索引 ════
+    _build_event_index(memory, index_dir)
+
+    # ════ Part 5: 关系索引 ════
+    _build_relation_index(memory, index_dir)
+
+    # ════ Part 6: 情绪索引 ════
+    _build_emotion_index(memory, index_dir)
+
+    # ════ Part 7: 剪辑信号索引 ════
+    _build_edit_signal_index(memory, index_dir)
+
+    return str(index_dir)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Part 1: 文本索引
+# ═══════════════════════════════════════════════════════════════
 
 def _build_text_index(memory, index_dir: Path) -> Path:
     """构建文本搜索索引（向后兼容旧格式）"""
     index_path = index_dir / "search_index.json"
     entries = []
 
-    for scene in memory.scenes:
+    scenes = memory.shots or memory.scenes or []
+
+    for scene in scenes:
         # 从 MemoryUnit 获取数据（如果存在）
         mu = next(
             (u for u in memory.memory_units if u.scene_index == scene.scene_index),
@@ -74,7 +107,6 @@ def _build_text_index(memory, index_dir: Path) -> Path:
         )
 
         if mu:
-            # 使用 MemoryUnit 中已整合的数据
             transcript_text = " ".join([t.text for t in mu.transcripts])
             vision_desc = mu.vision.description if mu.vision else ""
             vision_mood = mu.vision.mood if mu.vision else ""
@@ -91,7 +123,7 @@ def _build_text_index(memory, index_dir: Path) -> Path:
             char_names = mu.characters
             combined_text = mu.combined_text
         else:
-            # 回退：从 memory 中手动收集（兼容旧数据）
+            # 回退：从 memory 中手动收集
             scene_transcripts = [
                 t.text for t in memory.transcripts
                 if t.start_time >= scene.start_time and t.start_time < scene.end_time
@@ -124,7 +156,6 @@ def _build_text_index(memory, index_dir: Path) -> Path:
             ]
             char_names = scene_characters
 
-            # 构建 combined_text
             parts = []
             if transcript_text:
                 parts.append(transcript_text)
@@ -151,12 +182,15 @@ def _build_text_index(memory, index_dir: Path) -> Path:
             "characters": char_names,
             "combined_text": combined_text,
             "keywords": keywords,
+            # v2: 新增层级信息
+            "beat_index": scene.beat_index,
+            "story_scene_index": scene.story_scene_index,
         }
         entries.append(entry)
 
     index_data = {
         "video_id": memory.video_id,
-        "total_scenes": len(memory.scenes),
+        "total_scenes": len(scenes),
         "total_entries": len(entries),
         "entries": entries,
     }
@@ -169,17 +203,16 @@ def _build_text_index(memory, index_dir: Path) -> Path:
     return index_path
 
 
-def _build_embedding_index(memory, index_dir: Path):
-    """
-    为每个 MemoryUnit 生成 embedding 并构建 FAISS 索引。
+# ═══════════════════════════════════════════════════════════════
+# Part 2: Embedding + FAISS
+# ═══════════════════════════════════════════════════════════════
 
-    如果 Embedding API 不可用或 FAISS 未安装，会优雅降级。
-    """
+def _build_embedding_index(memory, index_dir: Path):
+    """为每个 MemoryUnit 生成 embedding 并构建 FAISS 索引。"""
     if not memory.memory_units:
         logger.info("无 MemoryUnit，跳过 embedding 索引")
         return
 
-    # 收集所有需要 embedding 的文本
     texts = [mu.combined_text for mu in memory.memory_units]
     scene_indices = [mu.scene_index for mu in memory.memory_units]
 
@@ -187,34 +220,243 @@ def _build_embedding_index(memory, index_dir: Path):
         logger.info("所有 MemoryUnit 文本为空，跳过 embedding 索引")
         return
 
-    # 尝试生成 embeddings
     embeddings = _generate_embeddings(texts)
 
     if embeddings is None:
         logger.warning("Embedding 生成失败，跳过向量索引")
         return
 
-    # 将 embedding 写回 MemoryUnit
     for i, mu in enumerate(memory.memory_units):
         if i < len(embeddings):
             mu.embedding = embeddings[i]
 
-    # 保存更新后的 memory（含 embedding）
     from memory.store import save_memory
     save_memory(memory)
 
-    # 构建 FAISS 索引
     if HAS_FAISS and embeddings:
         _build_faiss_index(embeddings, scene_indices, index_dir)
 
 
-def _generate_embeddings(texts: list[str]) -> list[list[float]] | None:
-    """
-    调用 Embedding API 生成文本向量。
+# ═══════════════════════════════════════════════════════════════
+# Part 3: 角色索引
+# ═══════════════════════════════════════════════════════════════
 
-    使用 OpenAI 兼容的 /embeddings 端点。
-    分批处理以避免超过 API 限制。
-    """
+def _build_character_index(memory, index_dir: Path):
+    """构建角色索引: character_id → {shots, beats, story_scenes, screen_time, role}"""
+    characters = memory.characters_deep or memory.characters
+    if not characters:
+        return
+
+    char_index = {}
+    for c in characters:
+        entry = {
+            "character_id": c.character_id,
+            "display_name": c.display_name,
+            "role": c.role,
+            "total_screen_time": c.total_screen_time,
+            "appearance_shots": c.appearance_scenes,
+            "appearance_beats": [],
+            "appearance_story_scenes": [],
+        }
+
+        # 找出该角色出现的 beat
+        for b in (memory.beats or []):
+            if c.character_id in (b.characters or []):
+                entry["appearance_beats"].append(b.beat_index)
+            elif any(si in c.appearance_scenes for si in b.shot_indices):
+                entry["appearance_beats"].append(b.beat_index)
+
+        # 找出该角色出现的 story_scene
+        for ss in (memory.story_scenes or []):
+            if c.character_id in (ss.characters or []):
+                entry["appearance_story_scenes"].append(ss.story_scene_index)
+            elif any(si in c.appearance_scenes for si in ss.shot_indices):
+                entry["appearance_story_scenes"].append(ss.story_scene_index)
+
+        # 深度字段
+        if hasattr(c, "importance_score"):
+            entry["importance_score"] = c.importance_score
+        if hasattr(c, "dialogue_count"):
+            entry["dialogue_count"] = c.dialogue_count
+
+        char_index[c.character_id] = entry
+
+    path = index_dir / "character_index.json"
+    path.write_text(json.dumps(char_index, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"角色索引已构建: {len(char_index)} 个角色")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Part 4: 事件索引
+# ═══════════════════════════════════════════════════════════════
+
+def _build_event_index(memory, index_dir: Path):
+    """构建事件索引: event_type → [{event_index, importance, shots, description}]"""
+    events = memory.events
+    if not events:
+        return
+
+    event_index = defaultdict(list)
+    for e in events:
+        event_index[e.event_type].append({
+            "event_index": e.event_index,
+            "start_time": e.start_time,
+            "end_time": e.end_time,
+            "importance": e.importance,
+            "description": e.description,
+            "characters": e.characters,
+            "scene_indices": e.scene_indices,
+            "beat_indices": getattr(e, "beat_indices", []),
+            "emotion": e.emotion,
+        })
+
+    # 按 importance 排序
+    for k in event_index:
+        event_index[k].sort(key=lambda x: -x["importance"])
+
+    path = index_dir / "event_index.json"
+    path.write_text(json.dumps(dict(event_index), indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"事件索引已构建: {len(event_index)} 种事件类型")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Part 5: 关系索引
+# ═══════════════════════════════════════════════════════════════
+
+def _build_relation_index(memory, index_dir: Path):
+    """构建关系索引: 'char_a|char_b' → {relation_type, co_shots, strength}"""
+    relations = memory.character_relations
+    if not relations:
+        return
+
+    rel_index = {}
+    for r in relations:
+        key = f"{r.character_a}|{r.character_b}"
+        rel_index[key] = {
+            "character_a": r.character_a,
+            "character_b": r.character_b,
+            "relation_type": r.relation_type,
+            "description": r.description,
+            "strength": r.strength,
+            "co_appearance_shots": r.co_appearance_shots,
+            "evolution": r.evolution,
+        }
+
+    path = index_dir / "relation_index.json"
+    path.write_text(json.dumps(rel_index, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"关系索引已构建: {len(rel_index)} 条关系")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Part 6: 情绪索引
+# ═══════════════════════════════════════════════════════════════
+
+def _build_emotion_index(memory, index_dir: Path):
+    """构建情绪索引: emotion → [{scene_index, intensity, description}]"""
+    emotion_index = defaultdict(list)
+
+    # 从 vision_summaries 提取情绪
+    for v in memory.vision_summaries:
+        if v.mood:
+            emotion_index[v.mood].append({
+                "scene_index": v.scene_index,
+                "timestamp": v.timestamp,
+                "description": v.description[:80],
+                "source": "vision",
+            })
+
+    # 从 events 提取情绪
+    for e in memory.events:
+        if e.emotion:
+            for si in e.scene_indices:
+                emotion_index[e.emotion].append({
+                    "scene_index": si,
+                    "timestamp": e.start_time,
+                    "description": e.description[:80],
+                    "source": "event",
+                    "importance": e.importance,
+                })
+
+    # 从 beats 提取情绪
+    for b in (memory.beats or []):
+        if b.emotion:
+            emotion_index[b.emotion].append({
+                "beat_index": b.beat_index,
+                "start_time": b.start_time,
+                "end_time": b.end_time,
+                "intensity": b.intensity,
+                "description": b.description[:80],
+                "source": "beat",
+            })
+
+    path = index_dir / "emotion_index.json"
+    path.write_text(json.dumps(dict(emotion_index), indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"情绪索引已构建: {len(emotion_index)} 种情绪")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Part 7: 剪辑信号索引
+# ═══════════════════════════════════════════════════════════════
+
+def _build_edit_signal_index(memory, index_dir: Path):
+    """构建剪辑信号索引: signal_type → top-N unit 列表"""
+    signals = memory.edit_signals
+    if not signals:
+        return
+
+    signal_types = [
+        "hook_score", "plot_importance", "emotional_intensity",
+        "visual_impact", "independence_score", "boundary_quality",
+    ]
+
+    signal_index = {}
+    for sig_type in signal_types:
+        # 按该信号排序，取 top-20
+        sorted_signals = sorted(
+            signals,
+            key=lambda s: getattr(s, sig_type, 0),
+            reverse=True,
+        )[:20]
+
+        signal_index[sig_type] = [
+            {
+                "unit_type": s.unit_type,
+                "unit_index": s.unit_index,
+                "start_time": s.start_time,
+                "end_time": s.end_time,
+                "score": getattr(s, sig_type, 0),
+                "suggested_usage": s.suggested_usage,
+            }
+            for s in sorted_signals
+            if getattr(s, sig_type, 0) > 0.3  # 过滤低分
+        ]
+
+    # 按 suggested_usage 建立反向索引
+    usage_index = defaultdict(list)
+    for s in signals:
+        for usage in s.suggested_usage:
+            usage_index[usage].append({
+                "unit_type": s.unit_type,
+                "unit_index": s.unit_index,
+                "start_time": s.start_time,
+                "end_time": s.end_time,
+                "hook_score": s.hook_score,
+                "plot_importance": s.plot_importance,
+                "emotional_intensity": s.emotional_intensity,
+            })
+    signal_index["by_usage"] = dict(usage_index)
+
+    path = index_dir / "edit_signal_index.json"
+    path.write_text(json.dumps(signal_index, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"剪辑信号索引已构建: {len(signal_types)} 种信号维度")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 共用工具函数
+# ═══════════════════════════════════════════════════════════════
+
+def _generate_embeddings(texts: list[str]) -> list[list[float]] | None:
+    """调用 Embedding API 生成文本向量。"""
     import requests
 
     api_base = config.LLM_API_BASE.rstrip("/")
@@ -232,11 +474,10 @@ def _generate_embeddings(texts: list[str]) -> list[list[float]] | None:
     }
 
     all_embeddings = []
-    batch_size = 20  # 每批最多 20 个文本
+    batch_size = 20
 
     for batch_start in range(0, len(texts), batch_size):
         batch_texts = texts[batch_start:batch_start + batch_size]
-        # 截断过长的文本
         batch_texts = [t[:8000] if t else " " for t in batch_texts]
 
         payload = {

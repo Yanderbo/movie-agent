@@ -1,15 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Video Memory 存储
+Video Memory 存储（v2）
 JSON 文件读写操作，汇总所有理解结果。
+
+v2 变更:
+- 支持新字段: shots, beats, story_scenes, event_graph,
+  characters_deep, character_relations, edit_signals,
+  beat_memory_units, scene_memory_units
+- 向后兼容旧 memory.json（通过 Optional 字段 + 默认值）
 """
 import json
 from pathlib import Path
 
 import config
 from models.schemas import (
-    VideoMeta, VideoMemory, Scene, TranscriptSegment,
-    OCRResult, VisionSummary, Character, Event, MemoryUnit,
+    VideoMeta, VideoMemory, Shot, Scene, TranscriptSegment,
+    OCRResult, VisionSummary, Character, CharacterDeep,
+    Event, EventGraph, Beat, StoryScene,
+    CharacterRelation, EditSignal,
+    MemoryUnit, BeatMemoryUnit, SceneMemoryUnit,
 )
 from utils.logger import get_logger
 
@@ -56,14 +65,49 @@ def _assemble_memory(video_id: str) -> VideoMemory:
 
     meta = load_meta(video_id)
 
-    scenes = _load_json_list(video_dir / "scenes" / "scenes.json", Scene)
+    # Shot/Scene
+    shots = _load_json_list(video_dir / "scenes" / "scenes.json", Shot)
+
+    # 基础模态
     transcripts = _load_json_list(video_dir / "transcripts.json", TranscriptSegment)
     ocr_results = _load_json_list(video_dir / "ocr.json", OCRResult)
     vision_summaries = _load_json_list(video_dir / "vision.json", VisionSummary)
-    characters = _load_json_list(video_dir / "characters.json", Character)
+
+    # 人物
+    # 尝试加载为 CharacterDeep，回退到 Character
+    characters_deep = _load_json_list(video_dir / "characters.json", CharacterDeep)
+    characters = characters_deep if characters_deep else _load_json_list(
+        video_dir / "characters.json", Character
+    )
+
+    # 人物关系
+    character_relations = _load_json_list(
+        video_dir / "character_relations.json", CharacterRelation
+    )
+
+    # 事件
     events = _load_json_list(video_dir / "events.json", Event)
 
-    # 加载 speaker_map（新增）
+    # 事件图谱
+    event_graph = None
+    graph_path = video_dir / "event_graph.json"
+    if graph_path.exists():
+        try:
+            data = json.loads(graph_path.read_text(encoding="utf-8"))
+            event_graph = EventGraph(**data)
+        except Exception as e:
+            logger.warning(f"加载 event_graph.json 失败: {e}")
+
+    # Beat
+    beats = _load_json_list(video_dir / "beats.json", Beat)
+
+    # StoryScene
+    story_scenes = _load_json_list(video_dir / "story_scenes.json", StoryScene)
+
+    # EditSignal
+    edit_signals = _load_json_list(video_dir / "edit_signals.json", EditSignal)
+
+    # speaker_map
     speaker_map = {}
     speaker_map_path = video_dir / "speaker_map.json"
     if speaker_map_path.exists():
@@ -75,13 +119,20 @@ def _assemble_memory(video_id: str) -> VideoMemory:
     memory = VideoMemory(
         video_id=video_id,
         meta=meta,
-        scenes=scenes,
+        shots=shots,
+        scenes=shots,  # 兼容
         transcripts=transcripts,
         ocr_results=ocr_results,
         vision_summaries=vision_summaries,
         characters=characters,
-        events=events,
+        characters_deep=characters_deep,
+        character_relations=character_relations,
         speaker_map=speaker_map,
+        beats=beats,
+        story_scenes=story_scenes,
+        event_graph=event_graph,
+        events=events,
+        edit_signals=edit_signals,
         # memory_units 会在 memory.json 中持久化，
         # 从散文件组装时不包含，需要重新构建索引才会有
     )

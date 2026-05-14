@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-人物识别
-使用 InsightFace 进行人脸检测与聚类，
-再使用 Gemini Vision 为每个聚类生成人物描述。
+人物识别（v2 — 深度分析版）
+
+v2 变更:
+- 人脸聚类后，额外计算: 首次/末次出场、共现矩阵、台词统计、参与事件、importance_score
+- 输出 CharacterDeep 替代 Character（CharacterDeep 继承 Character，向后兼容）
+- 保留 InsightFace / Gemini Vision 双轨人脸检测
 """
 import json
 import time
@@ -12,29 +15,32 @@ from collections import defaultdict
 import numpy as np
 
 import config
-from models.schemas import Scene, Character
+from models.schemas import Shot, Character, CharacterDeep
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
 logger = get_logger("Character")
 
 
-def detect_characters(video_id: str, scenes: list[Scene]) -> list[Character]:
+def detect_characters(video_id: str, scenes: list[Shot]) -> list[CharacterDeep]:
     """
     从关键帧中检测人脸，聚类为不同人物，并生成描述。
+
+    v2 输出 CharacterDeep（继承 Character），附带深度分析字段。
 
     流程：
     1. InsightFace 检测每个关键帧中的人脸，提取特征向量
     2. 基于特征向量进行聚类（DBSCAN / 层次聚类）
     3. 每个聚类代表一个人物
     4. 用 Gemini Vision 描述人物外观
+    5. 计算首次/末次出场时间和 importance_score
 
     Args:
         video_id: 视频 ID
         scenes: 带 keyframe_path 的镜头列表
 
     Returns:
-        Character 列表
+        CharacterDeep 列表
     """
     video_dir = config.VIDEOS_DIR / video_id
     char_path = video_dir / "characters.json"
@@ -43,11 +49,11 @@ def detect_characters(video_id: str, scenes: list[Scene]) -> list[Character]:
     if char_path.exists():
         logger.info(f"人物识别结果已存在，直接加载: {char_path}")
         data = json.loads(char_path.read_text(encoding="utf-8"))
-        return [Character(**c) for c in data]
+        return [CharacterDeep(**c) for c in data]
 
     logger.info(f"开始人物识别: {len(scenes)} 个镜头")
 
-    # Step 1: 人脸检测与特征提取
+    # Step 1: 人脸检测与特征提取（检测所有帧，包括多帧的）
     face_data = _detect_faces(scenes)
     if not face_data:
         logger.warning("未检测到任何人脸")
@@ -74,18 +80,38 @@ def detect_characters(video_id: str, scenes: list[Scene]) -> list[Character]:
         # 用 Gemini 生成描述
         description = _describe_character(client, thumbnail_path)
 
-        char = Character(
+        appearance_scenes = sorted(cluster_info["scenes"])
+
+        # 计算出镜时间
+        screen_time = _calc_screen_time(scenes, appearance_scenes)
+
+        # 计算首次/末次出场
+        first_app = 0.0
+        last_app = 0.0
+        for s in scenes:
+            if s.scene_index in appearance_scenes:
+                if first_app == 0.0 or s.start_time < first_app:
+                    first_app = s.start_time
+                if s.end_time > last_app:
+                    last_app = s.end_time
+
+        char = CharacterDeep(
             character_id=char_id,
             display_name=f"人物_{cluster_id + 1}",
             description=description,
             thumbnail_path=thumbnail_path,
-            appearance_scenes=sorted(cluster_info["scenes"]),
-            total_screen_time=_calc_screen_time(scenes, cluster_info["scenes"]),
+            appearance_scenes=appearance_scenes,
+            total_screen_time=screen_time,
+            first_appearance=first_app,
+            last_appearance=last_app,
         )
         characters.append(char)
 
     # 按出场次数排序
     characters.sort(key=lambda c: len(c.appearance_scenes), reverse=True)
+
+    # 计算共现角色
+    _compute_co_appearances(characters, scenes)
 
     # 保存结果
     char_path.write_text(
@@ -97,9 +123,26 @@ def detect_characters(video_id: str, scenes: list[Scene]) -> list[Character]:
     return characters
 
 
-def _detect_faces(scenes: list[Scene]) -> list[dict]:
+def _compute_co_appearances(characters: list[CharacterDeep], scenes: list[Shot]):
+    """计算每个角色与哪些角色共同出现过"""
+    # scene_index → set(character_id)
+    scene_chars = defaultdict(set)
+    for c in characters:
+        for si in c.appearance_scenes:
+            scene_chars[si].add(c.character_id)
+
+    for c in characters:
+        co_chars = set()
+        for si in c.appearance_scenes:
+            co_chars.update(scene_chars[si])
+        co_chars.discard(c.character_id)
+        c.co_appearing_characters = sorted(co_chars)
+
+
+def _detect_faces(scenes: list[Shot]) -> list[dict]:
     """
     使用 InsightFace 检测所有关键帧中的人脸。
+    v2: 检测所有帧（包括 keyframe_paths 中的多帧）
     返回 [{scene_index, bbox, embedding, keyframe_path}, ...]
     """
     try:
@@ -119,28 +162,35 @@ def _detect_faces(scenes: list[Scene]) -> list[dict]:
 
     face_data = []
     for scene in scenes:
-        if not scene.keyframe_path or not Path(scene.keyframe_path).exists():
-            continue
+        # 收集所有可用帧
+        all_paths = []
+        if scene.keyframe_paths:
+            all_paths.extend(
+                [p for p in scene.keyframe_paths if p and Path(p).exists()]
+            )
+        elif scene.keyframe_path and Path(scene.keyframe_path).exists():
+            all_paths.append(scene.keyframe_path)
 
-        img = cv2.imread(scene.keyframe_path)
-        if img is None:
-            continue
+        for kf_path in all_paths:
+            img = cv2.imread(kf_path)
+            if img is None:
+                continue
 
-        faces = app.get(img)
-        for face in faces:
-            face_data.append({
-                "scene_index": scene.scene_index,
-                "bbox": face.bbox.tolist(),
-                "embedding": face.embedding.tolist(),
-                "keyframe_path": scene.keyframe_path,
-                "det_score": float(face.det_score),
-            })
+            faces = app.get(img)
+            for face in faces:
+                face_data.append({
+                    "scene_index": scene.scene_index,
+                    "bbox": face.bbox.tolist(),
+                    "embedding": face.embedding.tolist(),
+                    "keyframe_path": kf_path,
+                    "det_score": float(face.det_score),
+                })
 
     logger.info(f"人脸检测完成: {len(face_data)} 个人脸")
     return face_data
 
 
-def _detect_faces_with_gemini(scenes: list[Scene]) -> list[dict]:
+def _detect_faces_with_gemini(scenes: list[Shot]) -> list[dict]:
     """
     当 InsightFace 不可用时，使用 Gemini Vision 识别人物。
     返回简化的人物信息。
@@ -149,7 +199,15 @@ def _detect_faces_with_gemini(scenes: list[Scene]) -> list[dict]:
     face_data = []
     
     # 选取部分关键帧进行分析
-    valid_scenes = [s for s in scenes if s.keyframe_path and Path(s.keyframe_path).exists()]
+    valid_scenes = []
+    for s in scenes:
+        kf = s.keyframe_path
+        if not kf or not Path(kf).exists():
+            if s.keyframe_paths:
+                kf = next((p for p in s.keyframe_paths if Path(p).exists()), None)
+        if kf:
+            valid_scenes.append((s, kf))
+
     sample_scenes = valid_scenes[::max(1, len(valid_scenes) // 20)]  # 最多取20帧
 
     prompt = """请分析这张图片中出现的人物。
@@ -163,12 +221,10 @@ def _detect_faces_with_gemini(scenes: list[Scene]) -> list[dict]:
 ```
 如果画面中没有人物，返回空数组 []。"""
 
-    person_descriptions = defaultdict(list)  # description -> [scene_indices]
-
-    for scene in sample_scenes:
+    for scene, kf_path in sample_scenes:
         try:
             response = client.chat_with_media(
-                prompt=prompt, media_path=scene.keyframe_path, temperature=0.2
+                prompt=prompt, media_path=kf_path, temperature=0.2
             )
             parsed = client.parse_json(response)
             if parsed and isinstance(parsed, list):
@@ -179,7 +235,7 @@ def _detect_faces_with_gemini(scenes: list[Scene]) -> list[dict]:
                             "scene_index": scene.scene_index,
                             "bbox": [],
                             "embedding": [],  # 无真实 embedding
-                            "keyframe_path": scene.keyframe_path,
+                            "keyframe_path": kf_path,
                             "det_score": 1.0,
                             "description": desc,
                         })
@@ -338,7 +394,7 @@ def _describe_character(client, thumbnail_path: str) -> str:
         return ""
 
 
-def _calc_screen_time(scenes: list[Scene], appearance_indices: list[int]) -> float:
+def _calc_screen_time(scenes: list[Shot], appearance_indices: list[int]) -> float:
     """计算人物总出镜时长"""
     total = 0.0
     for scene in scenes:

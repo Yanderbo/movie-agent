@@ -2,6 +2,9 @@
 
 > 文件：`memory/search.py`
 > 职责：三层漏斗检索系统，从 Video Memory 中根据查询条件精准定位片段
+>
+> **v2 注意**：indexer 已构建 7 种索引（文本/向量/角色/事件/关系/情绪/剪辑信号），
+> 当前 search.py 主要消费文本 + 向量索引，角色/事件/剪辑信号索引可在后续版本集成。
 
 ## 总体架构
 
@@ -112,7 +115,7 @@ SearchResult(
     score=0.87,
     match_type="embedding",       # 最主要的匹配方式
     snippet="台词片段...",
-    scene=Scene(...),             # 完整的 Scene 对象
+    scene=Scene(...),             # 完整的 Scene (= Shot) 对象
     transcript="完整台词文本",
     vision_summary="画面描述",
     matched_modalities=["transcript", "vision", "embedding"],
@@ -120,5 +123,9 @@ SearchResult(
     context_before="前一 shot 摘要",
     context_after="后一 shot 摘要",
     memory_unit=MemoryUnit(...),  # 完整的 MemoryUnit
+    # v2 新增
+    beat_index=3,                 # 所属 Beat
+    story_scene_index=1,          # 所属 StoryScene
+    edit_signal=EditSignal(...),  # 关联的剪辑信号
 )
 ```
