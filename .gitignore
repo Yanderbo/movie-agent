@@ -25,4 +25,5 @@ __pycache__/
 # Project specific (assuming these might contain generated data, uncomment if needed)
 # memory/
 # render/
-# logs/
+logs/
+data/
