@@ -13,7 +13,14 @@ VideoMeta ─────────────────── 视频元信
 Shot (= Scene) ────────────── 镜头（最小视觉单元，含多帧路径）
 TranscriptSegment ─────────── 台词（含 cross_shot / transcript_type）
 OCRResult ─────────────────── 单场景 OCR 结果
-VisionSummary ─────────────── 画面摘要（v2: 含 action/expression/props）
+VisionSummary ─────────────── 画面摘要（v3: 含 micro_clip 字段）
+
+── 音频层 🆕 ──
+AudioSegment ──────────────── 音频精细时间段
+AudioProsody ──────────────── 音频韵律（音乐/音效/沉默/语速/音量/语音情绪）
+
+── 多模态对齐层 🆕 ──
+MultimodalAlignment ───────── 跨模态一致性（speaker↔character↔visual↔audio）
 
 ── 人物层 ──
 Character ─────────────────── 人物（基础版）
@@ -24,18 +31,23 @@ CharacterRelation ─────────── 人物关系
 ── 叙事层 ──
 Beat ──────────────────────── 剧情节拍（连续 shot 组成）
 StoryScene ────────────────── 故事场景（连续 beat 组成）
-Event (= EventNode) ───────── 事件（v2: 含 beat_indices / story_scene_indices）
-EventEdge ─────────────────── 事件关系边
+Chapter ───────────────────── 🆕 长视频大段落（连续 StoryScene 组成）
+Event (= EventNode) ───────── 事件（v3: 含 evidence + confidence）
+EventEdge ─────────────────── 事件关系边（v3: 含 relation_basis）
 EventGraph ────────────────── 事件图谱（节点 + 边）
 
 ── 剪辑信号层 ──
 EditSignal ────────────────── 8维剪辑信号
+NarrativeSignal ───────────── 🆕 叙事信号（弧位置/张力/信息密度）
+RecompositionSignal ───────── 🆕 二次创作信号（梗潜力/平台适配/二创格式）
 
 ── Memory 层 ──
-MemoryUnit ────────────────── Shot 级多模态融合检索原子
+MemoryUnit ────────────────── Shot 级多模态融合检索原子（v3: 含 audio/alignment/chapter）
 BeatMemoryUnit ────────────── Beat 级记忆单元
 SceneMemoryUnit ───────────── StoryScene 级记忆单元
-VideoMemory ───────────────── 完整理解结果汇总（多层结构）
+ChapterMemoryUnit ─────────── 🆕 Chapter 级记忆单元
+
+VideoMemory ───────────────── 完整理解结果汇总（v3: 四层结构 + 三类信号）
 
 ── 剪辑方案层 ──
 EditClip ──────────────────── 剪辑片段（含证据链 + EditSignal引用）
@@ -62,7 +74,60 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 
 `shot_index` property 等价于 `scene_index`。
 
-### Beat（剧情节拍）🆕
+### VisionSummary（画面摘要）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `description` | str | 画面描述 |
+| `mood` | str | 情绪/氛围 |
+| `scene_type` | str | 场景类型 |
+| `objects` | list[str] | 可见物体 |
+| `action_description` | str | **v2** 动作/变化描述 |
+| `frame_descriptions` | list[str] | **v2** 各帧独立描述 |
+| `expression_changes` | str | **v2** 表情变化描述 |
+| `props` | list[str] | **v2** 关键道具列表 |
+| `camera_motion` | str | **v3** 镜头运动（pan/tilt/zoom/static/tracking/handheld） |
+| `interaction_description` | str | **v3** 人物互动描述 |
+| `shot_scale` | str | **v3** 景别（close_up/medium/wide/...） |
+
+### AudioProsody（音频韵律）🆕
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `scene_index` | int | 对应的 shot |
+| `start_time` / `end_time` | float | 时间范围 |
+| `has_music` | bool | 是否有背景音乐 |
+| `music_mood` | str | 音乐情绪 |
+| `has_sfx` | bool | 是否有音效 |
+| `sfx_tags` | list[str] | 音效标签列表 |
+| `silence_ratio` | float | 沉默占比 0-1 |
+| `speech_rate` | float | 语速（words_per_min） |
+| `volume_peak` | float | 音量峰值 0-1 |
+| `speech_emotion` | str | 语音情绪 |
+| `segments` | list[AudioSegment] | 精细时间段 |
+
+### AudioSegment（音频精细时间段）🆕
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `start_time` / `end_time` | float | 时间范围 |
+| `segment_type` | str | speech/music/sfx/silence |
+| `description` | str | 描述 |
+
+### MultimodalAlignment（多模态对齐）🆕
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `scene_index` | int | 对应的 shot |
+| `speaker_to_character` | dict[str,str] | speaker_id → character_id 映射 |
+| `visible_characters` | list[str] | 画面中可见的人物 |
+| `speaking_characters` | list[str] | 正在说话的人物 |
+| `active_modalities` | list[str] | 活跃模态（speech/visual_action/music/sfx/silence） |
+| `dominant_modality` | str | 主导模态 |
+| `alignment_confidence` | float | 对齐置信度 0-1 |
+| `notes` | str | 冲突说明（如画外音检测） |
+
+### Beat（剧情节拍）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -74,7 +139,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | `intensity` | float | 戏剧强度 0-1 |
 | `characters` | list[str] | 出场人物 |
 
-### StoryScene（故事场景）🆕
+### StoryScene（故事场景）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -85,45 +150,44 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | `plot_function` | str | inciting_incident / rising / climax / falling / resolution / setup |
 | `description` | str | 场景描述 |
 
-### MemoryUnit — Shot 级检索原子
+### Chapter（长视频大段落）🆕
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `scene_index` | int | 镜头编号 |
-| `start_time` / `end_time` | float | 时间范围 |
-| `transcripts` | list[TranscriptSegment] | 该 shot 内的台词 |
-| `vision` | VisionSummary? | 画面摘要 |
-| `ocr` | OCRResult? | OCR 文字 |
-| `characters` | list[str] | 出现的 character_id |
-| `events` | list[Event] | 时间重叠的事件 |
-| `combined_text` | str | 拼接后的多模态检索文本 |
-| `embedding` | list[float] | 预计算的语义向量 |
-| `beat_index` | int? | **v2** 所属 Beat |
-| `story_scene_index` | int? | **v2** 所属 StoryScene |
-| `edit_signal` | EditSignal? | **v2** 关联的剪辑信号 |
+| `chapter_index` | int | 章节编号 |
+| `story_scene_indices` | list[int] | 包含的 StoryScene |
+| `beat_indices` | list[int] | 包含的 Beat（汇总） |
+| `shot_indices` | list[int] | 包含的 Shot（汇总） |
+| `title` | str | 章节标题 |
+| `description` | str | 章节描述 |
+| `chapter_type` | str | opening / development / climax / resolution / epilogue |
+| `theme` | str | 主题 |
+| `characters` | list[str] | 出场人物 |
+| `mood_progression` | str | 情绪走向描述 |
+| `start_time` / `end_time` / `duration` | float | 时间信息 |
 
-### BeatMemoryUnit — Beat 级记忆单元 🆕
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `beat_index` | int | 节拍编号 |
-| `shot_indices` | list[int] | 组成的 shot |
-| `beat_type` / `description` / `emotion` | str | 节拍描述 |
-| `transcript_summary` | str | 台词摘要 |
-| `combined_text` | str | 检索文本 |
-| `edit_signal` | EditSignal? | 剪辑信号 |
-
-### SceneMemoryUnit — StoryScene 级记忆单元 🆕
+### Event（事件）v3 增强
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `story_scene_index` | int | 场景编号 |
-| `beat_indices` | list[int] | 组成的 beat |
-| `location` / `description` / `plot_function` | str | 场景描述 |
-| `combined_text` | str | 检索文本 |
-| `edit_signal` | EditSignal? | 剪辑信号 |
+| 原有字段 | — | event_index, event_type, description, characters, importance, ... |
+| `evidence` | str | **v3** 支撑该事件的证据描述 |
+| `confidence` | float | **v3** 事件置信度 0-1 |
+| `beat_indices` | list[int] | **v2** 关联的 Beat |
+| `story_scene_indices` | list[int] | **v2** 关联的 StoryScene |
 
-### EditSignal — 剪辑信号 🆕
+### EventEdge（事件关系边）v3 增强
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `source_event` / `target_event` | int | 源/目标事件索引 |
+| `relation_type` | str | cause / foreshadow / reversal / escalation / resolution / parallel |
+| `description` | str | 关系描述 |
+| `evidence` | str | **v3** 支撑该关系的证据 |
+| `confidence` | float | **v3** 关系置信度 0-1 |
+| `relation_basis` | str | **v3** 推理依据 |
+
+### EditSignal — 剪辑信号
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -139,69 +203,78 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | `spoiler_level` | float | 剧透程度 0-1 |
 | `suggested_usage` | list[str] | hook / trailer / highlight / recap / climax_clip / character_intro |
 
-### CharacterDeep — 深度人物 🆕
-
-继承自 `Character`，新增：
+### NarrativeSignal — 叙事信号 🆕
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `importance_score` | float | 综合重要性 0-1 |
-| `first_appearance` / `last_appearance` | float | 首/末出场时间 |
-| `arc` | CharacterArc? | 人物弧线 |
-| `co_appearing_characters` | list[str] | 共现角色 |
-| `dialogue_count` | int | 台词数 |
-| `key_event_indices` | list[int] | 关键事件索引 |
+| `unit_type` | str | beat / story_scene / chapter |
+| `unit_index` | int | 对应的 index |
+| `arc_position` | float | 叙事弧位置 0-1（开头=0，结尾=1） |
+| `tension_level` | float | 张力水平 0-1 |
+| `information_density` | float | 信息密度 0-1 |
+| `character_focus` | str | 主要聚焦的角色 character_id |
+| `narrative_function` | str | exposition / rising_action / climax / falling_action / resolution / transition / comic_relief |
+| `theme_relevance` | float | 与主题相关度 0-1 |
 
-### EventGraph — 事件图谱 🆕
+### RecompositionSignal — 二次创作信号 🆕
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `nodes` | list[Event] | 事件节点列表 |
-| `edges` | list[EventEdge] | 关系边列表 |
+| `unit_type` | str | beat / story_scene |
+| `unit_index` | int | 对应的 index |
+| `meme_potential` | float | 梗/传播潜力 0-1 |
+| `emotional_quotability` | float | 情感引用潜力/"名场面"程度 0-1 |
+| `context_freedom` | float | 脱离上下文仍有意义的程度 0-1 |
+| `remix_flexibility` | float | 可重新组合的灵活度 0-1 |
+| `platform_fit` | dict[str, float] | 平台适配分（douyin/bilibili/youtube） |
+| `suggested_formats` | list[str] | 建议格式（reaction/compilation/fancam/edit） |
 
-EventEdge 的 `relation_type`: `cause` / `foreshadow` / `reversal` / `escalation` / `resolution` / `parallel`
+### MemoryUnit — Shot 级检索原子
 
-### TranscriptSegment — 台词
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `scene_index` | int | 镜头编号 |
+| `start_time` / `end_time` | float | 时间范围 |
+| `transcripts` | list[TranscriptSegment] | 该 shot 内的台词 |
+| `vision` | VisionSummary? | 画面摘要 |
+| `ocr` | OCRResult? | OCR 文字 |
+| `characters` | list[str] | 出现的 character_id |
+| `events` | list[Event] | 时间重叠的事件 |
+| `combined_text` | str | 拼接后的多模态检索文本（v3: 含音频信息） |
+| `embedding` | list[float] | 预计算的语义向量 |
+| `beat_index` | int? | **v2** 所属 Beat |
+| `story_scene_index` | int? | **v2** 所属 StoryScene |
+| `edit_signal` | EditSignal? | **v2** 关联的剪辑信号 |
+| `chapter_index` | int? | **v3** 所属 Chapter |
+| `audio_prosody` | AudioProsody? | **v3** 音频韵律信息 |
+| `alignment` | MultimodalAlignment? | **v3** 多模态对齐信息 |
 
-| 关键字段 | 说明 |
-|----------|------|
-| `scene_index` | 所属镜头索引（由 ASR 回填） |
-| `character_id` | 绑定的人物 ID（由 speaker_bind 填写） |
-| `cross_shot` | **v2** 是否跨越镜头边界 |
-| `transcript_type` | **v2** dialogue / narration / voiceover / subtitle |
+### ChapterMemoryUnit — Chapter 级记忆单元 🆕
 
-### VisionSummary — 画面摘要
-
-v2 新增字段：
-
-| 字段 | 说明 |
-|------|------|
-| `action_description` | 动作/变化描述（多帧推断） |
-| `frame_descriptions` | 各帧独立描述 |
-| `expression_changes` | 表情变化描述 |
-| `props` | 关键道具列表 |
-
-### EditClip — 剪辑片段
-
-v2 新增字段：
-
-| 字段 | 说明 |
-|------|------|
-| `edit_signal_ref` | 关联的 EditSignal |
-| `source_beat_index` | 来源 Beat |
-| `source_story_scene_index` | 来源 StoryScene |
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `chapter_index` | int | 章节编号 |
+| `story_scene_indices` | list[int] | 包含的 StoryScene |
+| `title` / `description` / `theme` / `chapter_type` | str | 章节信息 |
+| `characters` | list[str] | 出场人物 |
+| `mood_progression` | str | 情绪走向 |
+| `combined_text` | str | 检索文本 |
+| `edit_signal` | EditSignal? | 剪辑信号 |
+| `narrative_signal` | NarrativeSignal? | 叙事信号 |
 
 ### VideoMemory — 完整理解结果
 
-v2 多层结构：
+v3 多层结构：
 
 | 字段组 | 字段 |
 |--------|------|
 | Shot 层 | `shots`, `transcripts`, `ocr_results`, `vision_summaries` |
+| 音频层 🆕 | `audio_prosodies` |
+| 对齐层 🆕 | `multimodal_alignments` |
 | 人物层 | `characters`, `characters_deep`, `character_relations`, `speaker_map` |
-| 叙事层 | `beats`, `story_scenes`, `event_graph`, `events` |
-| 剪辑信号层 | `edit_signals` |
-| Memory 层 | `memory_units`, `beat_memory_units`, `scene_memory_units` |
+| 叙事层 | `beats`, `story_scenes`, `chapters` 🆕, `event_graph`, `events` |
+| 剪辑信号层 | `edit_signals`, `narrative_signals` 🆕, `recomposition_signals` 🆕 |
+| Memory 层 | `memory_units`, `beat_memory_units`, `scene_memory_units`, `chapter_memory_units` 🆕 |
 | 兼容层 | `scenes`（= shots）|
 
 ## 向后兼容性
@@ -215,15 +288,23 @@ EventNode = Event   # 旧代码 import EventNode 可正常工作
 
 ### 默认值策略
 
-所有 v2 新增字段均设有默认值，旧版 JSON 数据可直接反序列化：
+所有 v2/v3 新增字段均设有默认值，旧版 JSON 数据可直接反序列化：
 
-| 字段 | 默认值 |
-|------|--------|
-| `Shot.keyframe_paths` | `[]` |
-| `Shot.beat_index` / `Shot.story_scene_index` | `None` |
-| `TranscriptSegment.cross_shot` | `False` |
-| `VisionSummary.action_description` | `""` |
-| `Event.beat_indices` / `Event.story_scene_indices` | `[]` |
-| `VideoMemory.beats` / `story_scenes` / `edit_signals` | `[]` |
-| `VideoMemory.beat_memory_units` / `scene_memory_units` | `[]` |
-| `EditClip.edit_signal_ref` | `None` |
+| 字段 | 默认值 | 版本 |
+|------|--------|------|
+| `Shot.keyframe_paths` | `[]` | v2 |
+| `Shot.beat_index` / `Shot.story_scene_index` | `None` | v2 |
+| `TranscriptSegment.cross_shot` | `False` | v2 |
+| `VisionSummary.action_description` | `""` | v2 |
+| `VisionSummary.camera_motion` / `interaction_description` / `shot_scale` | `""` | v3 |
+| `Event.evidence` | `""` | v3 |
+| `Event.confidence` | `0.0` | v3 |
+| `EventEdge.evidence` / `relation_basis` | `""` | v3 |
+| `EventEdge.confidence` | `0.0` | v3 |
+| `VideoMemory.audio_prosodies` / `multimodal_alignments` | `[]` | v3 |
+| `VideoMemory.chapters` | `[]` | v3 |
+| `VideoMemory.narrative_signals` / `recomposition_signals` | `[]` | v3 |
+| `VideoMemory.chapter_memory_units` | `[]` | v3 |
+| `MemoryUnit.chapter_index` | `None` | v3 |
+| `MemoryUnit.audio_prosody` / `alignment` | `None` | v3 |
+| `EditClip.edit_signal_ref` | `None` | v2 |

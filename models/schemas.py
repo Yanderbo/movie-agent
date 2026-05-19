@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Pydantic 数据模型定义（v2 — 面向剪辑决策）
+Pydantic 数据模型定义（v3 — 面向剪辑决策 + 深度多模态理解）
 
-层级结构: Shot → Beat → StoryScene → EventGraph
-新增: EditSignal / CharacterArc / CharacterRelation / EventGraph
+层级结构: Shot → Beat → StoryScene → Chapter → EventGraph
+新增 v3: AudioProsody / MultimodalAlignment / Chapter / NarrativeSignal / RecompositionSignal
+增强 v3: Event 增加 evidence+confidence / EventEdge 增加 relation_basis
+         VisionSummary 增加 camera_motion / interaction / shot_scale
 
 向后兼容:
   - Scene = Shot（别名）
   - Character 保留，CharacterDeep 扩展
   - VideoMemory.scenes 等价于 VideoMemory.shots
   - Event 保留作为 EventNode 别名
+  - 所有 v3 新增字段均有默认值
 """
 from __future__ import annotations
 from typing import Optional
@@ -157,7 +160,7 @@ class OCRResult(BaseModel):
 # ═══════════════════════════════════════════════════════════════
 
 class VisionSummary(BaseModel):
-    """单个场景的画面摘要（v2 支持多帧）"""
+    """单个场景的画面摘要（v2 支持多帧，v3 增加 micro_clip）"""
     scene_index: int
     timestamp: float
     description: str                  # 画面详细描述
@@ -169,6 +172,10 @@ class VisionSummary(BaseModel):
     frame_descriptions: list[str] = Field(default_factory=list)  # 各帧独立描述
     expression_changes: str = ""      # 表情变化描述
     props: list[str] = Field(default_factory=list)  # 关键道具
+    # ── v3 micro_clip 新增 ──
+    camera_motion: str = ""           # 镜头运动: static/pan_left/pan_right/tilt_up/tilt_down/zoom_in/zoom_out/tracking/crane/handheld
+    interaction_description: str = "" # 人物间互动描述（对话、肢体接触、对峙、合作等）
+    shot_scale: str = ""              # 景别: extreme_close_up/close_up/medium_close/medium/medium_long/long/extreme_long
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -232,7 +239,7 @@ class CharacterDeep(Character):
 # ═══════════════════════════════════════════════════════════════
 
 class Event(BaseModel):
-    """抽取的事件（v1 — 保留兼容别名 EventNode）"""
+    """抽取的事件（v1 兼容，v3 增加 evidence/confidence）"""
     event_index: int
     start_time: float
     end_time: float
@@ -245,6 +252,9 @@ class Event(BaseModel):
     # ── v2 新增 ──
     beat_indices: list[int] = Field(default_factory=list)
     story_scene_indices: list[int] = Field(default_factory=list)
+    # ── v3 新增 ──
+    evidence: list[str] = Field(default_factory=list)   # 证据来源: ["transcript:12-15", "vision:shot_5", "audio:music_shift"]
+    confidence: float = 0.8           # 事件抽取置信度 0-1
 
 
 # v2 别名
@@ -252,12 +262,16 @@ EventNode = Event
 
 
 class EventEdge(BaseModel):
-    """事件间关系 — 事件图谱中的边"""
+    """事件间关系 — 事件图谱中的边（v3 增加 evidence/confidence/relation_basis）"""
     source_event: int                 # event_index
     target_event: int                 # event_index
     relation_type: str                # cause / foreshadow / reversal / escalation / resolution / parallel
     description: str = ""
     strength: float = 0.5             # 0.0 - 1.0
+    # ── v3 新增 ──
+    evidence: list[str] = Field(default_factory=list)    # 关系推断的依据
+    confidence: float = 0.5           # 关系置信度 0-1
+    relation_basis: str = ""          # 关系推断依据说明（如"因为A中角色说了XX，导致B中发生了YY"）
 
 
 class EventGraph(BaseModel):
@@ -267,16 +281,82 @@ class EventGraph(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════
+# 音频韵律分析（v3 新增）
+# ═══════════════════════════════════════════════════════════════
+
+class AudioSegment(BaseModel):
+    """音频段落分析结果"""
+    start_time: float
+    end_time: float
+    segment_type: str = ""            # music / sfx / silence / speech / ambient
+    description: str = ""
+    intensity: float = 0.0            # 0-1 音量/能量强度
+
+
+class AudioProsody(BaseModel):
+    """单个 shot 的音频韵律分析（v3 新增）"""
+    scene_index: int
+    has_music: bool = False
+    music_mood: str = ""              # energetic / melancholic / tense / romantic / epic / calm
+    has_sfx: bool = False
+    sfx_tags: list[str] = Field(default_factory=list)  # explosion / door_slam / footsteps ...
+    silence_ratio: float = 0.0        # 沉默占比 0-1
+    speech_rate: str = ""             # slow / normal / fast
+    volume_peak: float = 0.0          # 归一化峰值音量 0-1
+    speech_emotion: str = ""          # calm / angry / sad / happy / fearful / surprised / neutral
+    audio_segments: list[AudioSegment] = Field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 多模态对齐（v3 新增）
+# ═══════════════════════════════════════════════════════════════
+
+class MultimodalAlignment(BaseModel):
+    """单个 shot 的多模态对齐结果（v3 新增）"""
+    scene_index: int
+    start_time: float
+    end_time: float
+    speaker_to_character: dict[str, str] = Field(default_factory=dict)  # speaker_id → character_id
+    visible_characters: list[str] = Field(default_factory=list)         # 画面中可见的 character_id
+    speaking_characters: list[str] = Field(default_factory=list)        # 正在说话的 character_id
+    active_modalities: list[str] = Field(default_factory=list)          # speech/music/sfx/silence/visual_action/text_overlay
+    dominant_modality: str = ""       # 主导模态
+    alignment_confidence: float = 0.0 # 对齐置信度 0-1
+    notes: str = ""                   # 对齐备注/冲突说明
+
+
+# ═══════════════════════════════════════════════════════════════
+# Chapter — 长视频大段落（v3 新增，StoryScene 之上）
+# ═══════════════════════════════════════════════════════════════
+
+class Chapter(BaseModel):
+    """长视频大段落 — 在 StoryScene 之上的最高叙事层级（v3 新增）"""
+    chapter_index: int
+    title: str = ""
+    start_time: float
+    end_time: float
+    duration: float = 0.0
+    story_scene_indices: list[int] = Field(default_factory=list)
+    beat_indices: list[int] = Field(default_factory=list)
+    shot_indices: list[int] = Field(default_factory=list)
+    description: str = ""
+    chapter_type: str = ""            # prologue / act_1 / act_2 / act_3 / climax_act / epilogue / flashback
+    theme: str = ""                   # 本章主题/关键词
+    characters: list[str] = Field(default_factory=list)
+    mood_progression: str = ""        # 情绪走势描述
+
+
+# ═══════════════════════════════════════════════════════════════
 # EditSignal — 面向剪辑的信号
 # ═══════════════════════════════════════════════════════════════
 
 class EditSignal(BaseModel):
     """
-    面向剪辑的信号 — 每个 shot / beat / story_scene 一条。
+    面向剪辑的信号 — 每个 shot / beat / story_scene / chapter 一条。
 
     这些信号直接服务于 DirectorAgent / ReviewerAgent 的剪辑决策。
     """
-    unit_type: str                    # shot / beat / story_scene
+    unit_type: str                    # shot / beat / story_scene / chapter
     unit_index: int
     start_time: float
     end_time: float
@@ -290,6 +370,34 @@ class EditSignal(BaseModel):
     spoiler_level: float = 0.0        # 剧透程度 (0-1): 包含关键剧情信息的程度
     suggested_usage: list[str] = Field(default_factory=list)
     # suggested_usage: hook / trailer / highlight / recap / climax_clip / character_intro
+
+
+class NarrativeSignal(BaseModel):
+    """叙事信号 — 衡量片段在叙事结构中的角色（v3 新增）"""
+    unit_type: str                    # shot / beat / story_scene / chapter
+    unit_index: int
+    start_time: float
+    end_time: float
+    arc_position: float = 0.0         # 在整体叙事弧中的位置 0-1
+    tension_level: float = 0.0        # 张力水平 0-1
+    information_density: float = 0.0  # 信息密度 0-1
+    character_focus: str = ""         # 主要聚焦的角色 character_id
+    narrative_function: str = ""      # exposition / rising_action / climax / falling_action / resolution / transition / comic_relief
+    theme_relevance: float = 0.0      # 与主题相关度 0-1
+
+
+class RecompositionSignal(BaseModel):
+    """二次创作信号 — 衡量片段在二次剪辑中的价值（v3 新增）"""
+    unit_type: str
+    unit_index: int
+    start_time: float
+    end_time: float
+    meme_potential: float = 0.0       # 梗/传播潜力 0-1
+    emotional_quotability: float = 0.0  # 情感引用潜力 0-1（"名场面"程度）
+    context_freedom: float = 0.0      # 脱离上下文仍有意义的程度 0-1
+    remix_flexibility: float = 0.0    # 可重新组合的灵活度 0-1
+    platform_fit: dict[str, float] = Field(default_factory=dict)  # {"douyin": 0.8, "bilibili": 0.6}
+    suggested_formats: list[str] = Field(default_factory=list)  # reaction / compilation / fancam / edit
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -319,6 +427,10 @@ class MemoryUnit(BaseModel):
     beat_index: Optional[int] = None
     story_scene_index: Optional[int] = None
     edit_signal: Optional[EditSignal] = None
+    # ── v3 新增 ──
+    chapter_index: Optional[int] = None
+    audio_prosody: Optional[AudioProsody] = None
+    alignment: Optional[MultimodalAlignment] = None
 
 
 class BeatMemoryUnit(BaseModel):
@@ -357,14 +469,37 @@ class SceneMemoryUnit(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Video Memory（汇总 — v2 多层结构）
+# Chapter MemoryUnit（v3 新增）
+# ═══════════════════════════════════════════════════════════════
+
+class ChapterMemoryUnit(BaseModel):
+    """Chapter 级记忆单元 — 聚合多个 StoryScene 的信息（v3 新增）"""
+    chapter_index: int
+    start_time: float
+    end_time: float
+    duration: float = 0.0
+    story_scene_indices: list[int] = Field(default_factory=list)
+    title: str = ""
+    description: str = ""
+    theme: str = ""
+    chapter_type: str = ""
+    characters: list[str] = Field(default_factory=list)
+    mood_progression: str = ""
+    combined_text: str = ""
+    embedding: list[float] = Field(default_factory=list)
+    edit_signal: Optional[EditSignal] = None
+    narrative_signal: Optional[NarrativeSignal] = None
+
+
+# ═══════════════════════════════════════════════════════════════
+# Video Memory（汇总 — v3 多层结构）
 # ═══════════════════════════════════════════════════════════════
 
 class VideoMemory(BaseModel):
     """
-    完整的视频理解结果（v2 — 多层结构）。
+    完整的视频理解结果（v3 — 多层结构 + 深度多模态理解）。
 
-    层级: Shot → Beat → StoryScene → EventGraph
+    层级: Shot → Beat → StoryScene → Chapter → EventGraph
     """
     video_id: str
     meta: VideoMeta
@@ -373,6 +508,10 @@ class VideoMemory(BaseModel):
     transcripts: list[TranscriptSegment] = Field(default_factory=list)
     ocr_results: list[OCRResult] = Field(default_factory=list)
     vision_summaries: list[VisionSummary] = Field(default_factory=list)
+    # ── 音频层（v3 新增）──
+    audio_prosodies: list[AudioProsody] = Field(default_factory=list)
+    # ── 多模态对齐层（v3 新增）──
+    multimodal_alignments: list[MultimodalAlignment] = Field(default_factory=list)
     # ── 人物层 ──
     characters: list[Character] = Field(default_factory=list)    # 基础版（兼容）
     characters_deep: list[CharacterDeep] = Field(default_factory=list)  # 深度版
@@ -381,13 +520,17 @@ class VideoMemory(BaseModel):
     # ── 叙事层 ──
     beats: list[Beat] = Field(default_factory=list)
     story_scenes: list[StoryScene] = Field(default_factory=list)
+    chapters: list[Chapter] = Field(default_factory=list)        # v3 新增
     event_graph: Optional[EventGraph] = None
     # ── 剪辑信号层 ──
     edit_signals: list[EditSignal] = Field(default_factory=list)
+    narrative_signals: list[NarrativeSignal] = Field(default_factory=list)          # v3 新增
+    recomposition_signals: list[RecompositionSignal] = Field(default_factory=list)  # v3 新增
     # ── Memory 层 ──
     memory_units: list[MemoryUnit] = Field(default_factory=list)
     beat_memory_units: list[BeatMemoryUnit] = Field(default_factory=list)
     scene_memory_units: list[SceneMemoryUnit] = Field(default_factory=list)
+    chapter_memory_units: list[ChapterMemoryUnit] = Field(default_factory=list)     # v3 新增
     # ── 兼容旧字段 ──
     scenes: list[Shot] = Field(default_factory=list)
     events: list[Event] = Field(default_factory=list)

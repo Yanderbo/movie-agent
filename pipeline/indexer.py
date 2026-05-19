@@ -85,6 +85,12 @@ def build_search_index(video_id: str) -> str:
     # ════ Part 7: 剪辑信号索引 ════
     _build_edit_signal_index(memory, index_dir)
 
+    # ════ Part 8: 音频索引（v3 新增）════
+    _build_audio_index(memory, index_dir)
+
+    # ════ Part 9: 章节索引（v3 新增）════
+    _build_chapter_index(memory, index_dir)
+
     return str(index_dir)
 
 
@@ -449,6 +455,71 @@ def _build_edit_signal_index(memory, index_dir: Path):
     path = index_dir / "edit_signal_index.json"
     path.write_text(json.dumps(signal_index, indent=2, ensure_ascii=False), encoding="utf-8")
     logger.info(f"剪辑信号索引已构建: {len(signal_types)} 种信号维度")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Part 8: 音频索引（v3 新增）
+# ═══════════════════════════════════════════════════════════════
+
+def _build_audio_index(memory, index_dir: Path):
+    """构建音频索引: audio_tag → shot 列表"""
+    audio_prosodies = getattr(memory, "audio_prosodies", []) or []
+    if not audio_prosodies:
+        return
+
+    audio_index = defaultdict(list)
+
+    for a in audio_prosodies:
+        entry = {
+            "scene_index": a.scene_index,
+            "volume_peak": a.volume_peak,
+        }
+        if a.has_music:
+            audio_index[f"music:{a.music_mood or 'unknown'}"].append(entry)
+        if a.has_sfx:
+            for tag in a.sfx_tags:
+                audio_index[f"sfx:{tag}"].append(entry)
+        if a.silence_ratio > 0.7:
+            audio_index["silence"].append(entry)
+        if a.speech_emotion:
+            audio_index[f"speech_emotion:{a.speech_emotion}"].append(entry)
+
+    path = index_dir / "audio_index.json"
+    path.write_text(json.dumps(dict(audio_index), indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"音频索引已构建: {len(audio_index)} 种音频标签")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Part 9: 章节索引（v3 新增）
+# ═══════════════════════════════════════════════════════════════
+
+def _build_chapter_index(memory, index_dir: Path):
+    """构建章节索引: chapter_index → {title, theme, story_scenes, characters}"""
+    chapters = getattr(memory, "chapters", []) or []
+    if not chapters:
+        return
+
+    chapter_index = {}
+    for ch in chapters:
+        chapter_index[str(ch.chapter_index)] = {
+            "chapter_index": ch.chapter_index,
+            "title": ch.title,
+            "start_time": ch.start_time,
+            "end_time": ch.end_time,
+            "duration": ch.duration,
+            "chapter_type": ch.chapter_type,
+            "theme": ch.theme,
+            "description": ch.description,
+            "story_scene_indices": ch.story_scene_indices,
+            "beat_indices": ch.beat_indices,
+            "shot_indices": ch.shot_indices,
+            "characters": ch.characters,
+            "mood_progression": ch.mood_progression,
+        }
+
+    path = index_dir / "chapter_index.json"
+    path.write_text(json.dumps(chapter_index, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"章节索引已构建: {len(chapter_index)} 个章节")
 
 
 # ═══════════════════════════════════════════════════════════════

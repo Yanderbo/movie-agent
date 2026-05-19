@@ -13,9 +13,10 @@ from collections import defaultdict
 
 import config
 from models.schemas import (
-    Shot, Beat, StoryScene, TranscriptSegment, OCRResult, VisionSummary,
-    Character, CharacterDeep, Event, EventGraph, EditSignal,
-    MemoryUnit, BeatMemoryUnit, SceneMemoryUnit,
+    Shot, Beat, StoryScene, Chapter, TranscriptSegment, OCRResult, VisionSummary,
+    Character, CharacterDeep, Event, EventGraph, EditSignal, NarrativeSignal,
+    AudioProsody, MultimodalAlignment,
+    MemoryUnit, BeatMemoryUnit, SceneMemoryUnit, ChapterMemoryUnit,
 )
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
@@ -58,6 +59,9 @@ def build_memory_units(
     beats: list[Beat] = None,
     story_scenes: list[StoryScene] = None,
     edit_signals: list[EditSignal] = None,
+    chapters: list[Chapter] = None,
+    audio_prosodies: list[AudioProsody] = None,
+    alignments: list[MultimodalAlignment] = None,
 ) -> list[MemoryUnit]:
     """
     将各模态数据按 shot 融合为 MemoryUnit 列表。
@@ -120,6 +124,25 @@ def build_memory_units(
             if sig.unit_type == "shot":
                 signal_by_shot[sig.unit_index] = sig
 
+    # AudioProsody 索引
+    audio_by_scene = {}
+    if audio_prosodies:
+        for a in audio_prosodies:
+            audio_by_scene[a.scene_index] = a
+
+    # MultimodalAlignment 索引
+    align_by_scene = {}
+    if alignments:
+        for al in alignments:
+            align_by_scene[al.scene_index] = al
+
+    # Chapter 索引（shot -> chapter_index）
+    chapter_by_shot = {}
+    if chapters:
+        for ch in chapters:
+            for si in ch.shot_indices:
+                chapter_by_shot[si] = ch.chapter_index
+
     # 构建 MemoryUnit
     memory_units = []
     for shot in shots:
@@ -166,6 +189,20 @@ def build_memory_units(
         combined_text = " | ".join(text_parts)
 
         signal = signal_by_shot.get(si)
+        audio = audio_by_scene.get(si)
+        align = align_by_scene.get(si)
+
+        # 音频信息补充到 combined_text
+        if audio:
+            audio_parts = []
+            if audio.has_music:
+                audio_parts.append(f"音乐:{audio.music_mood}")
+            if audio.has_sfx:
+                audio_parts.append(f"音效:{','.join(audio.sfx_tags[:3])}")
+            if audio.speech_emotion:
+                audio_parts.append(f"语音情绪:{audio.speech_emotion}")
+            if audio_parts:
+                combined_text += " | 音频: " + ", ".join(audio_parts)
 
         unit = MemoryUnit(
             scene_index=si,
@@ -183,6 +220,9 @@ def build_memory_units(
             beat_index=shot.beat_index,
             story_scene_index=shot.story_scene_index,
             edit_signal=signal,
+            chapter_index=chapter_by_shot.get(si),
+            audio_prosody=audio,
+            alignment=align,
         )
         memory_units.append(unit)
 
@@ -323,6 +363,80 @@ def build_scene_memory_units(
 
     logger.info(f"StoryScene MemoryUnit 构建完成: {len(scene_units)} 个单元")
     return scene_units
+
+
+def build_chapter_memory_units(
+    chapters: list[Chapter],
+    story_scenes: list[StoryScene],
+    edit_signals: list[EditSignal] = None,
+    narrative_signals: list[NarrativeSignal] = None,
+) -> list[ChapterMemoryUnit]:
+    """构建 Chapter 级别的 MemoryUnit（v3 新增）"""
+    if not chapters:
+        return []
+
+    signal_by_ch = {}
+    if edit_signals:
+        for sig in edit_signals:
+            if sig.unit_type == "chapter":
+                signal_by_ch[sig.unit_index] = sig
+
+    ns_by_ch = {}
+    if narrative_signals:
+        for ns in narrative_signals:
+            # chapter 级别的 NarrativeSignal
+            if ns.unit_type == "chapter":
+                ns_by_ch[ns.unit_index] = ns
+
+    scene_map = {ss.story_scene_index: ss for ss in story_scenes} if story_scenes else {}
+
+    chapter_units = []
+    for ch in chapters:
+        scene_descs = []
+        all_chars = set(ch.characters)
+        for ssi in ch.story_scene_indices:
+            ss = scene_map.get(ssi)
+            if ss:
+                if ss.description:
+                    scene_descs.append(f"[{ss.plot_function}] {ss.description}")
+                all_chars.update(ss.characters)
+
+        parts = []
+        if ch.title:
+            parts.append(f"章节: {ch.title}")
+        if ch.description:
+            parts.append(f"内容: {ch.description}")
+        if ch.theme:
+            parts.append(f"主题: {ch.theme}")
+        if ch.chapter_type:
+            parts.append(f"类型: {ch.chapter_type}")
+        if scene_descs:
+            parts.append(f"场景: {'; '.join(scene_descs[:5])}")
+        if ch.characters:
+            parts.append(f"人物: {', '.join(ch.characters[:5])}")
+        if ch.mood_progression:
+            parts.append(f"情绪: {ch.mood_progression}")
+
+        cmu = ChapterMemoryUnit(
+            chapter_index=ch.chapter_index,
+            start_time=ch.start_time,
+            end_time=ch.end_time,
+            duration=ch.duration,
+            story_scene_indices=ch.story_scene_indices,
+            title=ch.title,
+            description=ch.description,
+            theme=ch.theme,
+            chapter_type=ch.chapter_type,
+            characters=ch.characters or sorted(all_chars),
+            mood_progression=ch.mood_progression,
+            combined_text=" | ".join(parts),
+            edit_signal=signal_by_ch.get(ch.chapter_index),
+            narrative_signal=ns_by_ch.get(ch.chapter_index),
+        )
+        chapter_units.append(cmu)
+
+    logger.info(f"Chapter MemoryUnit 构建完成: {len(chapter_units)} 个单元")
+    return chapter_units
 
 
 def assign_character_roles(

@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Video Memory 存储（v2）
+Video Memory 存储（v3）
 JSON 文件读写操作，汇总所有理解结果。
 
-v2 变更:
-- 支持新字段: shots, beats, story_scenes, event_graph,
-  characters_deep, character_relations, edit_signals,
-  beat_memory_units, scene_memory_units
+v3 变更:
+- 支持新字段: audio_prosodies, multimodal_alignments, chapters,
+  narrative_signals, recomposition_signals, chapter_memory_units
 - 向后兼容旧 memory.json（通过 Optional 字段 + 默认值）
 """
 import json
@@ -19,6 +18,9 @@ from models.schemas import (
     Event, EventGraph, Beat, StoryScene,
     CharacterRelation, EditSignal,
     MemoryUnit, BeatMemoryUnit, SceneMemoryUnit,
+    # v3 新增
+    AudioProsody, MultimodalAlignment, Chapter,
+    NarrativeSignal, RecompositionSignal, ChapterMemoryUnit,
 )
 from utils.logger import get_logger
 
@@ -107,6 +109,13 @@ def _assemble_memory(video_id: str) -> VideoMemory:
     # EditSignal
     edit_signals = _load_json_list(video_dir / "edit_signals.json", EditSignal)
 
+    # v3 新增数据
+    audio_prosodies = _load_json_list(video_dir / "audio_prosody.json", AudioProsody)
+    multimodal_alignments = _load_json_list(video_dir / "multimodal_alignments.json", MultimodalAlignment)
+    chapters = _load_json_list(video_dir / "chapters.json", Chapter)
+    narrative_signals = _load_json_list(video_dir / "narrative_signals.json", NarrativeSignal)
+    recomposition_signals = _load_json_list(video_dir / "recomposition_signals.json", RecompositionSignal)
+
     # speaker_map
     speaker_map = {}
     speaker_map_path = video_dir / "speaker_map.json"
@@ -124,15 +133,24 @@ def _assemble_memory(video_id: str) -> VideoMemory:
         transcripts=transcripts,
         ocr_results=ocr_results,
         vision_summaries=vision_summaries,
+        # v3 新增
+        audio_prosodies=audio_prosodies,
+        multimodal_alignments=multimodal_alignments,
+        # 人物
         characters=characters,
         characters_deep=characters_deep,
         character_relations=character_relations,
         speaker_map=speaker_map,
+        # 叙事
         beats=beats,
         story_scenes=story_scenes,
+        chapters=chapters,
         event_graph=event_graph,
         events=events,
+        # 信号
         edit_signals=edit_signals,
+        narrative_signals=narrative_signals,
+        recomposition_signals=recomposition_signals,
         # memory_units 会在 memory.json 中持久化，
         # 从散文件组装时不包含，需要重新构建索引才会有
     )

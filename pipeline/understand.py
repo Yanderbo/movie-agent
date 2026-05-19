@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-视频理解主流程（v2 — 面向剪辑决策的结构化知识资产）
+视频理解主流程（v3 — 深度多模态 + 面向剪辑决策）
 
-层级结构: Shot → Beat → StoryScene → EventGraph
-流程（14步）:
+层级结构: Shot → Beat → StoryScene → Chapter → EventGraph
+流程（17步）:
   ingest → shot_detect → multi_keyframe → asr_windowed
-  → vision → character_deep → speaker_bind → beat_detect
-  → story_scene_detect → event_graph → character_arc
+  → vision → audio_analysis → character_deep → speaker_bind
+  → multimodal_align → beat_detect → story_scene_detect
+  → chapter_detect → event_graph → character_arc
   → edit_signal → build_memory → indexer
 
-v2 核心改动:
-- Scene 重命名为 Shot，新增 Beat / StoryScene 高层叙事单元
-- 多帧采样替代单关键帧
-- ASR 改为长窗口模式 + 按时间戳回填 shot
-- 人物深度分析（弧线、关系、重要性）
-- 事件图谱（因果/铺垫/反转/冲突升级）
-- 剪辑信号（hook_score / plot_importance / emotional_intensity 等）
-- 多层 VideoMemory + 多维索引
-- 全面向后兼容旧数据和旧步骤名
+v3 新增步骤:
+- audio_analysis: 音频韵律分析（音乐/音效/沉默/语速/音量/语音情绪）
+- multimodal_align: 多模态对齐（shot/ASR/speaker/character/vision/audio）
+- chapter_detect: 长视频大段落检测（StoryScene → Chapter）
+
+v3 增强:
+- vision: micro_clip（镜头运动/互动/景别）
+- event: evidence + confidence
+- edit_signal: 三类信号（EditSignal + NarrativeSignal + RecompositionSignal）
+- memory_builder: 四层 MemoryUnit（+Chapter 级）
+- indexer: 九维索引（+音频索引 + 章节索引）
 """
 import json
 from pathlib import Path
@@ -29,22 +32,25 @@ from utils.logger import get_logger
 
 logger = get_logger("Understand")
 
-# 理解流程步骤定义（v2）
+# 理解流程步骤定义（v3）
 STEPS = [
     "ingest",              # 1.  入库 + 元信息
     "shot_detect",         # 2.  镜头切分
     "multi_keyframe",      # 3.  多帧采样
     "asr_windowed",        # 4.  长窗口 ASR + 回填 shot
-    "vision",              # 5.  多帧画面理解
-    "character_deep",      # 6.  深度人物分析
-    "speaker_bind",        # 7.  Speaker ↔ Character 绑定
-    "beat_detect",         # 8.  剧情节拍检测
-    "story_scene_detect",  # 9.  故事场景检测
-    "event_graph",         # 10. 事件图谱构建
-    "character_arc",       # 11. 人物弧线 + 关系图
-    "edit_signal",         # 12. 剪辑信号计算
-    "build_memory",        # 13. 多层 VideoMemory 构建
-    "indexer",             # 14. 多维索引构建
+    "vision",              # 5.  多帧画面理解 + micro_clip
+    "audio_analysis",      # 6.  音频韵律分析 🆕
+    "character_deep",      # 7.  深度人物分析
+    "speaker_bind",        # 8.  Speaker ↔ Character 绑定
+    "multimodal_align",    # 9.  多模态对齐 🆕
+    "beat_detect",         # 10. 剧情节拍检测
+    "story_scene_detect",  # 11. 故事场景检测
+    "chapter_detect",      # 12. 长视频大段落检测 🆕
+    "event_graph",         # 13. 事件图谱构建
+    "character_arc",       # 14. 人物弧线 + 关系图
+    "edit_signal",         # 15. 三类信号计算
+    "build_memory",        # 16. 四层 VideoMemory 构建
+    "indexer",             # 17. 九维索引构建
 ]
 
 # 旧步骤名 → 新步骤名映射（向后兼容 progress.json）
@@ -63,7 +69,7 @@ def run_understand(
     resume: bool = False,
 ) -> str:
     """
-    运行视频理解全流程（v2）。
+    运行视频理解全流程（v3）。
 
     Args:
         video_path: 视频文件路径（新视频）
@@ -149,10 +155,10 @@ def run_understand(
     else:
         transcripts = _load_cached("transcripts", video_id)
 
-    # ═══ Step 5: Vision (OCR + 多帧画面摘要) ═══
+    # ═══ Step 5: Vision (OCR + 多帧画面摘要 + micro_clip) ═══
     if start_step <= 4:
         logger.info("=" * 50)
-        logger.info(f"步骤 5/{total_steps}: OCR + 多帧画面摘要")
+        logger.info(f"步骤 5/{total_steps}: OCR + 多帧画面摘要 + micro_clip")
         logger.info("=" * 50)
         from pipeline.vision import analyze_keyframes
         ocr_results, vision_summaries = analyze_keyframes(video_id, shots)
@@ -161,10 +167,24 @@ def run_understand(
         ocr_results = _load_cached("ocr", video_id)
         vision_summaries = _load_cached("vision", video_id)
 
-    # ═══ Step 6: Character Deep ═══
+    # ═══ Step 6: Audio Analysis 🆕 ═══
     if start_step <= 5:
         logger.info("=" * 50)
-        logger.info(f"步骤 6/{total_steps}: 深度人物分析")
+        logger.info(f"步骤 6/{total_steps}: 音频韵律分析")
+        logger.info("=" * 50)
+        from pipeline.audio_analysis import analyze_audio
+        audio_prosodies = analyze_audio(
+            video_id, meta.storage_path, shots,
+            transcripts=transcripts, vision_summaries=vision_summaries,
+        )
+        _save_progress(video_id, "audio_analysis")
+    else:
+        audio_prosodies = _load_cached("audio_prosody", video_id)
+
+    # ═══ Step 7: Character Deep ═══
+    if start_step <= 6:
+        logger.info("=" * 50)
+        logger.info(f"步骤 7/{total_steps}: 深度人物分析")
         logger.info("=" * 50)
         from pipeline.character import detect_characters
         characters = detect_characters(video_id, shots)
@@ -174,10 +194,10 @@ def run_understand(
     else:
         characters = _load_cached("characters", video_id)
 
-    # ═══ Step 7: Speaker ↔ Character 绑定 ═══
-    if start_step <= 6:
+    # ═══ Step 8: Speaker ↔ Character 绑定 ═══
+    if start_step <= 7:
         logger.info("=" * 50)
-        logger.info(f"步骤 7/{total_steps}: Speaker ↔ Character 绑定")
+        logger.info(f"步骤 8/{total_steps}: Speaker ↔ Character 绑定")
         logger.info("=" * 50)
         from pipeline.speaker_bind import bind_speakers_to_characters
         speaker_map, transcripts, characters = bind_speakers_to_characters(
@@ -187,10 +207,24 @@ def run_understand(
     else:
         speaker_map = _load_speaker_map(video_id)
 
-    # ═══ Step 8: Beat Detect ═══
-    if start_step <= 7:
+    # ═══ Step 9: Multimodal Alignment 🆕 ═══
+    if start_step <= 8:
         logger.info("=" * 50)
-        logger.info(f"步骤 8/{total_steps}: 剧情节拍检测")
+        logger.info(f"步骤 9/{total_steps}: 多模态对齐")
+        logger.info("=" * 50)
+        from pipeline.multimodal_align import align_multimodal
+        alignments = align_multimodal(
+            video_id, shots, transcripts, vision_summaries,
+            characters, speaker_map, audio_prosodies,
+        )
+        _save_progress(video_id, "multimodal_align")
+    else:
+        alignments = _load_cached("multimodal_alignments", video_id)
+
+    # ═══ Step 10: Beat Detect ═══
+    if start_step <= 9:
+        logger.info("=" * 50)
+        logger.info(f"步骤 10/{total_steps}: 剧情节拍检测")
         logger.info("=" * 50)
         from pipeline.beat_detect import detect_beats
         beats = detect_beats(video_id, shots, transcripts, vision_summaries, characters)
@@ -198,10 +232,10 @@ def run_understand(
     else:
         beats = _load_cached("beats", video_id)
 
-    # ═══ Step 9: Story Scene Detect ═══
-    if start_step <= 8:
+    # ═══ Step 11: Story Scene Detect ═══
+    if start_step <= 10:
         logger.info("=" * 50)
-        logger.info(f"步骤 9/{total_steps}: 故事场景检测")
+        logger.info(f"步骤 11/{total_steps}: 故事场景检测")
         logger.info("=" * 50)
         from pipeline.story_scene_detect import detect_story_scenes
         story_scenes = detect_story_scenes(video_id, shots, beats)
@@ -209,10 +243,23 @@ def run_understand(
     else:
         story_scenes = _load_cached("story_scenes", video_id)
 
-    # ═══ Step 10: Event Graph ═══
-    if start_step <= 9:
+    # ═══ Step 12: Chapter Detect 🆕 ═══
+    if start_step <= 11:
         logger.info("=" * 50)
-        logger.info(f"步骤 10/{total_steps}: 事件图谱构建")
+        logger.info(f"步骤 12/{total_steps}: 长视频大段落检测")
+        logger.info("=" * 50)
+        from pipeline.chapter_detect import detect_chapters
+        chapters = detect_chapters(
+            video_id, story_scenes, beats, shots, meta.duration,
+        )
+        _save_progress(video_id, "chapter_detect")
+    else:
+        chapters = _load_cached("chapters", video_id)
+
+    # ═══ Step 13: Event Graph ═══
+    if start_step <= 12:
+        logger.info("=" * 50)
+        logger.info(f"步骤 13/{total_steps}: 事件图谱构建")
         logger.info("=" * 50)
         from pipeline.event import extract_events
         events, event_graph = extract_events(
@@ -226,10 +273,10 @@ def run_understand(
         events = _load_cached("events", video_id)
         event_graph = _load_event_graph(video_id)
 
-    # ═══ Step 11: Character Arc ═══
-    if start_step <= 10:
+    # ═══ Step 14: Character Arc ═══
+    if start_step <= 13:
         logger.info("=" * 50)
-        logger.info(f"步骤 11/{total_steps}: 人物弧线 + 关系图")
+        logger.info(f"步骤 14/{total_steps}: 人物弧线 + 关系图")
         logger.info("=" * 50)
         from pipeline.character_arc import analyze_character_arcs
         characters, character_relations = analyze_character_arcs(
@@ -239,36 +286,42 @@ def run_understand(
     else:
         character_relations = _load_cached("character_relations", video_id)
 
-    # ═══ Step 12: Edit Signal ═══
-    if start_step <= 11:
+    # ═══ Step 15: Edit Signal (三类信号) ═══
+    if start_step <= 14:
         logger.info("=" * 50)
-        logger.info(f"步骤 12/{total_steps}: 剪辑信号计算")
+        logger.info(f"步骤 15/{total_steps}: 三类信号计算")
         logger.info("=" * 50)
         from pipeline.edit_signal import compute_edit_signals
-        edit_signals = compute_edit_signals(
+        edit_signals, narrative_signals, recomposition_signals = compute_edit_signals(
             video_id, shots, beats, story_scenes, events,
             characters, transcripts, vision_summaries,
         )
         _save_progress(video_id, "edit_signal")
     else:
         edit_signals = _load_cached("edit_signals", video_id)
+        narrative_signals = _load_cached("narrative_signals", video_id)
+        recomposition_signals = _load_cached("recomposition_signals", video_id)
 
-    # ═══ Step 13: Build Memory ═══
-    if start_step <= 12:
+    # ═══ Step 16: Build Memory ═══
+    if start_step <= 15:
         logger.info("=" * 50)
-        logger.info(f"步骤 13/{total_steps}: 构建多层 VideoMemory")
+        logger.info(f"步骤 16/{total_steps}: 构建四层 VideoMemory")
         logger.info("=" * 50)
 
         from models.schemas import VideoMemory, EventGraph as EG
         from pipeline.memory_builder import (
             build_memory_units, build_beat_memory_units,
-            build_scene_memory_units, assign_character_roles,
+            build_scene_memory_units, build_chapter_memory_units,
+            assign_character_roles,
         )
 
         # Shot 级 MemoryUnit
         memory_units = build_memory_units(
             shots, transcripts, ocr_results, vision_summaries,
             characters, events, beats, story_scenes, edit_signals,
+            chapters=chapters,
+            audio_prosodies=audio_prosodies,
+            alignments=alignments,
         )
 
         # Beat 级 MemoryUnit
@@ -279,6 +332,11 @@ def run_understand(
         # StoryScene 级 MemoryUnit
         scene_memory_units = build_scene_memory_units(
             story_scenes, beats, edit_signals,
+        )
+
+        # Chapter 级 MemoryUnit 🆕
+        chapter_memory_units = build_chapter_memory_units(
+            chapters, story_scenes, edit_signals, narrative_signals,
         )
 
         # 角色判定
@@ -297,6 +355,10 @@ def run_understand(
             transcripts=transcripts if isinstance(transcripts, list) else [],
             ocr_results=ocr_results if isinstance(ocr_results, list) else [],
             vision_summaries=vision_summaries if isinstance(vision_summaries, list) else [],
+            # 音频层 🆕
+            audio_prosodies=audio_prosodies if isinstance(audio_prosodies, list) else [],
+            # 多模态对齐层 🆕
+            multimodal_alignments=alignments if isinstance(alignments, list) else [],
             # 人物层
             characters=characters if isinstance(characters, list) else [],
             characters_deep=characters if isinstance(characters, list) else [],
@@ -305,14 +367,18 @@ def run_understand(
             # 叙事层
             beats=beats if isinstance(beats, list) else [],
             story_scenes=story_scenes if isinstance(story_scenes, list) else [],
+            chapters=chapters if isinstance(chapters, list) else [],
             event_graph=event_graph,
             events=events if isinstance(events, list) else [],
             # 剪辑信号层
             edit_signals=edit_signals if isinstance(edit_signals, list) else [],
+            narrative_signals=narrative_signals if isinstance(narrative_signals, list) else [],
+            recomposition_signals=recomposition_signals if isinstance(recomposition_signals, list) else [],
             # Memory 层
             memory_units=memory_units,
             beat_memory_units=beat_memory_units,
             scene_memory_units=scene_memory_units,
+            chapter_memory_units=chapter_memory_units,
         )
         save_memory(memory)
 
@@ -323,10 +389,10 @@ def run_understand(
 
         _save_progress(video_id, "build_memory")
 
-    # ═══ Step 14: Indexer ═══
-    if start_step <= 13:
+    # ═══ Step 17: Indexer ═══
+    if start_step <= 16:
         logger.info("=" * 50)
-        logger.info(f"步骤 14/{total_steps}: 构建多维检索索引")
+        logger.info(f"步骤 17/{total_steps}: 构建九维检索索引")
         logger.info("=" * 50)
         try:
             from pipeline.indexer import build_search_index
@@ -346,10 +412,14 @@ def run_understand(
     logger.info(f"   事件数: {len(memory.events)}")
     logger.info(f"   Beat 数: {len(memory.beats)}")
     logger.info(f"   StoryScene 数: {len(memory.story_scenes)}")
+    logger.info(f"   Chapter 数: {len(memory.chapters)}")
     logger.info(f"   EditSignal 数: {len(memory.edit_signals)}")
+    logger.info(f"   NarrativeSignal 数: {len(memory.narrative_signals)}")
+    logger.info(f"   RecompositionSignal 数: {len(memory.recomposition_signals)}")
     logger.info(f"   MemoryUnit 数: {len(memory.memory_units)}")
     logger.info(f"   BeatMemoryUnit 数: {len(memory.beat_memory_units)}")
     logger.info(f"   SceneMemoryUnit 数: {len(memory.scene_memory_units)}")
+    logger.info(f"   ChapterMemoryUnit 数: {len(memory.chapter_memory_units)}")
     logger.info("=" * 50)
 
     return video_id
@@ -390,6 +460,8 @@ def _load_cached(data_type: str, video_id: str):
     from models.schemas import (
         TranscriptSegment, OCRResult, VisionSummary, Character, CharacterDeep,
         Event, Beat, StoryScene, EditSignal, CharacterRelation,
+        AudioProsody, MultimodalAlignment, Chapter,
+        NarrativeSignal, RecompositionSignal,
     )
     model_map = {
         "transcripts": TranscriptSegment,
@@ -401,6 +473,11 @@ def _load_cached(data_type: str, video_id: str):
         "story_scenes": StoryScene,
         "edit_signals": EditSignal,
         "character_relations": CharacterRelation,
+        "audio_prosody": AudioProsody,
+        "multimodal_alignments": MultimodalAlignment,
+        "chapters": Chapter,
+        "narrative_signals": NarrativeSignal,
+        "recomposition_signals": RecompositionSignal,
     }
     file_map = {
         "transcripts": "transcripts.json",
@@ -412,6 +489,11 @@ def _load_cached(data_type: str, video_id: str):
         "story_scenes": "story_scenes.json",
         "edit_signals": "edit_signals.json",
         "character_relations": "character_relations.json",
+        "audio_prosody": "audio_prosody.json",
+        "multimodal_alignments": "multimodal_alignments.json",
+        "chapters": "chapters.json",
+        "narrative_signals": "narrative_signals.json",
+        "recomposition_signals": "recomposition_signals.json",
     }
     video_dir = config.VIDEOS_DIR / video_id
     filename = file_map.get(data_type)
