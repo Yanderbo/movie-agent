@@ -11,7 +11,7 @@
 
 基于 JSON 文件的读写层，所有数据持久化在 `data/videos/{video_id}/` 目录下。
 
-v2 支持多层 VideoMemory 结构（Shot / Beat / StoryScene / EventGraph / EditSignal）。
+v3 支持多层 VideoMemory 结构（Shot / Beat / StoryScene / Chapter / EventGraph / 三类剪辑信号），并保留对旧版 JSON 字段的兼容。
 
 ### 主要函数
 
@@ -34,24 +34,29 @@ def load_memory(video_id) -> VideoMemory:
 
 ### `_assemble_memory()` — 散文件组装
 
-当 `memory.json` 不存在时（如流水线在 step 13 之前中断），从以下文件逐个加载：
+当 `memory.json` 不存在时（如流水线在 step 16 之前中断），从以下文件逐个加载：
 
-| 文件 | 模型类 | v2 新增 |
-|------|--------|---------|
-| `scenes/scenes.json` | Shot (= Scene) | |
-| `transcripts.json` | TranscriptSegment | |
-| `ocr.json` | OCRResult | |
-| `vision.json` | VisionSummary | |
+| 文件 | 模型类 | 说明 |
+|------|--------|------|
+| `scenes/scenes.json` | Shot (= Scene) | 镜头与关键帧路径 |
+| `transcripts.json` | TranscriptSegment | 长窗口 ASR 结果 |
+| `ocr.json` | OCRResult | OCR 文字 |
+| `vision.json` | VisionSummary | 多帧画面摘要 + micro_clip |
+| `audio_prosody.json` | AudioProsody | v3 音频韵律 |
+| `multimodal_alignments.json` | MultimodalAlignment | v3 多模态对齐 |
 | `characters.json` | CharacterDeep → Character | 先尝试 CharacterDeep |
-| `events.json` | Event | |
-| `speaker_map.json` | dict | |
-| `beats.json` | Beat | ✅ |
-| `story_scenes.json` | StoryScene | ✅ |
-| `event_graph.json` | EventGraph | ✅ |
-| `edit_signals.json` | EditSignal | ✅ |
-| `character_relations.json` | CharacterRelation | ✅ |
+| `speaker_map.json` | dict | speaker → character |
+| `beats.json` | Beat | Shot → Beat |
+| `story_scenes.json` | StoryScene | Beat → StoryScene |
+| `chapters.json` | Chapter | v3 StoryScene → Chapter |
+| `events.json` | Event | 事件节点 |
+| `event_graph.json` | EventGraph | 事件关系图 |
+| `character_relations.json` | CharacterRelation | 人物关系 |
+| `edit_signals.json` | EditSignal | 8 维剪辑信号 |
+| `narrative_signals.json` | NarrativeSignal | v3 叙事信号 |
+| `recomposition_signals.json` | RecompositionSignal | v3 二创信号 |
 
-注意：散文件组装时 **不包含 MemoryUnit / BeatMemoryUnit / SceneMemoryUnit**（需要 step 13 构建）和 **不包含 embedding**（需要 step 14 构建）。
+注意：散文件组装时 **不包含 MemoryUnit / BeatMemoryUnit / SceneMemoryUnit / ChapterMemoryUnit**（需要 step 16 构建）和 **不包含 embedding**（需要 step 17 构建）。
 
 ---
 
@@ -61,7 +66,7 @@ def load_memory(video_id) -> VideoMemory:
 
 | 命令 | 函数 | 说明 |
 |------|------|------|
-| `understand` | `cmd_understand()` | 运行理解流水线（14步） |
+| `understand` | `cmd_understand()` | 运行理解流水线（17步） |
 | `search` | `cmd_search()` | 搜索 Video Memory |
 | `edit` | `cmd_edit()` | 生成 EditPlan |
 | `show-plan` | `cmd_show_plan()` | 查看 EditPlan |
@@ -71,7 +76,7 @@ def load_memory(video_id) -> VideoMemory:
 ### 各命令的参数
 
 ```bash
-# 理解视频（14步）
+# 理解视频（17步）
 python main.py understand --video movie.mp4
 python main.py understand --video-id xxx --resume   # 断点续跑（兼容 v1 旧进度）
 
@@ -120,7 +125,7 @@ os.getenv("KEY", "default")   # 环境变量优先
 | **日志** | `LOG_DIR`, `LOG_LEVEL` | 日志存储 |
 | **路径** | `DATA_DIR`, `VIDEOS_DIR`, `EDITPLANS_DIR`, `RENDERS_DIR` | 数据目录 |
 
-### v2 新增配置项
+### 关键新增配置项
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -154,33 +159,40 @@ data/
 │       │       ├── scene_0000_f0.jpg  ← step 3 (多帧)
 │       │       ├── scene_0000_f1.jpg
 │       │       └── ...
-│       ├── audio_shots/
-│       │   ├── window_000.wav       ← step 4 (长窗口)
+│       ├── audio_windows/
+│       │   ├── window_0000.wav      ← step 4 (长窗口 ASR)
 │       │   └── ...
 │       ├── transcripts.json         ← step 4 (含 cross_shot / transcript_type)
 │       ├── ocr.json                 ← step 5
-│       ├── vision.json              ← step 5 (含 action_description / props)
+│       ├── vision.json              ← step 5 (含 action_description / props / micro_clip)
+│       ├── audio_prosody.json       ← step 6
 │       ├── characters/
-│       │   └── char_000.jpg         ← step 6
-│       ├── characters.json          ← step 6 (CharacterDeep)
-│       ├── speaker_map.json         ← step 7
-│       ├── beats.json               ← step 8  🆕
-│       ├── story_scenes.json        ← step 9  🆕
-│       ├── events.json              ← step 10
-│       ├── event_graph.json         ← step 10 🆕
-│       ├── character_arcs.json      ← step 11 🆕
-│       ├── character_relations.json ← step 11 🆕
-│       ├── edit_signals.json        ← step 12 🆕
-│       ├── memory.json              ← step 13 (三层 MemoryUnit)
+│       │   └── char_000.jpg         ← step 7
+│       ├── characters.json          ← step 7 (CharacterDeep)
+│       ├── speaker_map.json         ← step 8
+│       ├── multimodal_alignments.json ← step 9
+│       ├── beats.json               ← step 10
+│       ├── story_scenes.json        ← step 11
+│       ├── chapters.json            ← step 12
+│       ├── events.json              ← step 13
+│       ├── event_graph.json         ← step 13
+│       ├── character_arcs.json      ← step 14
+│       ├── character_relations.json ← step 14
+│       ├── edit_signals.json        ← step 15
+│       ├── narrative_signals.json   ← step 15
+│       ├── recomposition_signals.json ← step 15
+│       ├── memory.json              ← step 16 (四层 MemoryUnit)
 │       └── index/
-│           ├── search_index.json    ← step 14
-│           ├── faiss.index          ← step 14
-│           ├── id_map.json          ← step 14
-│           ├── character_index.json ← step 14 🆕
-│           ├── event_index.json     ← step 14 🆕
-│           ├── relation_index.json  ← step 14 🆕
-│           ├── emotion_index.json   ← step 14 🆕
-│           └── edit_signal_index.json ← step 14 🆕
+│           ├── search_index.json    ← step 17
+│           ├── faiss.index          ← step 17
+│           ├── id_map.json          ← step 17
+│           ├── character_index.json ← step 17
+│           ├── event_index.json     ← step 17
+│           ├── relation_index.json  ← step 17
+│           ├── emotion_index.json   ← step 17
+│           ├── edit_signal_index.json ← step 17
+│           ├── audio_index.json     ← step 17
+│           └── chapter_index.json   ← step 17
 ├── editplans/
 │   └── plan_xxx.json
 └── renders/

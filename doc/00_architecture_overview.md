@@ -38,7 +38,7 @@
 │    ├─[11 story_scene_detect]──→ story_scenes.json (beat → scene 聚合)   │
 │    ├─[12 chapter_detect]──→ chapters.json 🆕 (scene → chapter 聚合)     │
 │    ├─[13 event_graph]──→ events.json + event_graph.json (含证据+置信)   │
-│    ├─[14 character_arc]──→ character_arcs.json + character_relations    │
+│    ├─[14 character_arc]──→ character_arcs.json + character_relations.json│
 │    ├─[15 edit_signal]──→ edit_signals.json + narrative_signals.json     │
 │    │                      + recomposition_signals.json (三类信号)        │
 │    ├─[16 build_memory]──→ memory.json (四层MemoryUnit + 角色判定)       │

@@ -131,7 +131,7 @@ def run_understand(video_path, video_id=None, resume=False) -> str:
 |------|------|
 | `camera_motion` | 镜头运动（pan/tilt/zoom/static/tracking/handheld） |
 | `interaction_description` | 人物互动描述 |
-| `shot_scale` | 景别（extreme_close_up/close_up/medium/full/wide/extreme_wide） |
+| `shot_scale` | 景别（extreme_close_up/close_up/medium_close/medium/medium_long/long/extreme_long） |
 
 ---
 
@@ -140,13 +140,15 @@ def run_understand(video_path, video_id=None, resume=False) -> str:
 **模块**：`pipeline/audio_analysis.py`
 
 **流程**：
-1. 按 ASR 窗口时长切分音频段
+1. 按 ASR 窗口时长组织时间窗口和窗口内 shot
 2. 构造每段 shot 内的台词/画面上下文 prompt
-3. LLM 分析音频特征：音乐、音效、沉默比例、语速、音量峰值、语音情绪
+3. LLM 基于上下文推断音频韵律特征：音乐、音效、沉默比例、语速、音量峰值、语音情绪
 4. 回填 `AudioProsody` 对象到每个 shot
 5. 写出 `audio_prosody.json`
 
 **输出**：`audio_prosody.json`（AudioProsody 列表）
+
+**当前实现说明**：`audio_analysis.py` 当前没有像 ASR 那样抽取音频文件并传入多模态接口，而是根据台词、画面摘要和 shot 时间范围让 LLM 推断音频韵律；因此产物更适合作为剪辑辅助信号，而不是精确 DSP 分析结果。
 
 **AudioProsody 字段**：
 | 字段 | 说明 |
@@ -156,10 +158,10 @@ def run_understand(video_path, video_id=None, resume=False) -> str:
 | `has_sfx` | 是否有音效 |
 | `sfx_tags` | 音效标签列表 |
 | `silence_ratio` | 沉默占比 0-1 |
-| `speech_rate` | 语速（words_per_min） |
+| `speech_rate` | 语速（slow/normal/fast） |
 | `volume_peak` | 音量峰值 0-1 |
 | `speech_emotion` | 语音情绪 |
-| `segments` | AudioSegment 列表（精细时间段） |
+| `audio_segments` | AudioSegment 列表（精细时间段） |
 
 **降级策略**：LLM 失败时返回空 AudioProsody（仅保留 `scene_index`），不阻塞流程
 
@@ -260,7 +262,7 @@ def run_understand(video_path, video_id=None, resume=False) -> str:
 4. 汇总 `story_scene_indices`, `beat_indices`, `shot_indices`
 5. 写出 `chapters.json`
 
-**Chapter 类型**：`opening` / `development` / `climax` / `resolution` / `epilogue`
+**Chapter 类型**：`prologue` / `act_1` / `act_2` / `act_3` / `climax_act` / `epilogue` / `flashback`
 
 **降级策略**：LLM 失败时，每 3 个 StoryScene 自动分为一组
 
@@ -382,6 +384,9 @@ def run_understand(video_path, video_id=None, resume=False) -> str:
 - 每步完成后调用 `_save_progress(video_id, step_name)`，写入 `progress.json`
 - resume 时读取 `progress.json`，找到第一个未完成的步骤作为起始点
 - **v2/v3 向后兼容**：`_STEP_ALIASES` 将旧步骤名映射为新步骤名
+- 当前实现依赖 `progress.json` 判断断点；如果进度文件缺失，不会自动从散文件推断完成步骤
+- `beat_detect` / `story_scene_detect` 会在内存对象上回填 `Shot.beat_index` / `Shot.story_scene_index`，中断续跑时建议检查 `scenes/scenes.json` 是否包含这些回填字段
+- LLM 分组结果按现有输出落盘；建议检查 `beats.json`、`story_scenes.json`、`chapters.json` 是否完整覆盖对应下层索引
 
 ```python
 _STEP_ALIASES = {

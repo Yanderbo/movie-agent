@@ -95,16 +95,15 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `scene_index` | int | 对应的 shot |
-| `start_time` / `end_time` | float | 时间范围 |
 | `has_music` | bool | 是否有背景音乐 |
 | `music_mood` | str | 音乐情绪 |
 | `has_sfx` | bool | 是否有音效 |
 | `sfx_tags` | list[str] | 音效标签列表 |
 | `silence_ratio` | float | 沉默占比 0-1 |
-| `speech_rate` | float | 语速（words_per_min） |
+| `speech_rate` | str | 语速（slow / normal / fast） |
 | `volume_peak` | float | 音量峰值 0-1 |
 | `speech_emotion` | str | 语音情绪 |
-| `segments` | list[AudioSegment] | 精细时间段 |
+| `audio_segments` | list[AudioSegment] | 精细时间段 |
 
 ### AudioSegment（音频精细时间段）🆕
 
@@ -119,6 +118,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `scene_index` | int | 对应的 shot |
+| `start_time` / `end_time` | float | 对齐时间范围 |
 | `speaker_to_character` | dict[str,str] | speaker_id → character_id 映射 |
 | `visible_characters` | list[str] | 画面中可见的人物 |
 | `speaking_characters` | list[str] | 正在说话的人物 |
@@ -160,7 +160,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | `shot_indices` | list[int] | 包含的 Shot（汇总） |
 | `title` | str | 章节标题 |
 | `description` | str | 章节描述 |
-| `chapter_type` | str | opening / development / climax / resolution / epilogue |
+| `chapter_type` | str | prologue / act_1 / act_2 / act_3 / climax_act / epilogue / flashback |
 | `theme` | str | 主题 |
 | `characters` | list[str] | 出场人物 |
 | `mood_progression` | str | 情绪走向描述 |
@@ -171,7 +171,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | 原有字段 | — | event_index, event_type, description, characters, importance, ... |
-| `evidence` | str | **v3** 支撑该事件的证据描述 |
+| `evidence` | list[str] | **v3** 支撑该事件的证据描述 |
 | `confidence` | float | **v3** 事件置信度 0-1 |
 | `beat_indices` | list[int] | **v2** 关联的 Beat |
 | `story_scene_indices` | list[int] | **v2** 关联的 StoryScene |
@@ -183,7 +183,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | `source_event` / `target_event` | int | 源/目标事件索引 |
 | `relation_type` | str | cause / foreshadow / reversal / escalation / resolution / parallel |
 | `description` | str | 关系描述 |
-| `evidence` | str | **v3** 支撑该关系的证据 |
+| `evidence` | list[str] | **v3** 支撑该关系的证据 |
 | `confidence` | float | **v3** 关系置信度 0-1 |
 | `relation_basis` | str | **v3** 推理依据 |
 
@@ -191,7 +191,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `unit_type` | str | shot / beat / story_scene |
+| `unit_type` | str | shot / beat / story_scene / chapter（当前计算逻辑主要生成 shot/beat/story_scene） |
 | `unit_index` | int | 对应的 index |
 | `hook_score` | float | 钩子适合度 0-1 |
 | `plot_importance` | float | 剧情重要性 0-1 |
@@ -207,7 +207,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `unit_type` | str | beat / story_scene / chapter |
+| `unit_type` | str | beat / story_scene / chapter（当前计算逻辑主要生成 beat/story_scene） |
 | `unit_index` | int | 对应的 index |
 | `arc_position` | float | 叙事弧位置 0-1（开头=0，结尾=1） |
 | `tension_level` | float | 张力水平 0-1 |
@@ -220,7 +220,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `unit_type` | str | beat / story_scene |
+| `unit_type` | str | beat / story_scene（当前计算逻辑主要生成 beat） |
 | `unit_index` | int | 对应的 index |
 | `meme_potential` | float | 梗/传播潜力 0-1 |
 | `emotional_quotability` | float | 情感引用潜力/"名场面"程度 0-1 |
@@ -297,10 +297,11 @@ EventNode = Event   # 旧代码 import EventNode 可正常工作
 | `TranscriptSegment.cross_shot` | `False` | v2 |
 | `VisionSummary.action_description` | `""` | v2 |
 | `VisionSummary.camera_motion` / `interaction_description` / `shot_scale` | `""` | v3 |
-| `Event.evidence` | `""` | v3 |
-| `Event.confidence` | `0.0` | v3 |
-| `EventEdge.evidence` / `relation_basis` | `""` | v3 |
-| `EventEdge.confidence` | `0.0` | v3 |
+| `Event.evidence` | `[]` | v3 |
+| `Event.confidence` | `0.8` | v3 |
+| `EventEdge.evidence` | `[]` | v3 |
+| `EventEdge.relation_basis` | `""` | v3 |
+| `EventEdge.confidence` | `0.5` | v3 |
 | `VideoMemory.audio_prosodies` / `multimodal_alignments` | `[]` | v3 |
 | `VideoMemory.chapters` | `[]` | v3 |
 | `VideoMemory.narrative_signals` / `recomposition_signals` | `[]` | v3 |
