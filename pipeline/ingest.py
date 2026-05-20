@@ -13,7 +13,7 @@ from pathlib import Path
 
 import config
 from models.schemas import VideoMeta
-from utils.ffmpeg_utils import get_video_info
+from utils.ffmpeg_utils import get_video_info, compress_video
 from utils.logger import get_logger
 
 logger = get_logger("Ingest")
@@ -51,7 +51,10 @@ def _generate_readable_video_id(video_path: str) -> str:
 
 def ingest_video(video_path: str, video_id: str = None) -> VideoMeta:
     """
-    将视频入库：复制到数据目录，解析元信息。
+    将视频入库：复制到数据目录，压缩（如需要），解析元信息。
+
+    v4.1 变更：新增视频压缩步骤，生成 compressed.mp4 用于理解流水线。
+    渲染阶段仍使用原始视频。
 
     Args:
         video_path: 原始视频文件路径
@@ -84,11 +87,35 @@ def ingest_video(video_path: str, video_id: str = None) -> VideoMeta:
     logger.info("解析视频元信息...")
     info = get_video_info(str(dest))
 
+    # ── v4.1: 视频压缩 ──
+    compressed_dest = video_dir / "compressed.mp4"
+    compress_result = {"compressed": False}
+    if compressed_dest.exists():
+        logger.info(f"压缩视频已存在，跳过压缩: {compressed_dest}")
+        compressed_info = get_video_info(str(compressed_dest))
+        compress_result = {
+            "compressed": True,
+            "output_path": str(compressed_dest),
+            "original_height": info["height"],
+            "original_fps": info["fps"],
+            "compressed_height": compressed_info["height"],
+            "compressed_fps": compressed_info["fps"],
+        }
+    else:
+        compress_result = compress_video(
+            str(dest), str(compressed_dest),
+            max_height=config.COMPRESS_MAX_HEIGHT,
+            max_fps=config.COMPRESS_MAX_FPS,
+        )
+
+    # 确定理解流水线使用的视频路径
+    pipeline_video = str(compressed_dest) if compress_result["compressed"] else str(dest)
+
     meta = VideoMeta(
         video_id=video_id,
         filename=src.name,
         original_path=str(src.resolve()),
-        storage_path=str(dest),
+        storage_path=pipeline_video,  # v4.1: 指向压缩视频（如果有）
         duration=info["duration"],
         width=info["width"],
         height=info["height"],
@@ -96,6 +123,13 @@ def ingest_video(video_path: str, video_id: str = None) -> VideoMeta:
         codec=info["codec"],
         file_size=info["file_size"],
         status="ingested",
+        # v4.1 压缩信息
+        compressed_path=str(compressed_dest) if compress_result["compressed"] else "",
+        is_compressed=compress_result["compressed"],
+        original_height=compress_result.get("original_height", info["height"]),
+        original_fps=compress_result.get("original_fps", info["fps"]),
+        compressed_height=compress_result.get("compressed_height", 0),
+        compressed_fps=compress_result.get("compressed_fps", 0.0),
     )
 
     # 保存 meta.json
@@ -108,5 +142,10 @@ def ingest_video(video_path: str, video_id: str = None) -> VideoMeta:
         f"分辨率={meta.width}x{meta.height}, "
         f"帧率={meta.fps}"
     )
+    if compress_result["compressed"]:
+        logger.info(
+            f"  压缩: {compress_result['original_height']}p@{compress_result['original_fps']}fps → "
+            f"{compress_result['compressed_height']}p@{compress_result['compressed_fps']}fps"
+        )
 
     return meta

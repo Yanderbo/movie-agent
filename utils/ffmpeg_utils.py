@@ -79,6 +79,133 @@ def get_video_info(video_path: str) -> dict:
     }
 
 
+def compress_video(
+    src: str, dst: str,
+    max_height: int = None, max_fps: int = None,
+) -> dict:
+    """
+    压缩视频用于理解流水线（v4.1 新增）。
+
+    仅在分辨率或帧率超过阈值时进行压缩，否则跳过。
+    音频保留原始质量（-c:a copy）以确保 ASR 准确性。
+
+    Args:
+        src: 源视频路径
+        dst: 输出路径
+        max_height: 高度阈值，超过则缩放（默认从 config 读取）
+        max_fps: 帧率阈值，超过则降帧率（默认从 config 读取）
+
+    Returns:
+        dict: {
+            "compressed": bool,      # 是否实际执行了压缩
+            "output_path": str,      # 输出文件路径
+            "original_height": int,
+            "original_fps": float,
+            "compressed_height": int,
+            "compressed_fps": float,
+        }
+    """
+    if max_height is None:
+        max_height = config.COMPRESS_MAX_HEIGHT
+    if max_fps is None:
+        max_fps = config.COMPRESS_MAX_FPS
+
+    info = get_video_info(src)
+    original_height = info["height"]
+    original_fps = info["fps"]
+
+    need_scale = original_height > max_height
+    need_fps = original_fps > max_fps
+
+    if not need_scale and not need_fps:
+        logger.info(
+            f"视频无需压缩: {original_height}p @ {original_fps}fps "
+            f"(阈值: {max_height}p @ {max_fps}fps)"
+        )
+        return {
+            "compressed": False,
+            "output_path": src,
+            "original_height": original_height,
+            "original_fps": original_fps,
+            "compressed_height": original_height,
+            "compressed_fps": original_fps,
+        }
+
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [config.FFMPEG_PATH, "-y", "-i", src]
+
+    # 视频滤镜：按比例缩放，宽度自适应保持偶数
+    if need_scale:
+        cmd.extend(["-vf", f"scale=-2:{max_height}"])
+
+    # 帧率
+    if need_fps:
+        cmd.extend(["-r", str(max_fps)])
+
+    # 视频编码：使用较快的预设
+    cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+
+    # 音频保留原始
+    cmd.extend(["-c:a", "copy"])
+
+    cmd.append(dst)
+
+    compressed_height = max_height if need_scale else original_height
+    compressed_fps = float(max_fps) if need_fps else original_fps
+
+    logger.info(
+        f"压缩视频: {original_height}p@{original_fps}fps → "
+        f"{compressed_height}p@{compressed_fps}fps"
+    )
+    _run_cmd(cmd, timeout=1800)  # 压缩可能较慢，30分钟超时
+    logger.info(f"视频压缩完成: {dst}")
+
+    return {
+        "compressed": True,
+        "output_path": dst,
+        "original_height": original_height,
+        "original_fps": original_fps,
+        "compressed_height": compressed_height,
+        "compressed_fps": compressed_fps,
+    }
+
+
+def extract_video_segment(
+    video_path: str, output_path: str,
+    start_time: float, end_time: float,
+) -> str:
+    """
+    从视频中截取指定时间段的视频片段（含音频）。
+    用于 MinuteChunk 处理时提取分钟级视频段。
+
+    Args:
+        video_path: 源视频路径
+        output_path: 输出路径
+        start_time: 起始时间(秒)
+        end_time: 结束时间(秒)
+
+    Returns:
+        输出文件路径
+    """
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    duration = end_time - start_time
+    if duration <= 0:
+        raise ValueError(f"时间段无效: start={start_time}, end={end_time}")
+
+    cmd = [
+        config.FFMPEG_PATH, "-y",
+        "-ss", str(start_time),
+        "-i", video_path,
+        "-t", str(duration),
+        "-c", "copy",
+        output_path,
+    ]
+    _run_cmd(cmd, timeout=120)
+    logger.debug(f"视频段提取完成: [{start_time:.1f}s-{end_time:.1f}s] -> {output_path}")
+    return output_path
+
+
 def extract_audio(video_path: str, output_path: str, sample_rate: int = 16000) -> str:
     """
     从视频中提取音频。

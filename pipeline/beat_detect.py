@@ -54,7 +54,7 @@ BEAT_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析
 [
   {{
     "beat_index": {beat_offset},
-    "shot_indices": [0, 1, 2],
+    "shot_indices": [{example_shot_indices}],
     "beat_type": "dialogue",
     "description": "男女主角在咖啡厅讨论计划",
     "emotion": "轻松",
@@ -89,11 +89,14 @@ def detect_beats(
     video_dir = config.VIDEOS_DIR / video_id
     beats_path = video_dir / "beats.json"
 
-    # 如果已存在，直接加载
+    # 如果已存在，直接加载（仍需回填 shot 的 beat_index）
     if beats_path.exists():
         logger.info(f"Beat 检测结果已存在，直接加载: {beats_path}")
         data = json.loads(beats_path.read_text(encoding="utf-8"))
-        return [Beat(**b) for b in data]
+        loaded_beats = [Beat(**b) for b in data]
+        # 缓存加载也需回填 shot 的反向链接
+        _backfill_beat_to_shots(shots, loaded_beats, video_id)
+        return loaded_beats
 
     logger.info(f"开始 Beat 检测: {len(shots)} 个镜头")
 
@@ -142,9 +145,12 @@ def detect_beats(
 
         shots_info = "\n".join(shot_lines)
 
+        # 构建示例索引（使用当前段的实际 scene_index）
+        example_indices = ", ".join(str(s.scene_index) for s in seg_shots[:3])
         prompt = BEAT_PROMPT_TEMPLATE.format(
             shots_info=shots_info,
             beat_offset=beat_offset,
+            example_shot_indices=example_indices,
         )
 
         try:
@@ -155,10 +161,14 @@ def detect_beats(
                 beats = _fallback_beats(seg_shots, beat_offset)
             else:
                 beats = []
+                # 局部索引→全局索引映射（防御 LLM 输出局部编号）
+                local_to_global = {i: s.scene_index for i, s in enumerate(seg_shots)}
                 for item in parsed:
                     shot_indices = item.get("shot_indices", [])
                     if not shot_indices:
                         continue
+                    # 尝试全局索引，失败则尝试局部索引映射
+                    shot_indices = [local_to_global.get(si, si) for si in shot_indices]
                     # 计算时间范围
                     beat_shots = [s for s in seg_shots if s.scene_index in shot_indices]
                     if not beat_shots:
@@ -184,22 +194,34 @@ def detect_beats(
         beat_offset += len(beats)
         time.sleep(0.5)
 
-    # 回写 shot 的 beat_index
-    beat_shot_map = {}
-    for b in all_beats:
-        for si in b.shot_indices:
-            beat_shot_map[si] = b.beat_index
-    for s in shots:
-        s.beat_index = beat_shot_map.get(s.scene_index)
+    # 回填 shot 的 beat_index 并持久化
+    _backfill_beat_to_shots(shots, all_beats, video_id)
 
-    # 保存
+    # 保存 beats.json
     beats_path.write_text(
         json.dumps([b.model_dump() for b in all_beats], indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    logger.info(f"Beat 检测完成: {len(all_beats)} 个 beat")
 
+    logger.info(f"Beat 检测完成: {len(all_beats)} 个 beat")
     return all_beats
+
+
+def _backfill_beat_to_shots(shots: list[Shot], beats: list[Beat], video_id: str):
+    """回填 shot.beat_index 并持久化到 scenes.json"""
+    beat_shot_map = {}
+    for b in beats:
+        for si in b.shot_indices:
+            beat_shot_map[si] = b.beat_index
+    for s in shots:
+        s.beat_index = beat_shot_map.get(s.scene_index)
+    # 持久化反向链接
+    scenes_json = config.VIDEOS_DIR / video_id / "scenes" / "scenes.json"
+    if scenes_json.exists():
+        scenes_json.write_text(
+            json.dumps([s.model_dump() for s in shots], indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
 
 def _fallback_beats(shots: list[Shot], offset: int) -> list[Beat]:

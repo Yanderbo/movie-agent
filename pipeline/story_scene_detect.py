@@ -76,11 +76,14 @@ def detect_story_scenes(
     video_dir = config.VIDEOS_DIR / video_id
     scenes_path = video_dir / "story_scenes.json"
 
-    # 如果已存在，直接加载
+    # 如果已存在，直接加载（仍需回填 shot 的 story_scene_index）
     if scenes_path.exists():
         logger.info(f"StoryScene 结果已存在，直接加载: {scenes_path}")
         data = json.loads(scenes_path.read_text(encoding="utf-8"))
-        return [StoryScene(**s) for s in data]
+        loaded_scenes = [StoryScene(**s) for s in data]
+        # 缓存加载也需回填 shot 的反向链接
+        _backfill_scene_to_shots(shots, loaded_scenes, video_id)
+        return loaded_scenes
 
     if not beats:
         logger.warning("无 Beat 数据，跳过 StoryScene 检测")
@@ -147,21 +150,36 @@ def detect_story_scenes(
         logger.warning(f"StoryScene 检测失败: {e}，使用默认分组")
         story_scenes = _fallback_story_scenes(beats, shots)
 
-    # 回写 shot 的 story_scene_index
-    for ss in story_scenes:
-        for si in ss.shot_indices:
-            for s in shots:
-                if s.scene_index == si:
-                    s.story_scene_index = ss.story_scene_index
+    # 回填 shot 的 story_scene_index 并持久化
+    _backfill_scene_to_shots(shots, story_scenes, video_id)
 
-    # 保存
+    # 保存 story_scenes.json
     scenes_path.write_text(
         json.dumps([s.model_dump() for s in story_scenes], indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
     logger.info(f"StoryScene 检测完成: {len(story_scenes)} 个故事场景")
 
     return story_scenes
+
+
+def _backfill_scene_to_shots(
+    shots: list[Shot], story_scenes: list[StoryScene], video_id: str,
+):
+    """回填 shot.story_scene_index 并持久化到 scenes.json"""
+    shot_map = {s.scene_index: s for s in shots}
+    for ss in story_scenes:
+        for si in ss.shot_indices:
+            if si in shot_map:
+                shot_map[si].story_scene_index = ss.story_scene_index
+    # 持久化反向链接
+    shots_json = config.VIDEOS_DIR / video_id / "scenes" / "scenes.json"
+    if shots_json.exists():
+        shots_json.write_text(
+            json.dumps([s.model_dump() for s in shots], indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
 
 def _fallback_story_scenes(beats: list[Beat], shots: list[Shot]) -> list[StoryScene]:

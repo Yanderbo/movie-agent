@@ -7,13 +7,18 @@
 
 ```
 ── 基础层 ──
-VideoMeta ─────────────────── 视频元信息
+VideoMeta ─────────────────── 视频元信息（v4.1: 含压缩信息）
+
+── v4.1 融合理解层 ──
+CharacterGallery ──────────── 角色脸谱（face_cluster 产物）
+CharacterProfile ──────────── 动态角色档案（随 MinuteChunk 累积）
+MinuteChunk ───────────────── 分钟级理解单元（ASR/Vision/Audio/角色/对齐）
 
 ── Shot 层 ──
 Shot (= Scene) ────────────── 镜头（最小视觉单元，含多帧路径）
 TranscriptSegment ─────────── 台词（含 cross_shot / transcript_type）
 OCRResult ─────────────────── 单场景 OCR 结果
-VisionSummary ─────────────── 画面摘要（v3: 含 micro_clip 字段）
+VisionSummary ─────────────── 画面摘要（v3: 含镜头运动/景别/人物互动字段）
 
 ── 音频层 🆕 ──
 AudioSegment ──────────────── 音频精细时间段
@@ -47,7 +52,7 @@ BeatMemoryUnit ────────────── Beat 级记忆单元
 SceneMemoryUnit ───────────── StoryScene 级记忆单元
 ChapterMemoryUnit ─────────── 🆕 Chapter 级记忆单元
 
-VideoMemory ───────────────── 完整理解结果汇总（v3: 四层结构 + 三类信号）
+VideoMemory ───────────────── 完整理解结果汇总（四层结构 + 三类信号）
 
 ── 剪辑方案层 ──
 EditClip ──────────────────── 剪辑片段（含证据链 + EditSignal引用）
@@ -58,6 +63,69 @@ BGMConfig ─────────────────── 背景音乐
 ```
 
 ## 关键模型详解
+
+### VideoMeta（视频元信息）
+
+v4.1 在原始元信息基础上增加压缩相关字段。`storage_path` 指向 understand 阶段实际使用的视频：如果发生压缩，则为 `compressed.mp4`；否则为原始入库文件。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `video_id` / `filename` | str | 视频 ID 与原始文件名 |
+| `original_path` | str | 用户传入视频的原始路径 |
+| `storage_path` | str | 理解流水线使用的视频路径 |
+| `duration` / `width` / `height` / `fps` | float/int | 原始视频元信息 |
+| `codec` / `file_size` | str/int | 编码与文件大小 |
+| `compressed_path` | str | **v4.1** 压缩后视频路径 |
+| `is_compressed` | bool | **v4.1** 是否实际压缩 |
+| `original_height` / `original_fps` | int/float | **v4.1** 压缩前高度和帧率 |
+| `compressed_height` / `compressed_fps` | int/float | **v4.1** 压缩后高度和帧率 |
+
+### CharacterGallery（角色脸谱）v4.1
+
+Step 4 `face_cluster.py` 的主要产物，用于在 Step 5 中作为 Gemini 角色识别先验。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `character_id` | str | 角色 ID，如 `char_000` |
+| `gallery_paths` | list[str] | 代表脸图片路径，主要/次要角色通常 3-6 张 |
+| `gallery_timestamps` | list[float] | 每张代表脸对应的视频时间 |
+| `total_detections` | int | 人脸总检测次数 |
+| `appearance_scenes` | list[int] | 出现过的 shot |
+| `tier` | str | major / minor / passerby |
+| `embedding_centroid` | list[float] | 人脸聚类中心向量 |
+
+### CharacterProfile（动态角色档案）v4.1
+
+Step 5 `minute_chunk.py` 在每个 chunk 处理后逐步更新的角色档案。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `character_id` | str | 角色 ID |
+| `names` | list[str] | 已知称呼，第一个通常作为主名称 |
+| `description` | str | 最新外观描述 |
+| `appearance_changes` | list[dict] | 外观变化记录，如 `{chunk_idx, description}` |
+| `key_actions` | list[dict] | 关键行为记录，如 `{chunk_idx, action}` |
+| `relationships_brief` | list[dict] | 简要关系记录 |
+| `tier` | str | major / minor / passerby |
+| `is_human` | bool | 是否人类角色 |
+| `entity_type` | str | human / animal / robot / other |
+| `gallery_ref` | str | 关联的 `CharacterGallery.character_id` |
+
+### MinuteChunk（分钟级理解单元）v4.1
+
+Step 5 的核心中间模型。它不是最终检索单元，而是用于承载 chunk 级 Gemini 原始理解结果，再回填为 shot 级散文件。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `chunk_index` | int | chunk 编号 |
+| `shot_indices` | list[int] | chunk 覆盖的 shot |
+| `start_time` / `end_time` / `duration` | float | chunk 时间范围 |
+| `raw_transcripts` | list[dict] | Gemini 输出的 ASR 原始结果 |
+| `per_shot_vision` | list[dict] | 逐 shot 画面理解 |
+| `per_shot_audio` | list[dict] | 逐 shot 音频特征 |
+| `character_updates` | list[dict] | 角色动态更新 |
+| `cross_shot_analysis` | dict | 跨 shot 叙事连续性、情绪弧线等 |
+| `suggested_beats` | list[list[int]] | Gemini 建议的 beat 分组 |
 
 ### Shot（镜头）
 
@@ -264,7 +332,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 
 ### VideoMemory — 完整理解结果
 
-v3 多层结构：
+多层结构：
 
 | 字段组 | 字段 |
 |--------|------|
@@ -277,6 +345,8 @@ v3 多层结构：
 | Memory 层 | `memory_units`, `beat_memory_units`, `scene_memory_units`, `chapter_memory_units` 🆕 |
 | 兼容层 | `scenes`（= shots）|
 
+说明：`MinuteChunk`、`CharacterGallery` 和 `CharacterProfile` 是 v4.1 的中间/辅助模型，当前不会直接挂到 `VideoMemory` 顶层；它们分别持久化在 `minute_chunks.json`、`characters/face_clusters.json` 和 `character_profiles.json` 中。
+
 ## 向后兼容性
 
 ### 类型别名
@@ -288,7 +358,7 @@ EventNode = Event   # 旧代码 import EventNode 可正常工作
 
 ### 默认值策略
 
-所有 v2/v3 新增字段均设有默认值，旧版 JSON 数据可直接反序列化：
+所有 v2/v3/v4.1 新增字段均设有默认值，旧版 JSON 数据可直接反序列化：
 
 | 字段 | 默认值 | 版本 |
 |------|--------|------|
@@ -309,3 +379,12 @@ EventNode = Event   # 旧代码 import EventNode 可正常工作
 | `MemoryUnit.chapter_index` | `None` | v3 |
 | `MemoryUnit.audio_prosody` / `alignment` | `None` | v3 |
 | `EditClip.edit_signal_ref` | `None` | v2 |
+| `VideoMeta.compressed_path` | `""` | v4.1 |
+| `VideoMeta.is_compressed` | `False` | v4.1 |
+| `VideoMeta.original_height` / `compressed_height` | `0` | v4.1 |
+| `VideoMeta.original_fps` / `compressed_fps` | `0.0` | v4.1 |
+| `CharacterGallery.gallery_paths` / `appearance_scenes` | `[]` | v4.1 |
+| `CharacterProfile.names` / `appearance_changes` / `key_actions` | `[]` | v4.1 |
+| `MinuteChunk.raw_transcripts` / `per_shot_vision` / `per_shot_audio` | `[]` | v4.1 |
+| `MinuteChunk.cross_shot_analysis` | `{}` | v4.1 |
+| `MinuteChunk.suggested_beats` | `[]` | v4.1 |

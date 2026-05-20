@@ -32,9 +32,9 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
 
 # ─── 视频处理参数 ─────────────────────────────────────────────
-# 压缩参数
-COMPRESS_HEIGHT = int(os.getenv("COMPRESS_HEIGHT", "480"))
-COMPRESS_FPS = int(os.getenv("COMPRESS_FPS", "15"))
+# 压缩参数（v4.1: 用于理解流水线的视频压缩）
+COMPRESS_MAX_HEIGHT = int(os.getenv("COMPRESS_MAX_HEIGHT", "480"))  # 高于此值时压缩
+COMPRESS_MAX_FPS = int(os.getenv("COMPRESS_MAX_FPS", "10"))        # 高于此值时降帧率
 
 # 镜头切分参数
 SCENE_DETECT_THRESHOLD = float(os.getenv("SCENE_DETECT_THRESHOLD", "27.0"))
@@ -49,6 +49,18 @@ ASR_WINDOW_DURATION = int(os.getenv("ASR_WINDOW_DURATION", "300"))  # 长窗口 
 
 # ─── 多帧采样参数 ─────────────────────────────────────────────
 MULTI_KEYFRAME_MAX = int(os.getenv("MULTI_KEYFRAME_MAX", "6"))  # 每个 shot 最大采样帧数
+
+# ─── MinuteChunk 参数（v4.1 新增）────────────────────────────
+CHUNK_TARGET_DURATION = int(os.getenv("CHUNK_TARGET_DURATION", "150"))  # 目标时长(秒) ~2.5min
+CHUNK_MIN_DURATION = int(os.getenv("CHUNK_MIN_DURATION", "90"))         # 最小时长(秒)
+CHUNK_MAX_DURATION = int(os.getenv("CHUNK_MAX_DURATION", "210"))        # 最大时长(秒)
+CHUNK_MERGE_THRESHOLD = int(os.getenv("CHUNK_MERGE_THRESHOLD", "30"))   # 尾段低于此值合并到前一个
+
+# ─── 人脸聚类参数（v4.1 新增）─────────────────────────────────
+FACE_GALLERY_MAX = int(os.getenv("FACE_GALLERY_MAX", "6"))              # 每角色最大脸谱数
+FACE_GALLERY_MIN = int(os.getenv("FACE_GALLERY_MIN", "3"))              # 每角色最小脸谱数
+FACE_CLUSTER_EPS = float(os.getenv("FACE_CLUSTER_EPS", "0.5"))          # DBSCAN eps
+FACE_PASSERBY_MIN_APPEARANCES = int(os.getenv("FACE_PASSERBY_MIN", "3")) # 低于此值视为路人
 
 # ─── 日志配置 ─────────────────────────────────────────────────
 LOG_DIR = Path(os.getenv("LOG_DIR", str(PROJECT_ROOT / "logs")))

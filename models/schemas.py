@@ -39,6 +39,74 @@ class VideoMeta(BaseModel):
     audio_path: Optional[str] = None
     status: str = "uploaded"          # uploaded/processing/ready/failed
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    # ── v4.1 新增：压缩信息 ──
+    compressed_path: str = ""         # 压缩后视频路径（理解流水线使用）
+    is_compressed: bool = False       # 是否经过压缩
+    original_height: int = 0          # 原始高度（压缩前）
+    original_fps: float = 0.0         # 原始帧率（压缩前）
+    compressed_height: int = 0        # 压缩后高度
+    compressed_fps: float = 0.0       # 压缩后帧率
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.1 新增：角色脸谱 + 角色档案 + MinuteChunk
+# ═══════════════════════════════════════════════════════════════
+
+class CharacterGallery(BaseModel):
+    """
+    角色脸谱（v4.1 — face_cluster 步骤产物）。
+
+    每个经聚类确认的角色保存 3-6 张代表脸图片，
+    用于后续 MinuteChunk 处理时输入 Gemini 进行身份识别。
+    """
+    character_id: str
+    gallery_paths: list[str] = Field(default_factory=list)        # 3-6张代表脸路径
+    gallery_timestamps: list[float] = Field(default_factory=list) # 每张脸对应的视频时间
+    total_detections: int = 0         # 总检测次数
+    appearance_scenes: list[int] = Field(default_factory=list)    # 出现的 shot 列表
+    tier: str = "major"               # major / minor / passerby
+    embedding_centroid: list[float] = Field(default_factory=list) # 聚类中心向量
+
+
+class CharacterProfile(BaseModel):
+    """
+    动态角色档案（v4.1 — 随 MinuteChunk 处理逐步累积）。
+
+    在处理每个 chunk 时，Gemini 会输出角色的新信息，
+    包括名称、外观变化、关键行为等，在此档案中动态更新。
+    """
+    character_id: str
+    names: list[str] = Field(default_factory=list)                # 所有已知称呼，第一个为主名称
+    description: str = ""             # 最新外观描述
+    appearance_changes: list[dict] = Field(default_factory=list)  # [{chunk_idx, description}]
+    key_actions: list[dict] = Field(default_factory=list)         # [{chunk_idx, action}]
+    relationships_brief: list[dict] = Field(default_factory=list) # [{target_id, relation}]
+    tier: str = "major"               # major / minor / passerby
+    is_human: bool = True             # False = 动物/机器人等
+    entity_type: str = "human"        # human / animal / robot / other
+    gallery_ref: str = ""             # 关联的 CharacterGallery.character_id
+
+
+class MinuteChunk(BaseModel):
+    """
+    分钟级理解单元（v4.1 核心中间产物）。
+
+    将连续 shot 拼接为 ~2-3min 的 chunk，一次性送入 Gemini
+    完成 ASR + Vision + Audio + 角色标注 + 跨shot分析。
+    处理完成后将结果回填到 shot 级数据结构。
+    """
+    chunk_index: int
+    shot_indices: list[int] = Field(default_factory=list)
+    start_time: float
+    end_time: float
+    duration: float
+    # ── Gemini 返回的原始结果 ──
+    raw_transcripts: list[dict] = Field(default_factory=list)     # ASR 原始结果
+    per_shot_vision: list[dict] = Field(default_factory=list)     # 逐shot画面理解
+    per_shot_audio: list[dict] = Field(default_factory=list)      # 逐shot音频特征
+    character_updates: list[dict] = Field(default_factory=list)   # 角色动态更新
+    cross_shot_analysis: dict = Field(default_factory=dict)       # 跨shot连续性分析
+    suggested_beats: list[list[int]] = Field(default_factory=list)  # 建议的beat分组
 
 
 # ═══════════════════════════════════════════════════════════════
