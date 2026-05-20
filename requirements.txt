@@ -5,6 +5,8 @@ scenedetect[opencv]
 opencv-python
 insightface
 onnxruntime
+# 可选：InsightFace GPU 加速，请按本机 CUDA 版本安装匹配的 onnxruntime-gpu
+# onnxruntime-gpu
 numpy
 scikit-learn
 

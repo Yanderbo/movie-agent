@@ -16,6 +16,8 @@
 - characters/char_XXX_gallery/      每角色 3-6 张代表脸
 """
 import json
+import os
+import subprocess
 import time
 from pathlib import Path
 from collections import defaultdict
@@ -106,12 +108,8 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
         )
         return []
 
-    # 初始化模型
-    app = FaceAnalysis(
-        name="buffalo_l",
-        providers=["CPUExecutionProvider"],
-    )
-    app.prepare(ctx_id=0, det_size=(640, 640))
+    # 初始化模型：优先 GPU，失败自动回退 CPU
+    app = _create_face_app(FaceAnalysis)
 
     face_data = []
     for shot in shots:
@@ -144,6 +142,107 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
 
     logger.info(f"人脸检测完成: {len(face_data)} 个人脸")
     return face_data
+
+
+def _create_face_app(face_analysis_cls):
+    """创建 InsightFace 应用，按配置优先使用 CUDA。"""
+    providers, ctx_id = _select_face_providers()
+    provider_name = _provider_name(providers[0])
+    try:
+        app = face_analysis_cls(name="buffalo_l", providers=providers)
+        app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+        logger.info(f"InsightFace 后端: {provider_name}, device={ctx_id}")
+        return app
+    except Exception as e:
+        if provider_name == "CUDAExecutionProvider":
+            logger.warning(f"InsightFace GPU 初始化失败，回退 CPU: {e}")
+            app = face_analysis_cls(name="buffalo_l", providers=["CPUExecutionProvider"])
+            app.prepare(ctx_id=-1, det_size=(640, 640))
+            return app
+        raise
+
+
+def _select_face_providers() -> tuple[list, int]:
+    """选择 onnxruntime provider；ctx_id=0 为 GPU，-1 为 CPU。"""
+    device = config.FACE_DETECT_DEVICE
+    if device == "cpu":
+        return ["CPUExecutionProvider"], -1
+
+    try:
+        import onnxruntime as ort
+        available = set(ort.get_available_providers())
+    except Exception:
+        available = set()
+
+    if "CUDAExecutionProvider" in available:
+        gpu_id = _select_cuda_device_id()
+        cuda_provider = ("CUDAExecutionProvider", {"device_id": gpu_id})
+        return [cuda_provider, "CPUExecutionProvider"], gpu_id
+
+    if device in ("cuda", "gpu"):
+        logger.warning("未检测到 CUDAExecutionProvider，请安装匹配 CUDA 的 onnxruntime-gpu")
+    return ["CPUExecutionProvider"], -1
+
+
+def _provider_name(provider) -> str:
+    return provider[0] if isinstance(provider, tuple) else provider
+
+
+def _select_cuda_device_id() -> int:
+    raw = config.FACE_DETECT_GPU_ID
+    if raw and raw != "auto":
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning(f"FACE_DETECT_GPU_ID 无效: {raw}，使用 0")
+            return 0
+    return _least_used_cuda_device()
+
+
+def _least_used_cuda_device() -> int:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return 0
+
+    visible = _visible_cuda_devices()
+    candidates = []
+    for line in result.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            physical_id, memory_used = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if visible is None:
+            candidates.append((physical_id, memory_used))
+        elif physical_id in visible:
+            candidates.append((visible.index(physical_id), memory_used))
+
+    return min(candidates, key=lambda item: item[1])[0] if candidates else 0
+
+
+def _visible_cuda_devices() -> list[int] | None:
+    value = os.getenv("CUDA_VISIBLE_DEVICES", "").strip()
+    if not value:
+        return None
+    devices = []
+    for part in value.split(","):
+        part = part.strip()
+        if part.isdigit():
+            devices.append(int(part))
+    return devices or None
 
 
 def _cluster_faces(face_data: list[dict]) -> dict:

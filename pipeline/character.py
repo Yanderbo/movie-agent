@@ -153,12 +153,9 @@ def _detect_faces(scenes: list[Shot]) -> list[dict]:
         logger.warning("InsightFace 未安装，尝试使用 Gemini 进行人物识别")
         return _detect_faces_with_gemini(scenes)
 
-    # 初始化模型
-    app = FaceAnalysis(
-        name="buffalo_l",
-        providers=["CPUExecutionProvider"],
-    )
-    app.prepare(ctx_id=0, det_size=(640, 640))
+    # 初始化模型：复用 v4.1 的 CUDA/CPU 选择逻辑
+    from pipeline.face_cluster import _create_face_app
+    app = _create_face_app(FaceAnalysis)
 
     face_data = []
     for scene in scenes:

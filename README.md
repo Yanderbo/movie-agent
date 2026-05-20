@@ -347,6 +347,8 @@ python main.py understand --video-id xxx --resume
 | `FACE_GALLERY_MAX` / `FACE_GALLERY_MIN` | `6` / `3` | 每个角色脸谱图片数量范围 |
 | `FACE_CLUSTER_EPS` | `0.5` | DBSCAN 聚类 eps |
 | `FACE_PASSERBY_MIN` | `3` | 低于此出场次数视为路人 |
+| `FACE_DETECT_DEVICE` | `auto` | InsightFace 推理设备：`auto` 优先 CUDA，`cuda` 指定 GPU，`cpu` 强制 CPU |
+| `FACE_DETECT_GPU_ID` | `auto` | InsightFace 使用的 CUDA 设备；`auto` 选择显存占用最低的 GPU，也可指定 `0`-`7` |
 | `DATA_DIR` | `./data` | 数据存储根目录 |
 
 ---
@@ -356,7 +358,7 @@ python main.py understand --video-id xxx --resume
 - `understand --resume --video-id xxx` 依赖 `progress.json` 判断断点；如果进度文件缺失，当前代码不会自动从散文件推断完成步骤。
 - v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 映射到 `minute_chunk`，`edit_signal` / `build_memory` / `indexer` 映射到 `final_build`。
 - Step 5 会保存 `MinuteChunk.suggested_beats`，但当前 `beat_detect.py` 主流程仍基于回填后的台词、画面和人物信息重新让 LLM 分组；`suggested_beats` 更像后续优化入口。
-- `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；如果 InsightFace 初始化或运行时失败，仍可能需要补充更细的异常降级。
+- `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；InsightFace 默认 `FACE_DETECT_DEVICE=auto`，检测到 `CUDAExecutionProvider` 时使用 GPU，`FACE_DETECT_GPU_ID=auto` 会选择显存占用最低的 CUDA 设备，否则回退 CPU。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和索引要等 `final_build` 完成后才会出现在 `memory.json` / `index/`。
 
 ---
@@ -390,7 +392,7 @@ python main.py understand --video-id xxx --resume
 | `numpy` | 数值计算 | 是 |
 | `scikit-learn` | DBSCAN 人脸聚类 | 是 |
 | `insightface` | 人脸检测 | 可选 |
-| `onnxruntime` | InsightFace 后端 | 随 insightface |
+| `onnxruntime` / `onnxruntime-gpu` | InsightFace 后端；GPU 加速需安装匹配 CUDA 的 `onnxruntime-gpu` | 随 insightface / 可选 GPU |
 | `faiss-cpu` | 向量检索索引 | 可选 |
 | FFmpeg / FFprobe | 视频处理、压缩、片段截取 | 是 |
 

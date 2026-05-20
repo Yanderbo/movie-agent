@@ -79,6 +79,8 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
 
 **流程**：
 1. **InsightFace 检测**所有关键帧中的人脸
+   - `FACE_DETECT_DEVICE=auto` 时优先使用 `CUDAExecutionProvider`，不可用则回退 CPU
+   - `FACE_DETECT_GPU_ID=auto` 时自动选择显存占用最低的 CUDA 设备，也可指定具体 GPU 编号
 2. **DBSCAN 聚类**（余弦距离）
 3. **频率分层**（根据视频时长自动调整阈值）：
    - **主要角色 (major)**: 出现 ≥ 总shot数的5% 或 ≥ 10次
@@ -89,7 +91,7 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
    - Embedding 多样性采样 → 捕捉不同表情/角度
 5. 保存到 `characters/char_XXX_gallery/`
 
-**降级**：InsightFace 不可用时跳过，由 Step 5 的 Gemini 自行识别。
+**降级**：InsightFace 不可用时跳过，由 Step 5 的 Gemini 自行识别；GPU 后端初始化失败时自动回退 CPU。当前本地深度模型主要是 InsightFace；LLM 与 Embedding 走远程 API，DBSCAN / PySceneDetect / FFmpeg 不涉及本地模型上 GPU。
 
 ---
 
