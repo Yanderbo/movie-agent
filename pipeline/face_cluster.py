@@ -112,6 +112,7 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
     app = _create_face_app(FaceAnalysis)
 
     face_data = []
+    filtered_faces = 0
     for shot in shots:
         # 收集所有可用帧
         all_paths = []
@@ -129,6 +130,9 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
                     continue
                 faces = app.get(img)
                 for face in faces:
+                    if not _is_usable_face(face):
+                        filtered_faces += 1
+                        continue
                     face_data.append({
                         "scene_index": shot.scene_index,
                         "bbox": face.bbox.tolist(),
@@ -136,12 +140,28 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
                         "keyframe_path": kf_path,
                         "timestamp": shot.start_time,
                         "det_score": float(face.det_score),
+                        "face_size": _face_size(face.bbox),
                     })
             except Exception as e:
                 logger.warning(f"人脸检测失败 (shot {shot.scene_index}, {kf_path}): {e}")
 
     logger.info(f"人脸检测完成: {len(face_data)} 个人脸")
+    if filtered_faces:
+        logger.info(f"Filtered low-quality faces: {filtered_faces}")
     return face_data
+
+
+def _is_usable_face(face) -> bool:
+    if float(getattr(face, "det_score", 0.0)) < config.FACE_MIN_DET_SCORE:
+        return False
+    return _face_size(getattr(face, "bbox", [])) >= config.FACE_MIN_FACE_SIZE
+
+
+def _face_size(bbox) -> float:
+    if bbox is None or len(bbox) != 4:
+        return 0.0
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    return max(0.0, min(x2 - x1, y2 - y1))
 
 
 def _create_face_app(face_analysis_cls):
@@ -264,7 +284,7 @@ def _cluster_faces(face_data: list[dict]) -> dict:
     # DBSCAN 聚类（余弦距离）
     clustering = DBSCAN(
         eps=config.FACE_CLUSTER_EPS,
-        min_samples=2,
+        min_samples=max(1, config.FACE_CLUSTER_MIN_SAMPLES),
         metric="cosine",
     )
     labels = clustering.fit_predict(embeddings)
@@ -279,7 +299,81 @@ def _cluster_faces(face_data: list[dict]) -> dict:
         clusters[label]["faces"].append(valid_faces[idx])
         clusters[label]["scenes"].add(valid_faces[idx]["scene_index"])
 
-    return clusters
+    return _merge_close_clusters(clusters)
+
+
+def _merge_close_clusters(clusters: dict) -> dict:
+    threshold = config.FACE_CLUSTER_MERGE_SIM
+    if threshold <= 0 or len(clusters) < 2:
+        return clusters
+
+    labels = list(clusters)
+    centroids = {
+        label: _normalized_centroid(info["faces"])
+        for label, info in clusters.items()
+    }
+    component_keyframes = {
+        label: _cluster_keyframes(info["faces"])
+        for label, info in clusters.items()
+    }
+    parent = {label: label for label in labels}
+
+    def find(label):
+        while parent[label] != label:
+            parent[label] = parent[parent[label]]
+            label = parent[label]
+        return label
+
+    def union(left, right) -> bool:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return False
+        if component_keyframes[left_root] & component_keyframes[right_root]:
+            return False
+        parent[right_root] = left_root
+        component_keyframes[left_root].update(component_keyframes[right_root])
+        return True
+
+    merges = 0
+    for i, left in enumerate(labels):
+        left_centroid = centroids.get(left)
+        if left_centroid is None:
+            continue
+        for right in labels[i + 1:]:
+            right_centroid = centroids.get(right)
+            if right_centroid is None:
+                continue
+            if float(np.dot(left_centroid, right_centroid)) >= threshold:
+                merges += int(union(left, right))
+
+    if not merges:
+        return clusters
+
+    merged = {}
+    for label in labels:
+        root = find(label)
+        item = merged.setdefault(root, {"faces": [], "scenes": set()})
+        item["faces"].extend(clusters[label]["faces"])
+        item["scenes"].update(clusters[label]["scenes"])
+
+    logger.info(f"Merged close face clusters: {len(clusters)} -> {len(merged)}")
+    return merged
+
+
+def _normalized_centroid(faces: list[dict]):
+    embeddings = np.array([f["embedding"] for f in faces if f.get("embedding")])
+    if len(embeddings) == 0:
+        return None
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    embeddings = embeddings / norms
+    centroid = embeddings.mean(axis=0)
+    norm = np.linalg.norm(centroid)
+    return centroid / norm if norm else None
+
+
+def _cluster_keyframes(faces: list[dict]) -> set[str]:
+    return {f["keyframe_path"] for f in faces if f.get("keyframe_path")}
 
 
 def _build_galleries(
@@ -310,6 +404,7 @@ def _build_galleries(
     major_threshold = max(10, int(total_shots * 0.05))
 
     galleries = []
+    skipped_passerby = 0
 
     for cluster_id, cluster_info in clusters.items():
         faces = cluster_info["faces"]
@@ -324,6 +419,10 @@ def _build_galleries(
             tier = "minor"
         else:
             tier = "passerby"
+
+        if tier == "passerby" and not config.FACE_KEEP_PASSERBY_GALLERY:
+            skipped_passerby += 1
+            continue
 
         char_id = f"char_{cluster_id:03d}"
 
@@ -367,6 +466,8 @@ def _build_galleries(
         )
         galleries.append(gallery)
 
+    if skipped_passerby:
+        logger.info(f"Skipped passerby clusters: {skipped_passerby}")
     return galleries
 
 

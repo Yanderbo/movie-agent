@@ -60,8 +60,13 @@ CHUNK_MERGE_THRESHOLD = int(os.getenv("CHUNK_MERGE_THRESHOLD", "30"))   # 尾段
 FACE_GALLERY_MAX = int(os.getenv("FACE_GALLERY_MAX", "6"))              # 每角色最大脸谱数
 FACE_GALLERY_MIN = int(os.getenv("FACE_GALLERY_MIN", "3"))              # 每角色最小脸谱数
 FACE_CLUSTER_EPS = float(os.getenv("FACE_CLUSTER_EPS", "0.5"))          # DBSCAN eps
+FACE_CLUSTER_MIN_SAMPLES = int(os.getenv("FACE_CLUSTER_MIN_SAMPLES", "3"))
+FACE_CLUSTER_MERGE_SIM = float(os.getenv("FACE_CLUSTER_MERGE_SIM", "0.72"))
+FACE_MIN_DET_SCORE = float(os.getenv("FACE_MIN_DET_SCORE", "0.65"))
+FACE_MIN_FACE_SIZE = int(os.getenv("FACE_MIN_FACE_SIZE", "48"))
 FACE_PASSERBY_MIN_APPEARANCES = int(os.getenv("FACE_PASSERBY_MIN", "3")) # 低于此值视为路人
 FACE_DETECT_DEVICE = os.getenv("FACE_DETECT_DEVICE", "auto").lower()    # auto/cuda/cpu
+FACE_KEEP_PASSERBY_GALLERY = os.getenv("FACE_KEEP_PASSERBY_GALLERY", "false").lower() in ("1", "true", "yes", "on")
 FACE_DETECT_GPU_ID = os.getenv("FACE_DETECT_GPU_ID", "auto").lower()    # auto 或 CUDA device id
 
 # ─── 日志配置 ─────────────────────────────────────────────────
