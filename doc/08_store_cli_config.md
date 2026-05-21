@@ -126,7 +126,7 @@ os.getenv("KEY", "default")   # 环境变量优先
 | **镜头切分** | `SCENE_DETECT_THRESHOLD`, `SCENE_DETECT_MIN_LEN` | PySceneDetect 参数 |
 | **多帧采样** | `MULTI_KEYFRAME_MAX` | 每 shot 最大采样帧数（默认6） |
 | **MinuteChunk** | `CHUNK_TARGET_DURATION`, `CHUNK_MERGE_THRESHOLD`, `CHUNK_MIN/MAX_DURATION` | v4.1: 分钟级 chunk 参数 |
-| **人脸聚类** | `FACE_GALLERY_MAX/MIN`, `FACE_CLUSTER_EPS` | v4.1: 脸谱参数 |
+| **人脸聚类** | `FACE_GALLERY_MAX/MIN`, `FACE_CLUSTER_*`, `FACE_MIN_*`, `FACE_DETECT_*` | v4.1: 人脸检测、聚类、拆分/合并和脸谱参数 |
 | **日志** | `LOG_DIR`, `LOG_LEVEL` | 日志存储 |
 | **路径** | `DATA_DIR`, `VIDEOS_DIR`, `EDITPLANS_DIR`, `RENDERS_DIR` | 数据目录 |
 
@@ -140,10 +140,23 @@ os.getenv("KEY", "default")   # 环境变量优先
 | `CHUNK_MIN_DURATION` | `90` | MinuteChunk 最小时长(秒)，当前配置保留，构建逻辑暂未强制使用 |
 | `CHUNK_MAX_DURATION` | `210` | MinuteChunk 最大时长(秒)，当前配置保留，构建逻辑暂未强制使用 |
 | `CHUNK_MERGE_THRESHOLD` | `30` | 尾段低于此值合并到前一个 |
-| `FACE_GALLERY_MAX` | `6` | 每角色最大脸谱数 |
-| `FACE_GALLERY_MIN` | `3` | 每角色最小脸谱数 |
-| `FACE_CLUSTER_EPS` | `0.5` | DBSCAN 聚类 eps |
-| `FACE_PASSERBY_MIN` | `3` | 低于此出场次数视为路人 |
+| `FACE_GALLERY_MAX` | `6` | 每个非路人角色最多保存的代表脸数量 |
+| `FACE_GALLERY_MIN` | `3` | 每个非路人角色尽量保留的最少代表脸数量 |
+| `FACE_CLUSTER_EPS` | `0.42` | 初始 DBSCAN 余弦距离阈值，越大越容易合并 |
+| `FACE_CLUSTER_MIN_SAMPLES` | `3` | DBSCAN 成簇最少样本数 |
+| `FACE_CLUSTER_SPLIT_EPS` | `0.30` | 疑似混簇二次拆分阈值 |
+| `FACE_CLUSTER_MAX_RADIUS` | `0.34` | 簇内 90 分位半径上限，超过则尝试拆分 |
+| `FACE_CLUSTER_MERGE_SIM` | `0.86` | 簇中心相似度合并阈值 |
+| `FACE_CLUSTER_MERGE_LINK_SIM` | `0.78` | 代表脸桥接相似度合并阈值 |
+| `FACE_CLUSTER_MERGE_MIN_CENTROID_SIM` | `0.62` | 使用桥接合并时要求的最低簇中心相似度 |
+| `FACE_CLUSTER_MERGE_MAX_FACES` | `32` | 每个簇用于合并比较的最多代表脸数量 |
+| `FACE_MIN_DET_SCORE` | `0.65` | InsightFace 检测置信度下限 |
+| `FACE_MIN_FACE_RATIO` | `0.05` | 人脸 bbox 短边 / 关键帧短边 的比例下限 |
+| `FACE_MIN_FACE_PIXEL_FLOOR` | `16` | 人脸 bbox 短边绝对像素兜底 |
+| `FACE_PASSERBY_MIN` | `3` | 中等时长视频中，低于此出现场景数视为路人 |
+| `FACE_DETECT_DEVICE` | `auto` | 人脸检测设备：auto/cuda/gpu/cpu |
+| `FACE_DETECT_GPU_ID` | `auto` | 自动选择或指定 CUDA device id |
+| `FACE_KEEP_PASSERBY_GALLERY` | `false` | 是否保存路人脸谱 |
 
 ### `init_dirs()`
 

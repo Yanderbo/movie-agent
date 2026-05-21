@@ -58,19 +58,24 @@ CHUNK_MAX_DURATION = int(os.getenv("CHUNK_MAX_DURATION", "210"))        # 最大
 CHUNK_MERGE_THRESHOLD = int(os.getenv("CHUNK_MERGE_THRESHOLD", "30"))   # 尾段低于此值合并到前一个
 
 # ─── 人脸聚类参数（v4.1 新增）─────────────────────────────────
-FACE_GALLERY_MAX = int(os.getenv("FACE_GALLERY_MAX", "6"))              # 每角色最大脸谱数
-FACE_GALLERY_MIN = int(os.getenv("FACE_GALLERY_MIN", "3"))              # 每角色最小脸谱数
-FACE_CLUSTER_EPS = float(os.getenv("FACE_CLUSTER_EPS", "0.42"))         # DBSCAN eps
-FACE_CLUSTER_MIN_SAMPLES = int(os.getenv("FACE_CLUSTER_MIN_SAMPLES", "3"))
-FACE_CLUSTER_SPLIT_EPS = float(os.getenv("FACE_CLUSTER_SPLIT_EPS", "0.30"))
-FACE_CLUSTER_MAX_RADIUS = float(os.getenv("FACE_CLUSTER_MAX_RADIUS", "0.34"))
-FACE_CLUSTER_MERGE_SIM = float(os.getenv("FACE_CLUSTER_MERGE_SIM", "0.86"))
-FACE_MIN_DET_SCORE = float(os.getenv("FACE_MIN_DET_SCORE", "0.65"))
-FACE_MIN_FACE_SIZE = int(os.getenv("FACE_MIN_FACE_SIZE", "48"))
-FACE_PASSERBY_MIN_APPEARANCES = int(os.getenv("FACE_PASSERBY_MIN", "3")) # 低于此值视为路人
-FACE_DETECT_DEVICE = os.getenv("FACE_DETECT_DEVICE", "auto").lower()    # auto/cuda/cpu
-FACE_KEEP_PASSERBY_GALLERY = os.getenv("FACE_KEEP_PASSERBY_GALLERY", "false").lower() in ("1", "true", "yes", "on")
-FACE_DETECT_GPU_ID = os.getenv("FACE_DETECT_GPU_ID", "auto").lower()    # auto 或 CUDA device id
+FACE_GALLERY_MAX = int(os.getenv("FACE_GALLERY_MAX", "6"))              # 每个非路人角色最多保存的代表脸数量
+FACE_GALLERY_MIN = int(os.getenv("FACE_GALLERY_MIN", "3"))              # 每个非路人角色尽量保留的最少代表脸数量
+FACE_CLUSTER_EPS = float(os.getenv("FACE_CLUSTER_EPS", "0.42"))         # 初始 DBSCAN 余弦距离阈值；越大越容易把脸聚到一起
+FACE_CLUSTER_MIN_SAMPLES = int(os.getenv("FACE_CLUSTER_MIN_SAMPLES", "3")) # DBSCAN 成簇最少样本数；越大越容易丢掉偶发人脸
+FACE_CLUSTER_SPLIT_EPS = float(os.getenv("FACE_CLUSTER_SPLIT_EPS", "0.30")) # 疑似混簇二次拆分的更严格 DBSCAN 阈值
+FACE_CLUSTER_MAX_RADIUS = float(os.getenv("FACE_CLUSTER_MAX_RADIUS", "0.34")) # 簇内 90 分位余弦半径；超过则尝试拆分
+FACE_CLUSTER_MERGE_SIM = float(os.getenv("FACE_CLUSTER_MERGE_SIM", "0.86")) # 簇中心余弦相似度合并阈值
+FACE_CLUSTER_MERGE_LINK_SIM = float(os.getenv("FACE_CLUSTER_MERGE_LINK_SIM", "0.78")) # 代表脸跨簇 top 相似度合并阈值
+FACE_CLUSTER_MERGE_MIN_CENTROID_SIM = float(os.getenv("FACE_CLUSTER_MERGE_MIN_CENTROID_SIM", "0.62")) # 使用代表脸合并时要求的最低簇中心相似度
+FACE_CLUSTER_MERGE_MAX_FACES = int(os.getenv("FACE_CLUSTER_MERGE_MAX_FACES", "32")) # 每个簇用于合并比较的最多代表脸数量
+FACE_MIN_DET_SCORE = float(os.getenv("FACE_MIN_DET_SCORE", "0.65"))      # InsightFace 检测置信度下限
+FACE_MIN_FACE_RATIO = float(os.getenv("FACE_MIN_FACE_RATIO", "0.05"))   # 人脸 bbox 短边 / 关键帧短边 的比例下限
+FACE_MIN_FACE_PIXEL_FLOOR = float(os.getenv("FACE_MIN_FACE_PIXEL_FLOOR", os.getenv("FACE_MIN_FACE_SIZE", "16"))) # 人脸 bbox 短边绝对像素兜底下限
+FACE_MIN_FACE_SIZE = int(os.getenv("FACE_MIN_FACE_SIZE", str(int(FACE_MIN_FACE_PIXEL_FLOOR)))) # 兼容旧变量；新逻辑优先用 FACE_MIN_FACE_PIXEL_FLOOR
+FACE_PASSERBY_MIN_APPEARANCES = int(os.getenv("FACE_PASSERBY_MIN", "3")) # 中等时长视频中，低于该出现场景数视为路人
+FACE_DETECT_DEVICE = os.getenv("FACE_DETECT_DEVICE", "auto").lower()    # 人脸检测设备：auto/cuda/gpu/cpu
+FACE_KEEP_PASSERBY_GALLERY = os.getenv("FACE_KEEP_PASSERBY_GALLERY", "false").lower() in ("1", "true", "yes", "on") # 是否也保存路人脸谱
+FACE_DETECT_GPU_ID = os.getenv("FACE_DETECT_GPU_ID", "auto").lower()    # auto 或指定 CUDA device id
 
 # ─── 日志配置 ─────────────────────────────────────────────────
 LOG_DIR = Path(os.getenv("LOG_DIR", str(PROJECT_ROOT / "logs")))

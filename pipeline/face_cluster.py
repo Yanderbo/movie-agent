@@ -1,19 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-人脸聚类 + 角色脸谱构建（v4.1 新增 — Step 4）
+人脸聚类 + 角色脸谱构建（v4.1 — Step 4）。
 
-在 Gemini 调用之前，用本地模型完成人脸检测和聚类，
-构建"角色脸谱"作为后续 MinuteChunk 处理时的参考输入。
+这个步骤位于多关键帧采样之后、MinuteChunk 理解之前。它的目标不是直接
+给角色命名，而是先在本地建立稳定的 character_id 与代表脸图库，让后续
+Gemini 处理每个 chunk 时能拿到“已知角色长什么样”的身份先验。
 
-流程：
-1. InsightFace 检测所有关键帧中的人脸
-2. DBSCAN 聚类 → 按出现频率分层（主要角色 / 次要角色 / 路人）
-3. 为每个角色选取 3-6 张代表脸（时间轴均匀采样 + 外观多样性采样）
-4. 保存角色脸谱图库
+主流程：
+1. 读取缓存：如果 `characters/face_clusters.json` 已存在，直接复用。
+   这样断点续跑不会重复跑 InsightFace，也避免已有角色 ID 反复变化。
+2. 人脸检测：遍历每个 shot 的关键帧，用 InsightFace 提取 bbox、
+   det_score 和 embedding。embedding 是后续判断“是否同一个人”的核心特征。
+3. 质量过滤：过滤低置信度、画面占比过小的人脸，减少远景误检和模糊脸
+   对聚类的污染。尺寸阈值按关键帧短边比例计算，而不是固定像素。
+4. 初始聚类：用 DBSCAN + cosine distance 将相似 embedding 聚为人物簇。
+   DBSCAN 不需要预先知道角色数量，适合长视频中角色数未知的场景。
+5. 拆分混簇：如果同一关键帧内一个簇出现多张脸，或簇半径过大，说明
+   可能把不同人物混在一起，使用更严格的阈值做二次聚类。
+6. 合并碎簇：如果同一人物因为发型、服装、光照或角度变化被拆成多个簇，
+   再用簇中心相似度和代表脸桥接相似度做保守合并。
+7. 构建脸谱：按出现 shot 数分为 major/minor/passerby，并为非路人角色
+   保存时间均匀且外观多样的代表脸。
 
 输出：
-- characters/face_clusters.json     聚类元数据
-- characters/char_XXX_gallery/      每角色 3-6 张代表脸
+- `characters/face_clusters.json`：CharacterGallery 元数据。
+- `characters/char_XXX_gallery/`：每个保留角色的代表脸裁剪图。
 """
 import json
 import os
@@ -30,57 +41,91 @@ from utils.logger import get_logger
 logger = get_logger("FaceCluster")
 
 
+
+# ---------------------------------------------------------------------------
+# Public entry
+# ---------------------------------------------------------------------------
+
 def cluster_faces(
     video_id: str,
     shots: list[Shot],
 ) -> list[CharacterGallery]:
     """
-    检测关键帧人脸 → 聚类 → 构建角色脸谱。
+    构建当前视频的角色脸谱。
+
+    这是一条“本地视觉预处理”流水线，产物会作为 Step 5 MinuteChunk 的
+    输入之一。后续 Gemini 不需要从零判断所有人物是否相同，而是参考这里
+    生成的 char_XXX gallery 做身份识别和角色档案更新。
 
     Args:
-        video_id: 视频 ID
-        shots: 带 keyframe_path(s) 的镜头列表
+        video_id: 视频 ID，用于定位 `data/videos/{video_id}/characters/`。
+        shots: 已完成镜头切分和关键帧采样的镜头列表。每个 shot 至少应带
+            `keyframe_path` 或 `keyframe_paths`，否则无法参与人脸检测。
 
     Returns:
-        CharacterGallery 列表（按出场频率降序排列）
+        CharacterGallery 列表，按检测次数降序排列。列表中的 character_id
+        只是稳定的内部编号，真实姓名会在后续 MinuteChunk 中逐步补全。
     """
     video_dir = config.VIDEOS_DIR / video_id
     chars_dir = video_dir / "characters"
     clusters_path = chars_dir / "face_clusters.json"
 
-    # 如果已存在，直接加载
-    if clusters_path.exists():
-        logger.info(f"人脸聚类结果已存在，直接加载: {clusters_path}")
-        data = json.loads(clusters_path.read_text(encoding="utf-8"))
-        return [CharacterGallery(**g) for g in data]
+    # 1. 缓存优先：face clustering 成本高，且 character_id 会影响后续产物。
+    #    断点续跑时复用已有 JSON，可以保持角色编号稳定。
+    cached = _load_cached_galleries(clusters_path)
+    if cached is not None:
+        return cached
 
     chars_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: 人脸检测
+    # 2. 本地检测关键帧中的所有可用人脸，得到 bbox + embedding。
+    #    如果 InsightFace 未安装或所有关键帧都没有可用脸，写入空缓存，
+    #    后续 MinuteChunk 会退化为让 Gemini 自行识别人物。
     face_data = _detect_all_faces(shots)
     if not face_data:
         logger.warning("未检测到任何人脸，返回空脸谱")
-        clusters_path.write_text("[]", encoding="utf-8")
+        _save_galleries(clusters_path, [])
         return []
 
-    # Step 2: 聚类
+    # 3. 聚类阶段只处理 embedding，不涉及角色命名：
+    #    初始 DBSCAN 负责发现人物簇，拆分/合并负责修正混簇和碎簇。
     clusters = _cluster_faces(face_data)
     logger.info(f"聚类完成: {len(clusters)} 个人物簇")
 
-    # Step 3: 按频率分层 + 构建脸谱
-    total_duration = max(s.end_time for s in shots) if shots else 0
-    galleries = _build_galleries(
-        clusters, shots, chars_dir, total_duration,
-    )
-
-    # 按出场频率排序
+    # 4. 将人物簇转成对下游友好的 CharacterGallery：
+    #    分层决定是否保留路人，代表脸图库用于 Gemini 身份参考。
+    galleries = _build_galleries(clusters, shots, chars_dir)
     galleries.sort(key=lambda g: g.total_detections, reverse=True)
 
-    # 保存
+    # 5. 持久化最终产物。后续 understand 断点续跑会从这里加载 galleries。
+    _save_galleries(clusters_path, galleries)
+    _log_gallery_summary(galleries)
+
+    return galleries
+
+
+# ---------------------------------------------------------------------------
+# Cache and config helpers
+# ---------------------------------------------------------------------------
+
+def _load_cached_galleries(clusters_path: Path) -> list[CharacterGallery] | None:
+    """加载已构建的脸谱缓存；不存在时返回 None，让主流程继续重建。"""
+    if not clusters_path.exists():
+        return None
+    logger.info(f"人脸聚类结果已存在，直接加载: {clusters_path}")
+    data = json.loads(clusters_path.read_text(encoding="utf-8"))
+    return [CharacterGallery(**g) for g in data]
+
+
+def _save_galleries(clusters_path: Path, galleries: list[CharacterGallery]) -> None:
+    """保存 CharacterGallery 元数据；图片文件由 `_save_gallery_faces` 单独保存。"""
     clusters_path.write_text(
         json.dumps([g.model_dump() for g in galleries], indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def _log_gallery_summary(galleries: list[CharacterGallery]) -> None:
     logger.info(
         f"角色脸谱构建完成: "
         f"{sum(1 for g in galleries if g.tier == 'major')} major, "
@@ -88,13 +133,30 @@ def cluster_faces(
         f"{sum(1 for g in galleries if g.tier == 'passerby')} passerby"
     )
 
-    return galleries
 
+
+
+# ---------------------------------------------------------------------------
+# Face detection and filtering
+# ---------------------------------------------------------------------------
 
 def _detect_all_faces(shots: list[Shot]) -> list[dict]:
     """
     使用 InsightFace 检测所有关键帧中的人脸。
-    返回 [{scene_index, bbox, embedding, keyframe_path, timestamp, det_score}, ...]
+
+    输入是 Step 3 产生的 shot 列表。函数不会直接读视频，而是读取每个 shot
+    中的关键帧图片。每一张检测到且通过质量过滤的人脸都会被转成普通 dict，
+    这样后续 DBSCAN、JSON 缓存和裁剪保存都不依赖 InsightFace 的对象类型。
+
+    返回元素格式：
+    {
+        scene_index: 所属 shot 索引，用于统计角色出现在哪些镜头；
+        bbox: 人脸框 [x1, y1, x2, y2]，用于裁剪 gallery 图片；
+        embedding: InsightFace 人脸向量，用于聚类；
+        keyframe_path: 来源关键帧路径，用于冲突检测和裁剪；
+        timestamp: 使用 shot.start_time，代表该脸在视频时间轴上的位置；
+        det_score: 检测置信度，用于过滤和优先选择高质量代表脸。
+    }
     """
     try:
         from insightface.app import FaceAnalysis
@@ -112,34 +174,17 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
     face_data = []
     filtered_faces = 0
     for shot in shots:
-        # 收集所有可用帧
-        all_paths = []
-        if shot.keyframe_paths:
-            all_paths.extend(
-                [p for p in shot.keyframe_paths if p and Path(p).exists()]
-            )
-        elif shot.keyframe_path and Path(shot.keyframe_path).exists():
-            all_paths.append(shot.keyframe_path)
-
-        for kf_path in all_paths:
+        for kf_path in _shot_keyframe_paths(shot):
             try:
                 img = cv2.imread(kf_path)
                 if img is None:
                     continue
                 faces = app.get(img)
                 for face in faces:
-                    if not _is_usable_face(face):
+                    if not _is_usable_face(face, img.shape):
                         filtered_faces += 1
                         continue
-                    face_data.append({
-                        "scene_index": shot.scene_index,
-                        "bbox": face.bbox.tolist(),
-                        "embedding": face.embedding.tolist(),
-                        "keyframe_path": kf_path,
-                        "timestamp": shot.start_time,
-                        "det_score": float(face.det_score),
-                        "face_size": _face_size(face.bbox),
-                    })
+                    face_data.append(_face_record(face, shot, kf_path))
             except Exception as e:
                 logger.warning(f"人脸检测失败 (shot {shot.scene_index}, {kf_path}): {e}")
 
@@ -149,10 +194,62 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
     return face_data
 
 
-def _is_usable_face(face) -> bool:
+def _shot_keyframe_paths(shot: Shot) -> list[str]:
+    """
+    收集一个 shot 的所有可用关键帧路径。
+
+    `keyframe_paths` 是新版多帧采样字段，`keyframe_path` 是旧版兼容字段。
+    这里同时读取并去重，避免旧数据或中间产物不完整时漏掉可用帧。
+    """
+    candidates = list(shot.keyframe_paths or [])
+    if shot.keyframe_path:
+        candidates.append(shot.keyframe_path)
+    paths = []
+    seen = set()
+    for path in candidates:
+        if not path:
+            continue
+        path_str = str(path)
+        if path_str in seen:
+            continue
+        if Path(path_str).exists():
+            paths.append(path_str)
+            seen.add(path_str)
+    return paths
+
+
+def _face_record(face, shot: Shot, keyframe_path: str) -> dict:
+    """把 InsightFace 返回对象压平成后续流程稳定使用的普通 dict。"""
+    return {
+        "scene_index": shot.scene_index,
+        "bbox": _to_list(getattr(face, "bbox", [])),
+        "embedding": _to_list(getattr(face, "embedding", [])),
+        "keyframe_path": keyframe_path,
+        "timestamp": shot.start_time,
+        "det_score": float(getattr(face, "det_score", 0.0)),
+    }
+
+
+def _to_list(value) -> list:
+    if value is None:
+        return []
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return list(value)
+
+
+def _is_usable_face(face, image_shape=None) -> bool:
+    """
+    判断一张检测脸是否值得进入聚类。
+
+    过滤规则有两层：
+    1. det_score 过滤误检；
+    2. bbox 短边过滤远景小脸。尺寸阈值按关键帧短边比例计算，并带像素兜底，
+       这样同一套配置能适配 480p/1080p/4K 等不同关键帧尺寸。
+    """
     if float(getattr(face, "det_score", 0.0)) < config.FACE_MIN_DET_SCORE:
         return False
-    return _face_size(getattr(face, "bbox", [])) >= config.FACE_MIN_FACE_SIZE
+    return _face_size(getattr(face, "bbox", [])) >= _face_size_threshold(image_shape)
 
 
 def _face_size(bbox) -> float:
@@ -161,6 +258,25 @@ def _face_size(bbox) -> float:
     x1, y1, x2, y2 = [float(v) for v in bbox]
     return max(0.0, min(x2 - x1, y2 - y1))
 
+
+def _face_size_threshold(image_shape) -> float:
+    """计算人脸 bbox 短边阈值：max(画面短边比例阈值, 像素兜底阈值)。"""
+    # config.py 已处理 FACE_MIN_FACE_SIZE → FACE_MIN_FACE_PIXEL_FLOOR 的兼容，
+    # 此处无需再做二级 fallback。
+    ratio_threshold = _image_short_side(image_shape) * config.FACE_MIN_FACE_RATIO
+    return max(config.FACE_MIN_FACE_PIXEL_FLOOR, ratio_threshold)
+
+
+def _image_short_side(image_shape) -> float:
+    if image_shape is None or len(image_shape) < 2:
+        return 0.0
+    height, width = image_shape[:2]
+    return float(max(0, min(int(width), int(height))))
+
+
+# ---------------------------------------------------------------------------
+# InsightFace runtime selection
+# ---------------------------------------------------------------------------
 
 def _create_face_app(face_analysis_cls):
     """创建 InsightFace 应用，按配置优先使用 CUDA。"""
@@ -263,10 +379,21 @@ def _visible_cuda_devices() -> list[int] | None:
     return devices or None
 
 
+# ---------------------------------------------------------------------------
+# Embedding clustering, split, and merge
+# ---------------------------------------------------------------------------
+
 def _cluster_faces(face_data: list[dict]) -> dict:
     """
     基于人脸特征向量 DBSCAN 聚类。
-    返回 {cluster_id: {"faces": [...], "scenes": set(...)}}
+
+    聚类分三层：
+    1. 初始 DBSCAN：尽量把同一人的脸聚到一起；
+    2. 拆分疑似混簇：优先避免“两个不同角色被合成一个 char”；
+    3. 合并相近碎簇：缓解同一角色因为造型/角度变化被拆成多个 gallery。
+
+    返回 {cluster_id: {"faces": [...], "scenes": set(...)}}。
+    scenes 用于后续 major/minor/passerby 分层。
     """
     valid_faces = [f for f in face_data if f.get("embedding")]
     labels = _dbscan_labels(
@@ -305,7 +432,13 @@ def _dbscan_labels(faces: list[dict], eps: float, min_samples: int):
 
 
 def _split_impure_clusters(clusters: dict) -> dict:
-    """拆分疑似混簇：同帧冲突或簇内半径过大时再聚类。"""
+    """
+    拆分疑似混簇。
+
+    如果同一关键帧里同一个簇出现多张脸，几乎可以判定这个簇混入了不同人。
+    如果簇内半径过大，也说明成员在 embedding 空间中过于分散。两种情况都会
+    触发更严格的二次 DBSCAN。
+    """
     if not clusters:
         return clusters
 
@@ -333,7 +466,7 @@ def _split_impure_clusters(clusters: dict) -> dict:
 
 
 def _split_cluster_faces(faces: list[dict]) -> list[list[dict]]:
-    """对单个疑似混簇做更严格的二次聚类。"""
+    """对单个疑似混簇做更严格的二次聚类，并保留噪声点为独立小簇。"""
     min_samples = max(1, config.FACE_CLUSTER_MIN_SAMPLES)
     if len(faces) < min_samples * 2 or not _needs_cluster_split(faces):
         return [faces]
@@ -363,12 +496,14 @@ def _split_cluster_faces(faces: list[dict]) -> list[list[dict]]:
 
 
 def _needs_cluster_split(faces: list[dict]) -> bool:
+    """判断一个簇是否需要拆分：同帧冲突或簇内 90 分位半径过大。"""
     has_conflict = _has_keyframe_conflict(faces)
     is_scattered = _cluster_radius(faces) > config.FACE_CLUSTER_MAX_RADIUS
     return has_conflict or is_scattered
 
 
 def _has_keyframe_conflict(faces: list[dict]) -> bool:
+    """同一关键帧内同簇多脸表示物理冲突，通常意味着不同人物被混在一起。"""
     counts = defaultdict(int)
     for face in faces:
         keyframe = face.get("keyframe_path")
@@ -380,6 +515,7 @@ def _has_keyframe_conflict(faces: list[dict]) -> bool:
 
 
 def _cluster_radius(faces: list[dict]) -> float:
+    """计算簇内 90 分位余弦距离，避免少量离群脸决定整个簇是否拆分。"""
     embeddings = _normalized_embeddings(faces)
     if embeddings is None or len(embeddings) < 2:
         return 0.0
@@ -392,9 +528,24 @@ def _cluster_radius(faces: list[dict]) -> float:
 
 
 def _merge_close_clusters(clusters: dict) -> dict:
-    """保守合并高度相似的小簇；同帧/同 shot 出现过则不合并。"""
-    threshold = config.FACE_CLUSTER_MERGE_SIM
-    if threshold <= 0 or len(clusters) < 2:
+    """
+    合并疑似同一人的碎片簇。
+
+    DBSCAN 对阈值敏感：同一角色在长视频里可能因为换发型、换装、侧脸、
+    强光/暗光被拆成多个小簇。这里使用两类证据进行保守合并：
+    - centroid_sim：两个簇中心向量足够相似，直接合并；
+    - link_sim：两个簇的代表脸之间存在高相似连接，且簇中心不太远，合并。
+
+    同一关键帧中同时出现过的两个簇不会合并，因为它们大概率是两个人。
+    注意：不能用 scene（shot）共现来阻断合并，因为同一人在同一 shot 的
+    不同关键帧中完全可能被检测到，这会导致碎簇永远无法合并。
+    """
+    centroid_threshold = config.FACE_CLUSTER_MERGE_SIM
+    link_threshold = config.FACE_CLUSTER_MERGE_LINK_SIM
+    min_centroid_sim = config.FACE_CLUSTER_MERGE_MIN_CENTROID_SIM
+    if centroid_threshold <= 0 and link_threshold <= 0:
+        return clusters
+    if len(clusters) < 2:
         return clusters
 
     labels = list(clusters)
@@ -402,12 +553,12 @@ def _merge_close_clusters(clusters: dict) -> dict:
         label: _normalized_centroid(info["faces"])
         for label, info in clusters.items()
     }
-    component_keyframes = {
-        label: _cluster_keyframes(info["faces"])
+    merge_embeddings = {
+        label: _cluster_merge_embeddings(info["faces"])
         for label, info in clusters.items()
     }
-    component_scenes = {
-        label: set(info["scenes"])
+    component_keyframes = {
+        label: _cluster_keyframes(info["faces"])
         for label, info in clusters.items()
     }
     parent = {label: label for label in labels}
@@ -422,25 +573,29 @@ def _merge_close_clusters(clusters: dict) -> dict:
         left_root, right_root = find(left), find(right)
         if left_root == right_root:
             return False
+        # 同一关键帧中同时出现说明是物理上不同的人，禁止合并。
         if component_keyframes[left_root] & component_keyframes[right_root]:
-            return False
-        if component_scenes[left_root] & component_scenes[right_root]:
             return False
         parent[right_root] = left_root
         component_keyframes[left_root].update(component_keyframes[right_root])
-        component_scenes[left_root].update(component_scenes[right_root])
         return True
 
     merges = 0
     for i, left in enumerate(labels):
         left_centroid = centroids.get(left)
-        if left_centroid is None:
-            continue
+        left_embeddings = merge_embeddings.get(left)
         for right in labels[i + 1:]:
             right_centroid = centroids.get(right)
-            if right_centroid is None:
-                continue
-            if float(np.dot(left_centroid, right_centroid)) >= threshold:
+            right_embeddings = merge_embeddings.get(right)
+            centroid_sim = _vector_similarity(left_centroid, right_centroid)
+            link_sim = _top_pair_similarity(left_embeddings, right_embeddings)
+            if _should_merge_clusters(
+                centroid_sim,
+                link_sim,
+                centroid_threshold,
+                link_threshold,
+                min_centroid_sim,
+            ):
                 merges += int(union(left, right))
 
     if not merges:
@@ -457,7 +612,64 @@ def _merge_close_clusters(clusters: dict) -> dict:
     return merged
 
 
+def _should_merge_clusters(
+    centroid_sim: float,
+    link_sim: float,
+    centroid_threshold: float,
+    link_threshold: float,
+    min_centroid_sim: float,
+) -> bool:
+    """集中管理合并判定，便于调参时保持 centroid/link 两条规则一致。"""
+    if centroid_sim >= centroid_threshold:
+        return True
+    if link_threshold <= 0:
+        return False
+    return link_sim >= link_threshold and centroid_sim >= min_centroid_sim
+
+
+def _vector_similarity(left, right) -> float:
+    if left is None or right is None:
+        return -1.0
+    return float(np.dot(left, right))
+
+
+def _top_pair_similarity(left_embeddings, right_embeddings, top_k: int = 3) -> float:
+    """
+    计算两个簇代表脸之间的桥接相似度。
+
+    取 top-k 平均而不是单个最大值，可以减少偶然误匹配造成的错误合并。
+    """
+    if left_embeddings is None or right_embeddings is None:
+        return -1.0
+    sims = np.dot(left_embeddings, right_embeddings.T).reshape(-1)
+    if sims.size == 0:
+        return -1.0
+    k = min(top_k, sims.size)
+    return float(np.partition(sims, -k)[-k:].mean())
+
+
+def _cluster_merge_embeddings(faces: list[dict]):
+    """抽取用于合并比较的代表脸 embedding，避免大簇两两全量比较过慢。"""
+    max_faces = config.FACE_CLUSTER_MERGE_MAX_FACES
+    selected = _select_merge_faces(faces, max_faces)
+    return _normalized_embeddings(selected)
+
+
+def _select_merge_faces(faces: list[dict], max_faces: int) -> list[dict]:
+    """为合并阶段选样本：高置信度脸 + 时间均匀脸，覆盖质量和时间跨度。"""
+    if max_faces <= 0 or len(faces) <= max_faces:
+        return faces
+
+    score_quota = max(1, max_faces // 2)
+    by_score = sorted(faces, key=lambda f: -float(f.get("det_score", 0.0)))
+    high_confidence = by_score[:score_quota]
+    time_samples = _time_sample_faces(faces, max_faces - len(high_confidence))
+    # by_score 尾部用于补足，_dedupe_faces 会自动去除重复。
+    return _dedupe_faces(high_confidence + time_samples + by_score)[:max_faces]
+
+
 def _normalized_centroid(faces: list[dict]):
+    """计算归一化簇中心，用于簇间余弦相似度比较和最终 JSON 输出。"""
     embeddings = _normalized_embeddings(faces)
     if embeddings is None:
         return None
@@ -467,6 +679,7 @@ def _normalized_centroid(faces: list[dict]):
 
 
 def _normalized_embeddings(faces: list[dict]):
+    """将人脸 embedding 做 L2 归一化，使点积等价于 cosine similarity。"""
     embeddings = np.array([f["embedding"] for f in faces if f.get("embedding")])
     if len(embeddings) == 0:
         return None
@@ -479,31 +692,24 @@ def _cluster_keyframes(faces: list[dict]) -> set[str]:
     return {f["keyframe_path"] for f in faces if f.get("keyframe_path")}
 
 
+# ---------------------------------------------------------------------------
+# Character gallery construction
+# ---------------------------------------------------------------------------
+
 def _build_galleries(
     clusters: dict,
     shots: list[Shot],
     chars_dir: Path,
-    total_duration: float,
 ) -> list[CharacterGallery]:
     """
-    为每个聚类构建角色脸谱，按频率分层。
+    为每个聚类构建 CharacterGallery。
 
-    分层规则（根据视频时长自动调整）：
-    - < 10min: passerby_threshold=2
-    - 10-30min: passerby_threshold=3
-    - > 30min: passerby_threshold=5
+    这里把纯 embedding 簇转换成下游可消费的角色脸谱：
+    - tier：根据出现场景数划分 major/minor/passerby；
+    - gallery_paths：代表脸裁剪图，用于 MinuteChunk 角色识别；
+    - embedding_centroid：后续如需本地相似度检索，可以继续复用。
     """
-    # 动态阈值
-    if total_duration < 600:
-        passerby_threshold = 2
-    elif total_duration < 1800:
-        passerby_threshold = config.FACE_PASSERBY_MIN_APPEARANCES
-    else:
-        passerby_threshold = max(5, config.FACE_PASSERBY_MIN_APPEARANCES)
-
-    total_shots = len(shots)
-    major_threshold = max(10, int(total_shots * 0.05))
-
+    major_threshold, passerby_threshold = _gallery_thresholds(shots)
     galleries = []
     skipped_passerby = 0
 
@@ -512,50 +718,21 @@ def _build_galleries(
         scenes = cluster_info["scenes"]
         n_detections = len(faces)
         n_scenes = len(scenes)
-
-        # 分层
-        if n_scenes >= major_threshold:
-            tier = "major"
-        elif n_scenes >= passerby_threshold:
-            tier = "minor"
-        else:
-            tier = "passerby"
+        tier = _cluster_tier(n_scenes, major_threshold, passerby_threshold)
 
         if tier == "passerby" and not config.FACE_KEEP_PASSERBY_GALLERY:
             skipped_passerby += 1
             continue
 
         char_id = f"char_{cluster_id:03d}"
-
-        # 选取代表脸
-        if tier == "passerby":
-            # 路人只保存 1 张（最高置信度的）
-            gallery_faces = sorted(faces, key=lambda f: -f["det_score"])[:1]
-        else:
-            gallery_faces = _select_representative_faces(
-                faces,
-                min_count=config.FACE_GALLERY_MIN,
-                max_count=config.FACE_GALLERY_MAX,
-            )
-
-        # 保存脸谱图片
-        gallery_dir = chars_dir / f"{char_id}_gallery"
-        gallery_dir.mkdir(parents=True, exist_ok=True)
-
-        gallery_paths = []
-        gallery_timestamps = []
-
-        for i, face in enumerate(gallery_faces):
-            face_path = gallery_dir / f"face_{i:02d}.jpg"
-            if not face_path.exists():
-                _save_face_crop(face, str(face_path))
-            gallery_paths.append(str(face_path))
-            gallery_timestamps.append(face["timestamp"])
-
-        # 计算聚类中心
+        gallery_faces = _select_gallery_faces(faces, tier)
+        gallery_paths, gallery_timestamps = _save_gallery_faces(
+            gallery_faces,
+            chars_dir / f"{char_id}_gallery",
+        )
         centroid = _normalized_centroid(faces)
 
-        gallery = CharacterGallery(
+        galleries.append(CharacterGallery(
             character_id=char_id,
             gallery_paths=gallery_paths,
             gallery_timestamps=gallery_timestamps,
@@ -563,12 +740,71 @@ def _build_galleries(
             appearance_scenes=sorted(scenes),
             tier=tier,
             embedding_centroid=centroid.tolist() if centroid is not None else [],
-        )
-        galleries.append(gallery)
+        ))
 
     if skipped_passerby:
         logger.info(f"Skipped passerby clusters: {skipped_passerby}")
     return galleries
+
+
+def _gallery_thresholds(shots: list[Shot]) -> tuple[int, int]:
+    """
+    根据视频长度和 shot 数动态计算角色分层阈值。
+
+    短视频里出现 2 次的人可能已经有意义；长视频里只出现几次更可能是路人。
+    major 采用 `max(10, 总 shot 数 5%)`，避免短视频误把过多人升为主要角色。
+    """
+    total_duration = max((s.end_time for s in shots), default=0)
+    major_threshold = max(10, int(len(shots) * 0.05))
+
+    if total_duration < 600:
+        passerby_threshold = 2
+    elif total_duration < 1800:
+        passerby_threshold = config.FACE_PASSERBY_MIN_APPEARANCES
+    else:
+        passerby_threshold = max(5, config.FACE_PASSERBY_MIN_APPEARANCES)
+    return major_threshold, passerby_threshold
+
+
+def _cluster_tier(
+    scene_count: int,
+    major_threshold: int,
+    passerby_threshold: int,
+) -> str:
+    """根据出现的不同 shot 数给角色分层。"""
+    if scene_count >= major_threshold:
+        return "major"
+    if scene_count >= passerby_threshold:
+        return "minor"
+    return "passerby"
+
+
+def _select_gallery_faces(faces: list[dict], tier: str) -> list[dict]:
+    """路人只保留最高置信度脸；主要/次要角色保留多张代表脸。"""
+    if tier == "passerby":
+        return sorted(faces, key=lambda f: -f["det_score"])[:1]
+    return _select_representative_faces(
+        faces,
+        min_count=config.FACE_GALLERY_MIN,
+        max_count=config.FACE_GALLERY_MAX,
+    )
+
+
+def _save_gallery_faces(
+    faces: list[dict],
+    gallery_dir: Path,
+) -> tuple[list[str], list[float]]:
+    """保存一个角色的 gallery 图片，并返回图片路径和对应时间戳。"""
+    gallery_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    timestamps = []
+    for i, face in enumerate(faces):
+        face_path = gallery_dir / f"face_{i:02d}.jpg"
+        if not face_path.exists():
+            _save_face_crop(face, str(face_path))
+        paths.append(str(face_path))
+        timestamps.append(face["timestamp"])
+    return paths, timestamps
 
 
 def _select_representative_faces(
@@ -587,73 +823,104 @@ def _select_representative_faces(
     if len(faces) <= max_count:
         return sorted(faces, key=lambda f: f["timestamp"])
 
-    # 策略1: 时间轴均匀采样
-    sorted_by_time = sorted(faces, key=lambda f: f["timestamp"])
-    time_min = sorted_by_time[0]["timestamp"]
-    time_max = sorted_by_time[-1]["timestamp"]
-    time_range = time_max - time_min
-
     n_time_samples = min(max_count, max(min_count, len(faces) // 3))
-    time_selected = []
+    selected = _time_sample_faces(faces, n_time_samples)
+    selected.extend(_diverse_faces(faces, min_count))
+    selected = _dedupe_faces(selected + _top_confidence_faces(faces, max_count))
+    selected = selected[:max_count]
+    selected.sort(key=lambda f: f["timestamp"])
+    return selected
 
-    if time_range > 0:
-        for i in range(n_time_samples):
-            target_time = time_min + (time_range * i / max(n_time_samples - 1, 1))
-            # 找离目标时间最近、置信度更高的脸。
-            candidate = min(
-                sorted_by_time,
-                key=lambda f: (abs(f["timestamp"] - target_time), -f["det_score"]),
-            )
-            if candidate not in time_selected:
-                time_selected.append(candidate)
-    else:
-        # 所有脸在同一时刻，按置信度取
-        time_selected = sorted(faces, key=lambda f: -f["det_score"])[:n_time_samples]
 
-    # 策略2: 外观多样性采样（在embedding空间中找最远的）
-    embeddings_normed = _normalized_embeddings(faces)
+def _time_sample_faces(faces: list[dict], count: int) -> list[dict]:
+    """沿视频时间轴均匀采样，覆盖角色在不同剧情阶段的造型变化。"""
+    if count <= 0 or not faces:
+        return []
+    sorted_by_time = sorted(faces, key=lambda f: f.get("timestamp", 0.0))
+    if len(sorted_by_time) <= count:
+        return sorted_by_time
+
+    time_min = sorted_by_time[0].get("timestamp", 0.0)
+    time_max = sorted_by_time[-1].get("timestamp", 0.0)
+    if time_max <= time_min:
+        return _top_confidence_faces(faces, count)
+
+    selected = []
+    for i in range(count):
+        target_time = time_min + ((time_max - time_min) * i / max(count - 1, 1))
+        selected.append(min(
+            sorted_by_time,
+            key=lambda f: (
+                abs(f.get("timestamp", 0.0) - target_time),
+                -float(f.get("det_score", 0.0)),
+            ),
+        ))
+    return _dedupe_faces(selected)
+
+
+def _diverse_faces(faces: list[dict], count: int) -> list[dict]:
+    """在 embedding 空间贪心选择最分散的脸，覆盖角度、表情和光照变化。"""
+    valid_faces = [f for f in faces if f.get("embedding")]
+    if count <= 0 or not valid_faces:
+        return []
+
+    embeddings_normed = _normalized_embeddings(valid_faces)
     if embeddings_normed is None:
-        return sorted(time_selected, key=lambda f: f["timestamp"])[:max_count]
+        return []
 
-    # 从置信度最高的开始，贪心选取最远的
-    diversity_selected = []
-    remaining_indices = list(range(len(faces)))
-    # 先加入置信度最高的
-    best_idx = max(remaining_indices, key=lambda i: faces[i]["det_score"])
-    diversity_selected.append(best_idx)
+    # 从最高置信度脸开始
+    best_idx = max(
+        range(len(valid_faces)),
+        key=lambda i: float(valid_faces[i].get("det_score", 0.0)),
+    )
+    selected_indices = [best_idx]
+    remaining_indices = list(range(len(valid_faces)))
     remaining_indices.remove(best_idx)
 
-    while len(diversity_selected) < min_count and remaining_indices:
-        # 找与已选中的所有脸距离最大的
-        selected_embs = embeddings_normed[diversity_selected]
-        max_min_dist = -1
-        best_remaining = None
-        for idx in remaining_indices:
-            dists = 1 - np.dot(selected_embs, embeddings_normed[idx])
-            min_dist = dists.min()
-            if min_dist > max_min_dist:
-                max_min_dist = min_dist
-                best_remaining = idx
-        if best_remaining is not None:
-            diversity_selected.append(best_remaining)
-            remaining_indices.remove(best_remaining)
+    # 贪心选取：每次找与已选集合距离最大的脸（矩阵运算批量计算）
+    while len(selected_indices) < count and remaining_indices:
+        selected_embs = embeddings_normed[selected_indices]
+        remaining_embs = embeddings_normed[remaining_indices]
+        # (n_remaining, n_selected) 距离矩阵
+        dist_matrix = 1 - remaining_embs @ selected_embs.T
+        min_dists = dist_matrix.min(axis=1)
+        best_pos = int(np.argmax(min_dists))
+        selected_indices.append(remaining_indices.pop(best_pos))
 
-    diversity_faces = [faces[i] for i in diversity_selected]
+    return [valid_faces[i] for i in selected_indices]
 
-    # 合并两组，去重
-    all_selected = list(time_selected)
-    for f in diversity_faces:
-        if f not in all_selected:
-            all_selected.append(f)
 
-    # 截断到 max_count
-    all_selected = all_selected[:max_count]
+def _top_confidence_faces(faces: list[dict], count: int) -> list[dict]:
+    """按 InsightFace 检测置信度选质量最高的脸。"""
+    if count <= 0:
+        return []
+    return sorted(faces, key=lambda f: -float(f.get("det_score", 0.0)))[:count]
 
-    # 按时间排序
-    all_selected.sort(key=lambda f: f["timestamp"])
 
-    return all_selected
+def _dedupe_faces(faces: list[dict]) -> list[dict]:
+    """按来源关键帧 + bbox 去重，保留第一次出现的选择顺序。"""
+    result = []
+    seen = set()
+    for face in faces:
+        marker = _face_marker(face)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(face)
+    return result
 
+
+def _face_marker(face: dict) -> tuple:
+    """构造人脸去重键；bbox 保留两位小数以兼容 float/int 表示差异。"""
+    return (
+        face.get("keyframe_path"),
+        tuple(round(float(v), 2) for v in face.get("bbox", [])),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Image output
+# ---------------------------------------------------------------------------
 
 def _save_face_crop(face_info: dict, output_path: str):
     """保存人脸裁剪图（扩大区域包含肩部）"""
