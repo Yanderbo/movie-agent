@@ -60,9 +60,11 @@ CHUNK_MERGE_THRESHOLD = int(os.getenv("CHUNK_MERGE_THRESHOLD", "30"))   # 尾段
 # ─── 人脸聚类参数（v4.1 新增）─────────────────────────────────
 FACE_GALLERY_MAX = int(os.getenv("FACE_GALLERY_MAX", "6"))              # 每角色最大脸谱数
 FACE_GALLERY_MIN = int(os.getenv("FACE_GALLERY_MIN", "3"))              # 每角色最小脸谱数
-FACE_CLUSTER_EPS = float(os.getenv("FACE_CLUSTER_EPS", "0.5"))          # DBSCAN eps
+FACE_CLUSTER_EPS = float(os.getenv("FACE_CLUSTER_EPS", "0.42"))         # DBSCAN eps
 FACE_CLUSTER_MIN_SAMPLES = int(os.getenv("FACE_CLUSTER_MIN_SAMPLES", "3"))
-FACE_CLUSTER_MERGE_SIM = float(os.getenv("FACE_CLUSTER_MERGE_SIM", "0.72"))
+FACE_CLUSTER_SPLIT_EPS = float(os.getenv("FACE_CLUSTER_SPLIT_EPS", "0.30"))
+FACE_CLUSTER_MAX_RADIUS = float(os.getenv("FACE_CLUSTER_MAX_RADIUS", "0.34"))
+FACE_CLUSTER_MERGE_SIM = float(os.getenv("FACE_CLUSTER_MERGE_SIM", "0.86"))
 FACE_MIN_DET_SCORE = float(os.getenv("FACE_MIN_DET_SCORE", "0.65"))
 FACE_MIN_FACE_SIZE = int(os.getenv("FACE_MIN_FACE_SIZE", "48"))
 FACE_PASSERBY_MIN_APPEARANCES = int(os.getenv("FACE_PASSERBY_MIN", "3")) # 低于此值视为路人

@@ -18,7 +18,6 @@
 import json
 import os
 import subprocess
-import time
 from pathlib import Path
 from collections import defaultdict
 
@@ -98,7 +97,6 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
     返回 [{scene_index, bbox, embedding, keyframe_path, timestamp, det_score}, ...]
     """
     try:
-        import insightface
         from insightface.app import FaceAnalysis
         import cv2
     except ImportError:
@@ -270,39 +268,131 @@ def _cluster_faces(face_data: list[dict]) -> dict:
     基于人脸特征向量 DBSCAN 聚类。
     返回 {cluster_id: {"faces": [...], "scenes": set(...)}}
     """
-    from sklearn.cluster import DBSCAN
-
-    embeddings = np.array([f["embedding"] for f in face_data if f["embedding"]])
-    if len(embeddings) == 0:
-        return {}
-
-    # 归一化
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms[norms == 0] = 1
-    embeddings = embeddings / norms
-
-    # DBSCAN 聚类（余弦距离）
-    clustering = DBSCAN(
+    valid_faces = [f for f in face_data if f.get("embedding")]
+    labels = _dbscan_labels(
+        valid_faces,
         eps=config.FACE_CLUSTER_EPS,
         min_samples=max(1, config.FACE_CLUSTER_MIN_SAMPLES),
-        metric="cosine",
     )
-    labels = clustering.fit_predict(embeddings)
+    if labels is None:
+        return {}
 
     clusters = {}
-    valid_faces = [f for f in face_data if f["embedding"]]
-    for idx, label in enumerate(labels):
+    for face, label in zip(valid_faces, labels):
         if label == -1:
             continue
-        if label not in clusters:
-            clusters[label] = {"faces": [], "scenes": set()}
-        clusters[label]["faces"].append(valid_faces[idx])
-        clusters[label]["scenes"].add(valid_faces[idx]["scene_index"])
+        item = clusters.setdefault(int(label), {"faces": [], "scenes": set()})
+        item["faces"].append(face)
+        item["scenes"].add(face["scene_index"])
 
+    # 先拆混簇，再保守合并，优先避免不同角色混成一个 char。
+    clusters = _split_impure_clusters(clusters)
     return _merge_close_clusters(clusters)
 
 
+def _dbscan_labels(faces: list[dict], eps: float, min_samples: int):
+    """统一的余弦 DBSCAN 入口，避免多处重复归一化。"""
+    from sklearn.cluster import DBSCAN
+
+    embeddings = _normalized_embeddings(faces)
+    if embeddings is None:
+        return None
+    return DBSCAN(
+        eps=eps,
+        min_samples=min_samples,
+        metric="cosine",
+    ).fit_predict(embeddings)
+
+
+def _split_impure_clusters(clusters: dict) -> dict:
+    """拆分疑似混簇：同帧冲突或簇内半径过大时再聚类。"""
+    if not clusters:
+        return clusters
+
+    next_label = max(clusters) + 1
+    result = {}
+    split_count = 0
+
+    for label, info in clusters.items():
+        parts = _split_cluster_faces(info["faces"])
+        if len(parts) == 1:
+            result[label] = info
+            continue
+
+        split_count += len(parts) - 1
+        for faces in parts:
+            result[next_label] = {
+                "faces": faces,
+                "scenes": {f["scene_index"] for f in faces},
+            }
+            next_label += 1
+
+    if split_count:
+        logger.info(f"Split impure face clusters: {len(clusters)} -> {len(result)}")
+    return result
+
+
+def _split_cluster_faces(faces: list[dict]) -> list[list[dict]]:
+    """对单个疑似混簇做更严格的二次聚类。"""
+    min_samples = max(1, config.FACE_CLUSTER_MIN_SAMPLES)
+    if len(faces) < min_samples * 2 or not _needs_cluster_split(faces):
+        return [faces]
+
+    labels = _dbscan_labels(
+        faces,
+        eps=min(config.FACE_CLUSTER_SPLIT_EPS, config.FACE_CLUSTER_EPS),
+        min_samples=min_samples,
+    )
+    if labels is None:
+        return [faces]
+
+    grouped = defaultdict(list)
+    noise = []
+    for idx, label in enumerate(labels):
+        if label == -1:
+            noise.append(faces[idx])
+        else:
+            grouped[label].append(faces[idx])
+
+    parts = [part for part in grouped.values() if part]
+    if len(parts) < 2:
+        return [faces]
+
+    parts.extend([[face] for face in noise])
+    return parts
+
+
+def _needs_cluster_split(faces: list[dict]) -> bool:
+    has_conflict = _has_keyframe_conflict(faces)
+    is_scattered = _cluster_radius(faces) > config.FACE_CLUSTER_MAX_RADIUS
+    return has_conflict or is_scattered
+
+
+def _has_keyframe_conflict(faces: list[dict]) -> bool:
+    counts = defaultdict(int)
+    for face in faces:
+        keyframe = face.get("keyframe_path")
+        if keyframe:
+            counts[keyframe] += 1
+            if counts[keyframe] > 1:
+                return True
+    return False
+
+
+def _cluster_radius(faces: list[dict]) -> float:
+    embeddings = _normalized_embeddings(faces)
+    if embeddings is None or len(embeddings) < 2:
+        return 0.0
+    centroid = embeddings.mean(axis=0)
+    norm = np.linalg.norm(centroid)
+    if norm == 0:
+        return 0.0
+    distances = 1 - np.dot(embeddings, centroid / norm)
+    return float(np.percentile(distances, 90))
+
+
 def _merge_close_clusters(clusters: dict) -> dict:
+    """保守合并高度相似的小簇；同帧/同 shot 出现过则不合并。"""
     threshold = config.FACE_CLUSTER_MERGE_SIM
     if threshold <= 0 or len(clusters) < 2:
         return clusters
@@ -314,6 +404,10 @@ def _merge_close_clusters(clusters: dict) -> dict:
     }
     component_keyframes = {
         label: _cluster_keyframes(info["faces"])
+        for label, info in clusters.items()
+    }
+    component_scenes = {
+        label: set(info["scenes"])
         for label, info in clusters.items()
     }
     parent = {label: label for label in labels}
@@ -330,8 +424,11 @@ def _merge_close_clusters(clusters: dict) -> dict:
             return False
         if component_keyframes[left_root] & component_keyframes[right_root]:
             return False
+        if component_scenes[left_root] & component_scenes[right_root]:
+            return False
         parent[right_root] = left_root
         component_keyframes[left_root].update(component_keyframes[right_root])
+        component_scenes[left_root].update(component_scenes[right_root])
         return True
 
     merges = 0
@@ -361,15 +458,21 @@ def _merge_close_clusters(clusters: dict) -> dict:
 
 
 def _normalized_centroid(faces: list[dict]):
+    embeddings = _normalized_embeddings(faces)
+    if embeddings is None:
+        return None
+    centroid = embeddings.mean(axis=0)
+    norm = np.linalg.norm(centroid)
+    return centroid / norm if norm else None
+
+
+def _normalized_embeddings(faces: list[dict]):
     embeddings = np.array([f["embedding"] for f in faces if f.get("embedding")])
     if len(embeddings) == 0:
         return None
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1
-    embeddings = embeddings / norms
-    centroid = embeddings.mean(axis=0)
-    norm = np.linalg.norm(centroid)
-    return centroid / norm if norm else None
+    return embeddings / norms
 
 
 def _cluster_keyframes(faces: list[dict]) -> set[str]:
@@ -390,8 +493,6 @@ def _build_galleries(
     - 10-30min: passerby_threshold=3
     - > 30min: passerby_threshold=5
     """
-    import cv2
-
     # 动态阈值
     if total_duration < 600:
         passerby_threshold = 2
@@ -432,7 +533,7 @@ def _build_galleries(
             gallery_faces = sorted(faces, key=lambda f: -f["det_score"])[:1]
         else:
             gallery_faces = _select_representative_faces(
-                faces, shots,
+                faces,
                 min_count=config.FACE_GALLERY_MIN,
                 max_count=config.FACE_GALLERY_MAX,
             )
@@ -452,8 +553,7 @@ def _build_galleries(
             gallery_timestamps.append(face["timestamp"])
 
         # 计算聚类中心
-        embeddings = np.array([f["embedding"] for f in faces])
-        centroid = embeddings.mean(axis=0).tolist() if len(embeddings) > 0 else []
+        centroid = _normalized_centroid(faces)
 
         gallery = CharacterGallery(
             character_id=char_id,
@@ -462,7 +562,7 @@ def _build_galleries(
             total_detections=n_detections,
             appearance_scenes=sorted(scenes),
             tier=tier,
-            embedding_centroid=centroid,
+            embedding_centroid=centroid.tolist() if centroid is not None else [],
         )
         galleries.append(gallery)
 
@@ -473,7 +573,6 @@ def _build_galleries(
 
 def _select_representative_faces(
     faces: list[dict],
-    shots: list[Shot],
     min_count: int = 3,
     max_count: int = 6,
 ) -> list[dict]:
@@ -500,22 +599,21 @@ def _select_representative_faces(
     if time_range > 0:
         for i in range(n_time_samples):
             target_time = time_min + (time_range * i / max(n_time_samples - 1, 1))
-            # 找最近的且置信度最高的
-            candidates = sorted(
+            # 找离目标时间最近、置信度更高的脸。
+            candidate = min(
                 sorted_by_time,
                 key=lambda f: (abs(f["timestamp"] - target_time), -f["det_score"]),
             )
-            if candidates and candidates[0] not in time_selected:
-                time_selected.append(candidates[0])
+            if candidate not in time_selected:
+                time_selected.append(candidate)
     else:
         # 所有脸在同一时刻，按置信度取
         time_selected = sorted(faces, key=lambda f: -f["det_score"])[:n_time_samples]
 
     # 策略2: 外观多样性采样（在embedding空间中找最远的）
-    embeddings = np.array([f["embedding"] for f in faces])
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms[norms == 0] = 1
-    embeddings_normed = embeddings / norms
+    embeddings_normed = _normalized_embeddings(faces)
+    if embeddings_normed is None:
+        return sorted(time_selected, key=lambda f: f["timestamp"])[:max_count]
 
     # 从置信度最高的开始，贪心选取最远的
     diversity_selected = []
