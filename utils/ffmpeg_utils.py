@@ -13,7 +13,7 @@ from utils.logger import get_logger
 logger = get_logger("FFmpegUtils")
 
 
-def _run_cmd(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
+def _run_cmd(cmd: list[str], timeout: int | None = 600) -> subprocess.CompletedProcess:
     """运行外部命令，捕获输出"""
     logger.debug(f"执行命令: {' '.join(cmd)}")
     try:
@@ -26,6 +26,18 @@ def _run_cmd(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
         raise RuntimeError(f"命令执行失败: {e.stderr[:500]}") from e
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"命令超时 ({timeout}s): {' '.join(cmd[:3])}...") from e
+
+
+def duration_matches(
+    expected: float,
+    actual: float,
+    tolerance_seconds: float = 5.0,
+    tolerance_ratio: float = 0.01,
+) -> bool:
+    if expected <= 0 or actual <= 0:
+        return False
+    tolerance = max(tolerance_seconds, expected * tolerance_ratio)
+    return abs(expected - actual) <= tolerance
 
 
 def probe_video(video_path: str) -> dict:
@@ -87,7 +99,7 @@ def compress_video(
     压缩视频用于理解流水线（v4.1 新增）。
 
     仅在分辨率或帧率超过阈值时进行压缩，否则跳过。
-    音频保留原始质量（-c:a copy）以确保 ASR 准确性。
+    音频重编码为 AAC，避免源文件异常时间戳导致压缩产物截断。
 
     Args:
         src: 源视频路径
@@ -113,6 +125,7 @@ def compress_video(
     info = get_video_info(src)
     original_height = info["height"]
     original_fps = info["fps"]
+    original_duration = info["duration"]
 
     need_scale = original_height > max_height
     need_fps = original_fps > max_fps
@@ -134,20 +147,29 @@ def compress_video(
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [config.FFMPEG_PATH, "-y", "-i", src]
+    filters = []
 
     # 视频滤镜：按比例缩放，宽度自适应保持偶数
     if need_scale:
-        cmd.extend(["-vf", f"scale=-2:{max_height}"])
+        filters.append(f"scale=-2:{max_height}")
 
     # 帧率
     if need_fps:
-        cmd.extend(["-r", str(max_fps)])
+        filters.insert(0, f"fps={max_fps}")
+
+    if filters:
+        cmd.extend(["-vf", ",".join(filters)])
 
     # 视频编码：使用较快的预设
-    cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+    cmd.extend([
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-movflags", "+faststart",
+    ])
 
-    # 音频保留原始
-    cmd.extend(["-c:a", "copy"])
+    # 音频重编码，避免继承异常时间戳
+    cmd.extend(["-c:a", "aac", "-b:a", "128k"])
 
     cmd.append(dst)
 
@@ -158,16 +180,28 @@ def compress_video(
         f"压缩视频: {original_height}p@{original_fps}fps → "
         f"{compressed_height}p@{compressed_fps}fps"
     )
-    _run_cmd(cmd, timeout=1800)  # 压缩可能较慢，30分钟超时
+    try:
+        _run_cmd(cmd, timeout=config.FFMPEG_COMPRESS_TIMEOUT or None)
+    except Exception:
+        Path(dst).unlink(missing_ok=True)
+        raise
     logger.info(f"视频压缩完成: {dst}")
+
+    compressed_info = get_video_info(dst)
+    if not duration_matches(original_duration, compressed_info["duration"]):
+        Path(dst).unlink(missing_ok=True)
+        raise RuntimeError(
+            "Compressed video duration mismatch: "
+            f"source={original_duration:.3f}s, compressed={compressed_info['duration']:.3f}s"
+        )
 
     return {
         "compressed": True,
         "output_path": dst,
         "original_height": original_height,
         "original_fps": original_fps,
-        "compressed_height": compressed_height,
-        "compressed_fps": compressed_fps,
+        "compressed_height": compressed_info["height"],
+        "compressed_fps": compressed_info["fps"],
     }
 
 

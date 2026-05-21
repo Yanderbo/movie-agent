@@ -13,7 +13,7 @@ from pathlib import Path
 
 import config
 from models.schemas import VideoMeta
-from utils.ffmpeg_utils import get_video_info, compress_video
+from utils.ffmpeg_utils import get_video_info, compress_video, duration_matches
 from utils.logger import get_logger
 
 logger = get_logger("Ingest")
@@ -92,16 +92,21 @@ def ingest_video(video_path: str, video_id: str = None) -> VideoMeta:
     compress_result = {"compressed": False}
     if compressed_dest.exists():
         logger.info(f"压缩视频已存在，跳过压缩: {compressed_dest}")
-        compressed_info = get_video_info(str(compressed_dest))
-        compress_result = {
-            "compressed": True,
-            "output_path": str(compressed_dest),
-            "original_height": info["height"],
-            "original_fps": info["fps"],
-            "compressed_height": compressed_info["height"],
-            "compressed_fps": compressed_info["fps"],
-        }
-    else:
+        try:
+            compressed_info = get_video_info(str(compressed_dest))
+            compress_result = {
+                "compressed": True,
+                "output_path": str(compressed_dest),
+                "original_height": info["height"],
+                "original_fps": info["fps"],
+                "compressed_height": compressed_info["height"],
+                "compressed_fps": compressed_info["fps"],
+            }
+        except Exception as e:
+            logger.warning(f"压缩视频不可读，将重新生成: {e}")
+            compressed_dest.unlink(missing_ok=True)
+
+    if not compressed_dest.exists():
         compress_result = compress_video(
             str(dest), str(compressed_dest),
             max_height=config.COMPRESS_MAX_HEIGHT,
@@ -109,6 +114,20 @@ def ingest_video(video_path: str, video_id: str = None) -> VideoMeta:
         )
 
     # 确定理解流水线使用的视频路径
+    if compress_result["compressed"]:
+        compressed_info = get_video_info(compress_result["output_path"])
+        if not duration_matches(info["duration"], compressed_info["duration"]):
+            logger.warning(
+                "压缩视频时长异常，将重新生成: "
+                f"source={info['duration']:.3f}s, compressed={compressed_info['duration']:.3f}s"
+            )
+            compressed_dest.unlink(missing_ok=True)
+            compress_result = compress_video(
+                str(dest), str(compressed_dest),
+                max_height=config.COMPRESS_MAX_HEIGHT,
+                max_fps=config.COMPRESS_MAX_FPS,
+            )
+
     pipeline_video = str(compressed_dest) if compress_result["compressed"] else str(dest)
 
     meta = VideoMeta(

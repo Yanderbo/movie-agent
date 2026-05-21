@@ -30,6 +30,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-004")
 # ─── FFmpeg 配置 ──────────────────────────────────────────────
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
+FFMPEG_COMPRESS_TIMEOUT = int(os.getenv("FFMPEG_COMPRESS_TIMEOUT", "0"))  # 0 = no timeout
 
 # ─── 视频处理参数 ─────────────────────────────────────────────
 # 压缩参数（v4.1: 用于理解流水线的视频压缩）
