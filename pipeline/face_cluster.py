@@ -174,7 +174,7 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
     face_data = []
     filtered_faces = 0
     for shot in shots:
-        for kf_path in _shot_keyframe_paths(shot):
+        for kf_path, kf_timestamp in _shot_keyframe_items(shot):
             try:
                 img = cv2.imread(kf_path)
                 if img is None:
@@ -184,7 +184,7 @@ def _detect_all_faces(shots: list[Shot]) -> list[dict]:
                     if not _is_usable_face(face, img.shape):
                         filtered_faces += 1
                         continue
-                    face_data.append(_face_record(face, shot, kf_path))
+                    face_data.append(_face_record(face, shot, kf_path, kf_timestamp))
             except Exception as e:
                 logger.warning(f"人脸检测失败 (shot {shot.scene_index}, {kf_path}): {e}")
 
@@ -201,6 +201,11 @@ def _shot_keyframe_paths(shot: Shot) -> list[str]:
     `keyframe_paths` 是新版多帧采样字段，`keyframe_path` 是旧版兼容字段。
     这里同时读取并去重，避免旧数据或中间产物不完整时漏掉可用帧。
     """
+    return [path for path, _ in _shot_keyframe_items(shot)]
+
+
+def _shot_keyframe_items(shot: Shot) -> list[tuple[str, float]]:
+    """Return existing keyframe paths with an estimated timestamp for each frame."""
     candidates = list(shot.keyframe_paths or [])
     if shot.keyframe_path:
         candidates.append(shot.keyframe_path)
@@ -215,17 +220,39 @@ def _shot_keyframe_paths(shot: Shot) -> list[str]:
         if Path(path_str).exists():
             paths.append(path_str)
             seen.add(path_str)
-    return paths
+    total = len(paths)
+    return [
+        (path, _infer_keyframe_timestamp(shot, idx, total))
+        for idx, path in enumerate(paths)
+    ]
 
 
-def _face_record(face, shot: Shot, keyframe_path: str) -> dict:
+def _infer_keyframe_timestamp(shot: Shot, frame_index: int, frame_count: int) -> float:
+    """Mirror keyframe.py sampling so multi-frame detections keep temporal order."""
+    start = float(shot.start_time)
+    end = float(shot.end_time)
+    duration = max(0.0, end - start)
+    if frame_count <= 1:
+        return start + duration * 0.5
+
+    safe_start = start + duration * 0.1
+    safe_end = end - duration * 0.1
+    safe_duration = safe_end - safe_start
+    if safe_duration <= 0:
+        return start + duration * 0.5
+
+    step = safe_duration / max(frame_count - 1, 1)
+    return round(safe_start + step * frame_index, 3)
+
+
+def _face_record(face, shot: Shot, keyframe_path: str, timestamp: float | None = None) -> dict:
     """把 InsightFace 返回对象压平成后续流程稳定使用的普通 dict。"""
     return {
         "scene_index": shot.scene_index,
         "bbox": _to_list(getattr(face, "bbox", [])),
         "embedding": _to_list(getattr(face, "embedding", [])),
         "keyframe_path": keyframe_path,
-        "timestamp": shot.start_time,
+        "timestamp": float(shot.start_time if timestamp is None else timestamp),
         "det_score": float(getattr(face, "det_score", 0.0)),
     }
 
@@ -726,7 +753,12 @@ def _build_galleries(
 
         char_id = f"char_{cluster_id:03d}"
         gallery_faces = _select_gallery_faces(faces, tier)
-        gallery_paths, gallery_timestamps = _save_gallery_faces(
+        (
+            gallery_paths,
+            gallery_timestamps,
+            gallery_scene_indices,
+            gallery_keyframe_paths,
+        ) = _save_gallery_faces(
             gallery_faces,
             chars_dir / f"{char_id}_gallery",
         )
@@ -736,6 +768,8 @@ def _build_galleries(
             character_id=char_id,
             gallery_paths=gallery_paths,
             gallery_timestamps=gallery_timestamps,
+            gallery_scene_indices=gallery_scene_indices,
+            gallery_keyframe_paths=gallery_keyframe_paths,
             total_detections=n_detections,
             appearance_scenes=sorted(scenes),
             tier=tier,
@@ -793,18 +827,22 @@ def _select_gallery_faces(faces: list[dict], tier: str) -> list[dict]:
 def _save_gallery_faces(
     faces: list[dict],
     gallery_dir: Path,
-) -> tuple[list[str], list[float]]:
-    """保存一个角色的 gallery 图片，并返回图片路径和对应时间戳。"""
+) -> tuple[list[str], list[float], list[int], list[str]]:
+    """保存一个角色的 gallery 图片，并返回图片路径和来源元数据。"""
     gallery_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     timestamps = []
+    scene_indices = []
+    keyframe_paths = []
     for i, face in enumerate(faces):
         face_path = gallery_dir / f"face_{i:02d}.jpg"
         if not face_path.exists():
             _save_face_crop(face, str(face_path))
         paths.append(str(face_path))
-        timestamps.append(face["timestamp"])
-    return paths, timestamps
+        timestamps.append(_face_timestamp(face))
+        scene_indices.append(_face_scene_index(face))
+        keyframe_paths.append(str(face.get("keyframe_path", "")))
+    return paths, timestamps, scene_indices, keyframe_paths
 
 
 def _select_representative_faces(
@@ -816,85 +854,176 @@ def _select_representative_faces(
     为一个角色选取代表脸，凸显形象变化。
 
     策略：
-    1. 时间轴均匀采样 — 捕捉服装/发型随剧情变化
-    2. 外观多样性采样 — 在 embedding 空间选取最远的脸
-    3. 合并去重 → 保留 min_count ~ max_count 张
+    1. 先按 shot 去重，避免 gallery 被同一个近景 shot 占满。
+    2. 再沿角色出现时间轴均匀采样，覆盖不同剧情阶段。
+    3. 数量不足时优先补充未使用 shot、且离已选样本时间更远的脸。
     """
-    if len(faces) <= max_count:
-        return sorted(faces, key=lambda f: f["timestamp"])
+    if max_count <= 0:
+        return []
 
-    n_time_samples = min(max_count, max(min_count, len(faces) // 3))
-    selected = _time_sample_faces(faces, n_time_samples)
-    selected.extend(_diverse_faces(faces, min_count))
-    selected = _dedupe_faces(selected + _top_confidence_faces(faces, max_count))
-    selected = selected[:max_count]
-    selected.sort(key=lambda f: f["timestamp"])
+    faces = _dedupe_faces(faces)
+    if len(faces) <= max_count:
+        return sorted(faces, key=_face_sort_key)
+
+    target_count = min(max_count, len(faces))
+    scene_faces = _best_faces_by_scene(faces)
+    primary_pool = (
+        scene_faces
+        if len(scene_faces) >= min(min_count, target_count)
+        else faces
+    )
+
+    selected = _time_sample_faces(primary_pool, min(target_count, len(primary_pool)))
+    selected = _fill_gallery_faces(selected, faces, target_count)
+    selected = selected[:target_count]
+    selected.sort(key=_face_sort_key)
     return selected
+
+
+def _best_faces_by_scene(faces: list[dict]) -> list[dict]:
+    """Keep the best face per shot so a gallery does not collapse into one shot."""
+    grouped = defaultdict(list)
+    for face in faces:
+        grouped[face.get("scene_index")].append(face)
+    best_faces = [max(items, key=_face_quality_key) for items in grouped.values()]
+    return sorted(best_faces, key=_face_sort_key)
+
+
+def _fill_gallery_faces(
+    selected: list[dict],
+    faces: list[dict],
+    target_count: int,
+) -> list[dict]:
+    """Fill shortages while preferring unused shots and larger temporal gaps."""
+    selected = _dedupe_faces(selected)
+    seen = {_face_marker(face) for face in selected}
+
+    while len(selected) < target_count:
+        candidates = [face for face in faces if _face_marker(face) not in seen]
+        if not candidates:
+            break
+        best = max(candidates, key=lambda face: _gallery_fill_key(face, selected))
+        selected.append(best)
+        seen.add(_face_marker(best))
+
+    return selected
+
+
+def _gallery_fill_key(face: dict, selected: list[dict]) -> tuple:
+    selected_scenes = {_face_scene_index(item) for item in selected}
+    scene_is_new = _face_scene_index(face) not in selected_scenes
+    return (
+        int(scene_is_new),
+        _min_timestamp_gap(face, selected),
+        *_face_quality_key(face),
+    )
+
+
+def _min_timestamp_gap(face: dict, selected: list[dict]) -> float:
+    if not selected:
+        return float("inf")
+    timestamp = _face_timestamp(face)
+    return min(abs(timestamp - _face_timestamp(item)) for item in selected)
 
 
 def _time_sample_faces(faces: list[dict], count: int) -> list[dict]:
     """沿视频时间轴均匀采样，覆盖角色在不同剧情阶段的造型变化。"""
     if count <= 0 or not faces:
         return []
-    sorted_by_time = sorted(faces, key=lambda f: f.get("timestamp", 0.0))
+    sorted_by_time = sorted(_dedupe_faces(faces), key=_face_sort_key)
     if len(sorted_by_time) <= count:
         return sorted_by_time
 
-    time_min = sorted_by_time[0].get("timestamp", 0.0)
-    time_max = sorted_by_time[-1].get("timestamp", 0.0)
+    time_min = _face_timestamp(sorted_by_time[0])
+    time_max = _face_timestamp(sorted_by_time[-1])
     if time_max <= time_min:
         return _top_confidence_faces(faces, count)
 
     selected = []
+    used = set()
+    bucket_width = (time_max - time_min) / count
+
     for i in range(count):
+        start = time_min + bucket_width * i
+        end = time_max if i == count - 1 else start + bucket_width
+        bucket = [
+            face for face in sorted_by_time
+            if _face_marker(face) not in used
+            and start <= _face_timestamp(face) <= end
+        ]
+        if bucket:
+            best = max(bucket, key=_face_quality_key)
+            selected.append(best)
+            used.add(_face_marker(best))
+
+    for i in range(count):
+        if len(selected) >= count:
+            break
         target_time = time_min + ((time_max - time_min) * i / max(count - 1, 1))
-        selected.append(min(
-            sorted_by_time,
-            key=lambda f: (
-                abs(f.get("timestamp", 0.0) - target_time),
-                -float(f.get("det_score", 0.0)),
+        remaining = [
+            face for face in sorted_by_time
+            if _face_marker(face) not in used
+        ]
+        if not remaining:
+            break
+        best = min(
+            remaining,
+            key=lambda face: (
+                abs(_face_timestamp(face) - target_time),
+                -float(face.get("det_score", 0.0)),
             ),
-        ))
-    return _dedupe_faces(selected)
+        )
+        selected.append(best)
+        used.add(_face_marker(best))
 
-
-def _diverse_faces(faces: list[dict], count: int) -> list[dict]:
-    """在 embedding 空间贪心选择最分散的脸，覆盖角度、表情和光照变化。"""
-    valid_faces = [f for f in faces if f.get("embedding")]
-    if count <= 0 or not valid_faces:
-        return []
-
-    embeddings_normed = _normalized_embeddings(valid_faces)
-    if embeddings_normed is None:
-        return []
-
-    # 从最高置信度脸开始
-    best_idx = max(
-        range(len(valid_faces)),
-        key=lambda i: float(valid_faces[i].get("det_score", 0.0)),
-    )
-    selected_indices = [best_idx]
-    remaining_indices = list(range(len(valid_faces)))
-    remaining_indices.remove(best_idx)
-
-    # 贪心选取：每次找与已选集合距离最大的脸（矩阵运算批量计算）
-    while len(selected_indices) < count and remaining_indices:
-        selected_embs = embeddings_normed[selected_indices]
-        remaining_embs = embeddings_normed[remaining_indices]
-        # (n_remaining, n_selected) 距离矩阵
-        dist_matrix = 1 - remaining_embs @ selected_embs.T
-        min_dists = dist_matrix.min(axis=1)
-        best_pos = int(np.argmax(min_dists))
-        selected_indices.append(remaining_indices.pop(best_pos))
-
-    return [valid_faces[i] for i in selected_indices]
+    return sorted(_dedupe_faces(selected), key=_face_sort_key)
 
 
 def _top_confidence_faces(faces: list[dict], count: int) -> list[dict]:
     """按 InsightFace 检测置信度选质量最高的脸。"""
     if count <= 0:
         return []
-    return sorted(faces, key=lambda f: -float(f.get("det_score", 0.0)))[:count]
+    return sorted(
+        _dedupe_faces(faces),
+        key=lambda f: -float(f.get("det_score", 0.0)),
+    )[:count]
+
+
+def _face_timestamp(face: dict) -> float:
+    try:
+        return float(face.get("timestamp", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _face_sort_key(face: dict) -> tuple:
+    return (
+        _face_timestamp(face),
+        _face_scene_index(face),
+        str(face.get("keyframe_path", "")),
+        _face_bbox_key(face),
+    )
+
+
+def _face_scene_index(face: dict) -> int:
+    try:
+        return int(face.get("scene_index", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _face_quality_key(face: dict) -> tuple:
+    return (
+        float(face.get("det_score", 0.0)),
+        _face_size(face.get("bbox", [])),
+    )
+
+
+def _face_bbox_key(face: dict) -> tuple:
+    try:
+        return tuple(round(float(v), 2) for v in face.get("bbox", []))
+    except (TypeError, ValueError):
+        return tuple()
 
 
 def _dedupe_faces(faces: list[dict]) -> list[dict]:
@@ -914,7 +1043,7 @@ def _face_marker(face: dict) -> tuple:
     """构造人脸去重键；bbox 保留两位小数以兼容 float/int 表示差异。"""
     return (
         face.get("keyframe_path"),
-        tuple(round(float(v), 2) for v in face.get("bbox", [])),
+        _face_bbox_key(face),
     )
 
 

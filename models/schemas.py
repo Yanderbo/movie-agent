@@ -62,6 +62,8 @@ class CharacterGallery(BaseModel):
     character_id: str
     gallery_paths: list[str] = Field(default_factory=list)        # 3-6张代表脸路径
     gallery_timestamps: list[float] = Field(default_factory=list) # 每张脸对应的视频时间
+    gallery_scene_indices: list[int] = Field(default_factory=list) # 每张代表脸对应的 shot
+    gallery_keyframe_paths: list[str] = Field(default_factory=list) # 每张代表脸来源关键帧
     total_detections: int = 0         # 总检测次数
     appearance_scenes: list[int] = Field(default_factory=list)    # 出现的 shot 列表
     tier: str = "major"               # major / minor / passerby
