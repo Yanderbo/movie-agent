@@ -269,14 +269,23 @@ def _is_usable_face(face, image_shape=None) -> bool:
     """
     判断一张检测脸是否值得进入聚类。
 
-    过滤规则有两层：
+    过滤规则有四层：
     1. det_score 过滤误检；
     2. bbox 短边过滤远景小脸。尺寸阈值按关键帧短边比例计算，并带像素兜底，
        这样同一套配置能适配 480p/1080p/4K 等不同关键帧尺寸。
+    3. 裁剪后短边过滤，避免 gallery 出现不可辨认的小图；
+    4. 可选侧脸过滤，优先保留正脸/轻微转头的人脸作为身份库。
     """
     if float(getattr(face, "det_score", 0.0)) < config.FACE_MIN_DET_SCORE:
         return False
-    return _face_size(getattr(face, "bbox", [])) >= _face_size_threshold(image_shape)
+    bbox = getattr(face, "bbox", [])
+    if _face_size(bbox) < _face_size_threshold(image_shape):
+        return False
+    if _face_crop_short_side(bbox, image_shape) < _face_crop_size_threshold(image_shape):
+        return False
+    if _is_side_face(face):
+        return False
+    return True
 
 
 def _face_size(bbox) -> float:
@@ -292,6 +301,91 @@ def _face_size_threshold(image_shape) -> float:
     # 此处无需再做二级 fallback。
     ratio_threshold = _image_short_side(image_shape) * config.FACE_MIN_FACE_RATIO
     return max(config.FACE_MIN_FACE_PIXEL_FLOOR, ratio_threshold)
+
+
+def _face_crop_short_side(bbox, image_shape) -> float:
+    bounds = _expanded_face_crop_bounds(bbox, image_shape)
+    if bounds is None and bbox is not None and len(bbox) == 4:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        crop_width = max(0.0, (x2 - x1) * 1.8)
+        crop_height = max(0.0, (y2 - y1) * 2.0)
+        return float(min(crop_width, crop_height))
+    if bounds is None:
+        return 0.0
+    x1, y1, x2, y2 = bounds
+    return float(max(0, min(x2 - x1, y2 - y1)))
+
+
+def _face_crop_size_threshold(image_shape) -> float:
+    """计算保存到 gallery 的裁剪图短边阈值。"""
+    ratio_threshold = _image_short_side(image_shape) * config.FACE_MIN_CROP_RATIO
+    return max(config.FACE_MIN_CROP_PIXEL_FLOOR, ratio_threshold)
+
+
+def _expanded_face_crop_bounds(bbox, image_shape) -> tuple[int, int, int, int] | None:
+    if bbox is None or len(bbox) != 4 or image_shape is None or len(image_shape) < 2:
+        return None
+    height, width = image_shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    pad_x = int((x2 - x1) * 0.4)
+    pad_y = int((y2 - y1) * 0.5)
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(int(width), x2 + pad_x)
+    y2 = min(int(height), y2 + pad_y)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _is_side_face(face) -> bool:
+    if not config.FACE_REJECT_SIDE_FACE:
+        return False
+
+    yaw = _face_pose_yaw(face)
+    if yaw is not None and abs(yaw) > config.FACE_MAX_POSE_YAW:
+        return True
+
+    imbalance = _landmark_yaw_imbalance(face)
+    return (
+        imbalance is not None
+        and imbalance > config.FACE_MAX_LANDMARK_IMBALANCE
+    )
+
+
+def _face_pose_yaw(face) -> float | None:
+    pose = getattr(face, "pose", None)
+    if pose is None:
+        return None
+    values = _to_list(pose)
+    if len(values) < 2:
+        return None
+    try:
+        return float(values[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _landmark_yaw_imbalance(face) -> float | None:
+    """用 InsightFace 5 点 landmarks 估算侧脸程度；缺少 landmarks 时不过滤。"""
+    kps = getattr(face, "kps", None)
+    if kps is None:
+        return None
+    points = _to_list(kps)
+    if len(points) < 3:
+        return None
+    try:
+        left_eye_x = float(points[0][0])
+        right_eye_x = float(points[1][0])
+        nose_x = float(points[2][0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    eye_distance = abs(right_eye_x - left_eye_x)
+    if eye_distance <= 1e-6:
+        return None
+    eye_mid_x = (left_eye_x + right_eye_x) / 2.0
+    return abs(nose_x - eye_mid_x) / eye_distance
 
 
 def _image_short_side(image_shape) -> float:
@@ -562,6 +656,7 @@ def _merge_close_clusters(clusters: dict) -> dict:
     强光/暗光被拆成多个小簇。这里使用两类证据进行保守合并：
     - centroid_sim：两个簇中心向量足够相似，直接合并；
     - link_sim：两个簇的代表脸之间存在高相似连接，且簇中心不太远，合并。
+    - strong_link_sim：单对代表脸极高相似时，用更低中心相似度要求桥接碎簇。
 
     同一关键帧中同时出现过的两个簇不会合并，因为它们大概率是两个人。
     注意：不能用 scene（shot）共现来阻断合并，因为同一人在同一 shot 的
@@ -570,7 +665,9 @@ def _merge_close_clusters(clusters: dict) -> dict:
     centroid_threshold = config.FACE_CLUSTER_MERGE_SIM
     link_threshold = config.FACE_CLUSTER_MERGE_LINK_SIM
     min_centroid_sim = config.FACE_CLUSTER_MERGE_MIN_CENTROID_SIM
-    if centroid_threshold <= 0 and link_threshold <= 0:
+    strong_link_threshold = config.FACE_CLUSTER_MERGE_STRONG_LINK_SIM
+    strong_min_centroid_sim = config.FACE_CLUSTER_MERGE_STRONG_MIN_CENTROID_SIM
+    if centroid_threshold <= 0 and link_threshold <= 0 and strong_link_threshold <= 0:
         return clusters
     if len(clusters) < 2:
         return clusters
@@ -616,12 +713,20 @@ def _merge_close_clusters(clusters: dict) -> dict:
             right_embeddings = merge_embeddings.get(right)
             centroid_sim = _vector_similarity(left_centroid, right_centroid)
             link_sim = _top_pair_similarity(left_embeddings, right_embeddings)
+            strong_link_sim = _top_pair_similarity(
+                left_embeddings,
+                right_embeddings,
+                top_k=1,
+            )
             if _should_merge_clusters(
                 centroid_sim,
                 link_sim,
+                strong_link_sim,
                 centroid_threshold,
                 link_threshold,
                 min_centroid_sim,
+                strong_link_threshold,
+                strong_min_centroid_sim,
             ):
                 merges += int(union(left, right))
 
@@ -642,16 +747,23 @@ def _merge_close_clusters(clusters: dict) -> dict:
 def _should_merge_clusters(
     centroid_sim: float,
     link_sim: float,
+    strong_link_sim: float,
     centroid_threshold: float,
     link_threshold: float,
     min_centroid_sim: float,
+    strong_link_threshold: float,
+    strong_min_centroid_sim: float,
 ) -> bool:
     """集中管理合并判定，便于调参时保持 centroid/link 两条规则一致。"""
     if centroid_sim >= centroid_threshold:
         return True
-    if link_threshold <= 0:
-        return False
-    return link_sim >= link_threshold and centroid_sim >= min_centroid_sim
+    if link_threshold > 0 and link_sim >= link_threshold and centroid_sim >= min_centroid_sim:
+        return True
+    return (
+        strong_link_threshold > 0
+        and strong_link_sim >= strong_link_threshold
+        and centroid_sim >= strong_min_centroid_sim
+    )
 
 
 def _vector_similarity(left, right) -> float:
@@ -836,8 +948,8 @@ def _save_gallery_faces(
     keyframe_paths = []
     for i, face in enumerate(faces):
         face_path = gallery_dir / f"face_{i:02d}.jpg"
-        if not face_path.exists():
-            _save_face_crop(face, str(face_path))
+        if not face_path.exists() and not _save_face_crop(face, str(face_path)):
+            continue
         paths.append(str(face_path))
         timestamps.append(_face_timestamp(face))
         scene_indices.append(_face_scene_index(face))
@@ -1051,7 +1163,7 @@ def _face_marker(face: dict) -> tuple:
 # Image output
 # ---------------------------------------------------------------------------
 
-def _save_face_crop(face_info: dict, output_path: str):
+def _save_face_crop(face_info: dict, output_path: str) -> bool:
     """保存人脸裁剪图（扩大区域包含肩部）"""
     try:
         import cv2
@@ -1059,26 +1171,24 @@ def _save_face_crop(face_info: dict, output_path: str):
         bbox = face_info.get("bbox", [])
 
         if not keyframe or not Path(keyframe).exists():
-            return
+            return False
 
         img = cv2.imread(keyframe)
         if img is None:
-            return
+            return False
 
         if bbox and len(bbox) == 4:
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            h, w = img.shape[:2]
-            # 扩大裁剪区域（包含更多上下文）
-            pad_x = int((x2 - x1) * 0.4)
-            pad_y = int((y2 - y1) * 0.5)
-            x1 = max(0, x1 - pad_x)
-            y1 = max(0, y1 - pad_y)
-            x2 = min(w, x2 + pad_x)
-            y2 = min(h, y2 + pad_y)
+            bounds = _expanded_face_crop_bounds(bbox, img.shape)
+            if bounds is None:
+                return False
+            if _face_crop_short_side(bbox, img.shape) < _face_crop_size_threshold(img.shape):
+                return False
+            x1, y1, x2, y2 = bounds
             face_img = img[y1:y2, x1:x2]
-            cv2.imwrite(output_path, face_img)
+            return bool(cv2.imwrite(output_path, face_img))
         else:
             # 无 bbox，保存整帧
-            cv2.imwrite(output_path, img)
+            return bool(cv2.imwrite(output_path, img))
     except Exception as e:
         logger.warning(f"保存人脸裁剪失败: {e}")
+        return False
