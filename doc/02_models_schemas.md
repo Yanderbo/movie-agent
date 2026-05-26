@@ -89,6 +89,8 @@ Step 4 `face_cluster.py` 的主要产物，用于在 Step 5 中作为 Gemini 角
 | `character_id` | str | 角色 ID，如 `char_000` |
 | `gallery_paths` | list[str] | 代表脸图片路径，主要/次要角色通常 3-6 张 |
 | `gallery_timestamps` | list[float] | 每张代表脸对应的视频时间 |
+| `gallery_scene_indices` | list[int] | 每张代表脸来源 shot，便于排查 gallery 是否时间扎堆 |
+| `gallery_keyframe_paths` | list[str] | 每张代表脸来源关键帧路径 |
 | `total_detections` | int | 人脸总检测次数 |
 | `appearance_scenes` | list[int] | 出现过的 shot |
 | `tier` | str | major / minor / passerby |
@@ -383,7 +385,7 @@ EventNode = Event   # 旧代码 import EventNode 可正常工作
 | `VideoMeta.is_compressed` | `False` | v4.1 |
 | `VideoMeta.original_height` / `compressed_height` | `0` | v4.1 |
 | `VideoMeta.original_fps` / `compressed_fps` | `0.0` | v4.1 |
-| `CharacterGallery.gallery_paths` / `appearance_scenes` | `[]` | v4.1 |
+| `CharacterGallery.gallery_paths` / `gallery_timestamps` / `gallery_scene_indices` / `gallery_keyframe_paths` / `appearance_scenes` | `[]` | v4.1 |
 | `CharacterProfile.names` / `appearance_changes` / `key_actions` | `[]` | v4.1 |
 | `MinuteChunk.raw_transcripts` / `per_shot_vision` / `per_shot_audio` | `[]` | v4.1 |
 | `MinuteChunk.cross_shot_analysis` | `{}` | v4.1 |

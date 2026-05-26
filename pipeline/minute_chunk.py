@@ -71,6 +71,11 @@ E. **跨镜头分析**
    - emotion_arc: 情绪变化
    - suggested_beats: 建议的节拍分组（哪些连续镜头属于同一叙事节拍），用镜头索引表示
 
+F. **角色身份合并建议**（仅在你有充分证据时才填写）
+   - 如果你发现两个角色ID实际上是同一个人（同一演员），报告合并建议
+   - 需要脸部特征、声音、剧情连续性、称呼等多项证据一致才能确认
+   - 如果只是"看起来有点像"但不确定，不要报告
+
 输出 JSON（只输出JSON）：
 ```json
 {{
@@ -88,6 +93,7 @@ E. **跨镜头分析**
   "character_updates": [
     {{"character_id": "char_000", "new_names": [], "appearance_change": "", "key_action": ""}}
   ],
+  "character_merge_suggestions": [],
   "cross_shot": {{
     "narrative_continuity": "",
     "emotion_arc": "",
@@ -97,14 +103,28 @@ E. **跨镜头分析**
 ```"""
 
 CHARACTER_SECTION_TEMPLATE = """== 已知角色脸谱 ==
-以下附图为已识别角色的参考脸谱（按 {gallery_labels} 的顺序排列）。
-请在分析时用对应的角色ID标注人物。
+下方附件中，每张参考脸谱前都标注了对应的角色ID、序号和来源时间。
+请根据脸部五官特征（而非服装或发型）匹配角色身份。
+
+== 角色匹配规则 ==
+1. 以脸部特征（五官、脸型）为主要依据，同一人可能换装/换发型。
+2. 如果视频画面中的人物无法确定匹配哪个角色，标注为 "unknown_1", "unknown_2" 等临时编号，不要强行匹配。
+3. 如果出现非人类实体（动物/机器人等），在 character_updates 中报告。
 
 == 已知角色档案 ==
-{profiles_text}
+{profiles_text}"""
 
-如果画面中出现不在已知角色列表中的人物，标注为 "unknown_1", "unknown_2" 等临时编号。
-如果出现非人类实体（动物/机器人等），在 character_updates 中报告。"""
+PROFILE_ONLY_CHARACTER_SECTION_TEMPLATE = """== 角色信息 ==
+当前无参考脸谱图片，仅有文字档案。请结合以下档案信息识别画面中的人物。
+如果无法确定匹配哪个角色，标注为 "unknown_1", "unknown_2" 等临时编号。
+
+== 角色匹配规则 ==
+1. 以脸部特征（五官、脸型）为主要依据，同一人可能换装/换发型。
+2. 不确定时标注为 unknown，不要强行匹配。
+3. 如果出现非人类实体（动物/机器人等），在 character_updates 中报告。
+
+== 已知角色档案 ==
+{profiles_text}"""
 
 NO_CHARACTER_SECTION = """== 角色信息 ==
 尚无已知角色。请在分析中自行识别并命名画面中的人物。
@@ -183,32 +203,27 @@ def run_minute_chunk_understand(
                 logger.warning(f"  视频片段提取失败: {e}")
                 segment_path = None
 
-        # 收集关键帧路径
         chunk_shots = [s for s in shots if s.scene_index in chunk.shot_indices]
-        keyframe_paths = _collect_keyframes(chunk_shots)
 
-        # 收集角色脸谱图片（身份脸谱 + 上一轮新增）
-        gallery_paths, gallery_labels = _collect_gallery_images(
-            galleries, profiles, chunk.chunk_index
+        # 构建结构化 gallery 记录
+        gallery_records = _build_gallery_records(galleries, profiles)
+
+        # 构建 prompt（纯文字部分）
+        prompt = _build_prompt(chunk, chunk_shots, profiles, gallery_records)
+
+        # 构建结构化 content（text-media 交错，每张图前带标签）
+        content_parts = _build_structured_content(
+            prompt, segment_path, gallery_records
         )
 
-        # 构建 prompt
-        prompt = _build_prompt(chunk, chunk_shots, profiles, gallery_labels)
-
-        # 构建媒体文件列表：视频 + 关键帧 + 脸谱
-        media_paths = []
-        if segment_path and Path(segment_path).exists():
-            media_paths.append(segment_path)
-        media_paths.extend(keyframe_paths)
-        media_paths.extend(gallery_paths)
-
-        # 调用 Gemini
-        result = _call_gemini(client, prompt, media_paths)
+        # 调用 Gemini（使用结构化标签接口）
+        result = _call_gemini_structured(client, content_parts)
 
         if result:
             # 回填到 shot 级数据
             t, o, v, a, al = _backfill_chunk_result(
-                result, chunk, chunk_shots, profiles
+                result, chunk, chunk_shots, profiles,
+                chunk_index=chunk.chunk_index,
             )
             all_transcripts.extend(t)
             all_ocr.extend(o)
@@ -216,8 +231,11 @@ def run_minute_chunk_understand(
             all_audio.extend(a)
             all_alignments.extend(al)
 
-            # 更新角色档案
+            # 更新角色档案（含 description 回写）
             _update_profiles(profiles, result, chunk.chunk_index)
+
+            # 处理角色合并建议（顶层独立字段）
+            _process_merge_suggestions(profiles, result, chunk.chunk_index)
 
             # 保存 chunk 原始结果
             chunk.raw_transcripts = result.get("transcripts", [])
@@ -246,6 +264,18 @@ def run_minute_chunk_understand(
     all_vision.sort(key=lambda v: v.scene_index)
     all_audio.sort(key=lambda a: a.scene_index)
     all_alignments.sort(key=lambda a: a.scene_index)
+
+    # 应用已确认的角色合并（canonicalization）
+    identity_links = _apply_confirmed_merges(
+        profiles, all_transcripts, all_alignments
+    )
+    if identity_links:
+        links_path = video_dir / "character_identity_links.json"
+        links_path.write_text(
+            json.dumps(identity_links, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info(f"已保存 {len(identity_links)} 条角色身份合并到 character_identity_links.json")
 
     # 生成 speaker_map（从角色标注直接派生）
     speaker_map = _build_speaker_map(all_transcripts)
@@ -351,30 +381,78 @@ def _collect_keyframes(chunk_shots: list[Shot]) -> list[str]:
     return paths
 
 
-def _collect_gallery_images(
-    galleries: list[CharacterGallery],
-    profiles: dict,
-    chunk_index: int,
-) -> tuple[list[str], list[str]]:
-    """收集角色脸谱图片（身份识别用）+ 上一轮新增"""
-    all_paths = []
-    labels = []
+def _build_gallery_records(galleries, profiles):
+    """构建结构化 gallery 记录，替代旧的扁平 _collect_gallery_images。
+
+    Returns:
+        list[dict]: 每个元素包含 character_id, name, description,
+                    gallery_imgs, timestamps, source_shots
+    """
+    records = []
     for g in galleries:
         if g.tier == "passerby":
             continue
-        # 每角色取前2张用于身份识别（减少输入量）
-        gallery_imgs = [p for p in g.gallery_paths[:2] if Path(p).exists()]
-        if gallery_imgs:
-            all_paths.extend(gallery_imgs)
-            profile = profiles.get(g.character_id)
-            name = profile.names[0] if profile and profile.names else g.character_id
-            labels.append(f"{g.character_id}({name}): {len(gallery_imgs)}张")
+        imgs = []
+        for i, p in enumerate(g.gallery_paths):
+            if Path(p).exists():
+                ts = g.gallery_timestamps[i] if i < len(g.gallery_timestamps) else 0.0
+                src_shot = g.gallery_scene_indices[i] if i < len(g.gallery_scene_indices) else -1
+                imgs.append({"path": p, "timestamp": ts, "source_shot": src_shot})
+        if not imgs:
+            continue
 
-    return all_paths, labels
+        profile = profiles.get(g.character_id)
+        name = g.character_id
+        desc = ""
+        if profile:
+            name = profile.names[0] if profile.names else g.character_id
+            # 优先用 description；为空时取最近一条 appearance_change
+            desc = profile.description or ""
+            if not desc and profile.appearance_changes:
+                desc = profile.appearance_changes[-1].get("description", "")
+
+        records.append({
+            "character_id": g.character_id,
+            "name": name,
+            "description": desc,
+            "gallery_imgs": imgs,
+            "tier": g.tier,
+        })
+    return records
 
 
-def _build_prompt(chunk, chunk_shots, profiles, gallery_labels):
-    """构建 Gemini prompt"""
+def _build_structured_content(prompt, segment_path, gallery_records):
+    """构建 text-media 交错排列的结构化 content。
+
+    每张 gallery 图片前都插入独立的文字标签：
+      char_000 / 张三 / face 1 of 4 / source shot 12 / time 35.2s
+      [image]
+    """
+    parts = [{"type": "text", "text": prompt}]
+
+    # 视频片段
+    if segment_path and Path(segment_path).exists():
+        parts.append({"type": "media", "path": segment_path})
+
+    # 逐角色、逐图带标签
+    for rec in gallery_records:
+        cid = rec["character_id"]
+        name = rec["name"]
+        n_imgs = len(rec["gallery_imgs"])
+        for idx, img_info in enumerate(rec["gallery_imgs"]):
+            label = (
+                f"{cid} / {name} / face {idx + 1} of {n_imgs}"
+                f" / source shot {img_info['source_shot']}"
+                f" / time {img_info['timestamp']:.1f}s"
+            )
+            parts.append({"type": "text", "text": label})
+            parts.append({"type": "media", "path": img_info["path"]})
+
+    return parts
+
+
+def _build_prompt(chunk, chunk_shots, profiles, gallery_records):
+    """构建 Gemini prompt（纯文字部分）"""
     # 镜头边界
     boundaries = []
     for s in chunk_shots:
@@ -383,14 +461,36 @@ def _build_prompt(chunk, chunk_shots, profiles, gallery_labels):
         )
 
     # 角色部分
-    if profiles:
+    if gallery_records:
+        profiles_lines = []
+        for rec in gallery_records:
+            cid = rec["character_id"]
+            name = rec["name"]
+            desc = rec["description"] or "（暂无描述）"
+            # 从 profiles 补充最近的 appearance_changes 和 key_actions
+            profile = profiles.get(cid)
+            extra = ""
+            if profile:
+                recent_changes = profile.appearance_changes[-2:]
+                recent_actions = profile.key_actions[-3:]
+                if recent_changes:
+                    changes_str = "; ".join(c.get("description", "") for c in recent_changes)
+                    extra += f" | 近期外观变化: {changes_str}"
+                if recent_actions:
+                    actions_str = "; ".join(a.get("action", "") for a in recent_actions)
+                    extra += f" | 近期行为: {actions_str}"
+            profiles_lines.append(f"- {cid} ({name}): {desc}{extra}")
+        char_section = CHARACTER_SECTION_TEMPLATE.format(
+            profiles_text="\n".join(profiles_lines),
+        )
+    elif profiles:
+        # 有 profiles 但没有 gallery（降级场景）— 使用专用模板
         profiles_lines = []
         for cid, p in profiles.items():
             name = p.names[0] if p.names else cid
             desc = p.description or "（暂无描述）"
             profiles_lines.append(f"- {cid} ({name}): {desc}")
-        char_section = CHARACTER_SECTION_TEMPLATE.format(
-            gallery_labels=", ".join(gallery_labels),
+        char_section = PROFILE_ONLY_CHARACTER_SECTION_TEMPLATE.format(
             profiles_text="\n".join(profiles_lines),
         )
     else:
@@ -407,7 +507,7 @@ def _build_prompt(chunk, chunk_shots, profiles, gallery_labels):
 
 
 def _call_gemini(client, prompt, media_paths) -> dict | None:
-    """调用 Gemini API 并解析结果"""
+    """调用 Gemini API 并解析结果（旧接口，保留兼容）"""
     try:
         if media_paths:
             response = client.chat_with_multi_media(
@@ -428,13 +528,30 @@ def _call_gemini(client, prompt, media_paths) -> dict | None:
         return None
 
 
-def _normalize_character_id(raw_id: str, profiles: dict) -> str | None:
+def _call_gemini_structured(client, content_parts) -> dict | None:
+    """使用结构化 content（text-media 交错）调用 Gemini"""
+    try:
+        response = client.chat_with_labeled_media(
+            content_parts=content_parts,
+            temperature=0.2,
+        )
+        parsed = client.parse_json(response)
+        if parsed and isinstance(parsed, dict):
+            return parsed
+        logger.warning("Gemini 响应解析失败")
+        return None
+    except Exception as e:
+        logger.error(f"Gemini 调用失败: {e}")
+        return None
+
+
+def _normalize_character_id(raw_id: str, profiles: dict, chunk_index: int = -1) -> str | None:
     """将各种形式的人物标识规范化为 char_ 前缀的 ID。
 
     规则:
       - char_XXX → 直接返回
       - entity_XXX → 直接返回
-      - unknown_N → char_tmp_unknown_N，并在 profiles 中注册
+      - unknown_N → char_tmp_chunk_XXXX_unknown_N（带 chunk 作用域），并在 profiles 中注册
       - unknown / 空 / 其他 → None
     """
     raw_id = str(raw_id or "").strip()
@@ -443,7 +560,10 @@ def _normalize_character_id(raw_id: str, profiles: dict) -> str | None:
     if raw_id.startswith(("char_", "entity_")):
         return raw_id
     if raw_id.startswith("unknown_"):
-        normalized = f"char_tmp_{raw_id}"
+        if chunk_index >= 0:
+            normalized = f"char_tmp_chunk_{chunk_index:04d}_{raw_id}"
+        else:
+            normalized = f"char_tmp_{raw_id}"
         if normalized not in profiles:
             profiles[normalized] = CharacterProfile(
                 character_id=normalized,
@@ -455,7 +575,7 @@ def _normalize_character_id(raw_id: str, profiles: dict) -> str | None:
     return None
 
 
-def _backfill_chunk_result(result, chunk, chunk_shots, profiles):
+def _backfill_chunk_result(result, chunk, chunk_shots, profiles, chunk_index=-1):
     """将 chunk 结果回填到 shot 级数据结构"""
     transcripts = []
     ocr_results = []
@@ -476,7 +596,9 @@ def _backfill_chunk_result(result, chunk, chunk_shots, profiles):
             continue
 
         speaker = item.get("speaker", "unknown")
-        char_id = _normalize_character_id(speaker, profiles)
+        char_id = _normalize_character_id(speaker, profiles, chunk_index=chunk_index)
+        if char_id and str(speaker or "").strip().startswith("unknown_"):
+            speaker = char_id
 
         # 按中点分配 scene_index
         mid = (seg_start + seg_end) / 2.0
@@ -542,7 +664,7 @@ def _backfill_chunk_result(result, chunk, chunk_shots, profiles):
         # 多模态对齐（从结果直接派生）
         chars_present = []
         for c in item.get("characters_present", []):
-            normalized = _normalize_character_id(c, profiles)
+            normalized = _normalize_character_id(c, profiles, chunk_index=chunk_index)
             if normalized:
                 chars_present.append(normalized)
         shot_trans = [t for t in transcripts if t.scene_index == si]
@@ -577,7 +699,7 @@ def _update_profiles(profiles, result, chunk_index):
         if not cid:
             continue
         # 规范化 character_id（unknown_X → char_tmp_unknown_X）
-        cid = _normalize_character_id(cid, profiles)
+        cid = _normalize_character_id(cid, profiles, chunk_index=chunk_index)
         if not cid:
             continue
         if cid in profiles:
@@ -588,10 +710,13 @@ def _update_profiles(profiles, result, chunk_index):
                     if n and n not in p.names:
                         p.names.append(n)
             if update.get("appearance_change"):
+                change_desc = update["appearance_change"]
                 p.appearance_changes.append({
                     "chunk_idx": chunk_index,
-                    "description": update["appearance_change"],
+                    "description": change_desc,
                 })
+                # 回写 description — 始终保持最新外观描述
+                p.description = change_desc
             if update.get("key_action"):
                 p.key_actions.append({
                     "chunk_idx": chunk_index,
@@ -609,12 +734,197 @@ def _update_profiles(profiles, result, chunk_index):
             )
 
 
+def _safe_parse_float(value, default=0.0) -> float:
+    """安全解析 LLM 输出的 float 值，兼容 '', null, '90%' 等值。"""
+    if value is None:
+        return default
+    try:
+        if isinstance(value, str):
+            text = value.strip()
+            is_percent = text.endswith("%")
+            if is_percent:
+                text = text[:-1].strip()
+            parsed = float(text)
+            if is_percent or 1.0 < parsed <= 100.0:
+                parsed /= 100.0
+        else:
+            parsed = float(value)
+            if 1.0 < parsed <= 100.0:
+                parsed /= 100.0
+        return max(0.0, min(1.0, parsed))
+    except (ValueError, TypeError):
+        return default
+
+
+def _process_merge_suggestions(profiles, result, chunk_index):
+    """处理 Gemini 返回的角色合并建议（顶层独立字段）。
+
+    将建议记录到 primary 角色的 merge_suggestions 中，
+    以便后续决策是否执行 canonicalization。
+    """
+    for merge in result.get("character_merge_suggestions", []):
+        primary = merge.get("primary", "")
+        duplicate = merge.get("duplicate", "")
+        confidence = _safe_parse_float(merge.get("confidence"), 0.0)
+        reason = merge.get("reason", "")
+
+        if not primary or not duplicate:
+            continue
+        # 跳过自身合并
+        if primary == duplicate:
+            continue
+        # 要求两者都存在于 profiles 或已知 gallery
+        if primary not in profiles or duplicate not in profiles:
+            logger.warning(
+                f"  合并建议被忽略: {duplicate} → {primary} "
+                f"(一方或双方不在已知角色中)"
+            )
+            continue
+
+        logger.info(
+            f"  ⚠ Gemini 建议合并角色: {duplicate} → {primary} "
+            f"(置信度: {confidence:.0%}, 原因: {reason})"
+        )
+
+        profiles[primary].merge_suggestions.append({
+            "duplicate_id": duplicate,
+            "reason": reason,
+            "confidence": confidence,
+            "chunk_index": chunk_index,
+        })
+
+
+_MERGE_CONFIDENCE_THRESHOLD = 0.85
+_MERGE_MIN_CHUNK_REPORTS = 2
+
+
+def _apply_confirmed_merges(profiles, transcripts, alignments):
+    """对确认的合并建议执行 canonicalization。
+
+    确认条件: 最高 confidence >= _MERGE_CONFIDENCE_THRESHOLD
+              且 >= _MERGE_MIN_CHUNK_REPORTS 个不同 chunk 报告了同一对合并。
+              正反方向会归并为同一无向 pair 后统计。
+
+    执行:
+      - transcripts 中的 character_id / speaker → primary
+      - alignments 中的 visible_characters / speaking_characters → primary
+      - duplicate profile 标记 merged_into = primary
+
+    Returns:
+        list[dict]: identity links 记录，保存为 character_identity_links.json
+    """
+    # 收集无向 pair → suggestions，避免 A→B 和 B→A 被拆开统计。
+    merge_candidates = defaultdict(list)
+    for cid, profile in profiles.items():
+        for sug in profile.merge_suggestions:
+            dup = sug.get("duplicate_id", "")
+            if not dup or dup == cid or dup not in profiles:
+                continue
+            pair = tuple(sorted((cid, dup)))
+            suggestion = dict(sug)
+            suggestion["_proposed_primary"] = cid
+            suggestion["_proposed_duplicate"] = dup
+            merge_candidates[pair].append(suggestion)
+
+    # 筛选确认的合并
+    confirmed = {}  # duplicate → primary
+    link_details = {}
+    tier_rank = {"major": 0, "minor": 1, "passerby": 2}
+
+    def primary_rank(cid: str):
+        profile = profiles.get(cid)
+        return (tier_rank.get(getattr(profile, "tier", ""), 3), cid)
+
+    for pair, suggestions in merge_candidates.items():
+        max_conf = max(_safe_parse_float(s.get("confidence"), 0.0) for s in suggestions)
+        unique_chunks = len({s.get("chunk_index") for s in suggestions})
+        if max_conf < _MERGE_CONFIDENCE_THRESHOLD or unique_chunks < _MERGE_MIN_CHUNK_REPORTS:
+            continue
+
+        primary_votes = defaultdict(int)
+        for s in suggestions:
+            proposed_primary = s.get("_proposed_primary")
+            if proposed_primary in pair:
+                primary_votes[proposed_primary] += 1
+
+        primary = min(
+            pair,
+            key=lambda cid: (-primary_votes.get(cid, 0), primary_rank(cid)),
+        )
+        dup = pair[1] if primary == pair[0] else pair[0]
+        confirmed[dup] = primary
+        link_details[dup] = {
+            "primary": primary,
+            "duplicate": dup,
+            "max_confidence": max_conf,
+            "chunk_count": unique_chunks,
+            "reasons": [s.get("reason", "") for s in suggestions],
+        }
+
+    def resolve_primary(cid: str) -> str:
+        seen = set()
+        while cid in confirmed and cid not in seen:
+            seen.add(cid)
+            cid = confirmed[cid]
+        return cid
+
+    confirmed = {
+        dup: resolve_primary(primary)
+        for dup, primary in confirmed.items()
+        if dup != resolve_primary(primary)
+    }
+
+    identity_links = []
+    for dup, primary in confirmed.items():
+        detail = link_details.get(dup, {})
+        detail["primary"] = primary
+        detail["duplicate"] = dup
+        identity_links.append(detail)
+        logger.info(
+            f"  ✓ 确认合并: {dup} → {primary} "
+            f"(最高置信度: {detail.get('max_confidence', 0):.0%}, "
+            f"{detail.get('chunk_count', 0)} 个 chunk 报告)"
+        )
+
+    if not confirmed:
+        return []
+
+    # 执行 canonicalization
+    # 1. transcripts
+    for t in transcripts:
+        if t.character_id in confirmed:
+            t.character_id = confirmed[t.character_id]
+        if t.speaker in confirmed:
+            t.speaker = confirmed[t.speaker]
+
+    # 2. alignments
+    for al in alignments:
+        al.visible_characters = [
+            confirmed.get(c, c) for c in al.visible_characters
+        ]
+        al.speaking_characters = [
+            confirmed.get(c, c) for c in al.speaking_characters
+        ]
+        # 去重
+        al.visible_characters = list(dict.fromkeys(al.visible_characters))
+        al.speaking_characters = list(dict.fromkeys(al.speaking_characters))
+
+    # 3. 标记 duplicate profile
+    for dup, primary in confirmed.items():
+        if dup in profiles:
+            profiles[dup].merged_into = primary
+
+    return identity_links
+
 def _build_speaker_map(transcripts) -> dict:
     """从角色标注直接生成 speaker_map"""
     speaker_map = {}
     for t in transcripts:
         if t.speaker and t.character_id:
-            speaker_map[t.speaker] = t.character_id
+            speaker_key = t.speaker
+            if str(speaker_key).startswith("unknown_"):
+                speaker_key = t.character_id
+            speaker_map[speaker_key] = t.character_id
     return speaker_map
 
 
@@ -716,22 +1026,33 @@ def _save_all_outputs(
 
     # Characters.json（从 profiles 生成，兼容下游）
     from models.schemas import CharacterDeep
+
+    def resolve_character_id(cid: str) -> str:
+        seen = set()
+        while cid in profiles and profiles[cid].merged_into and cid not in seen:
+            seen.add(cid)
+            cid = profiles[cid].merged_into
+        return cid
+
     # 从 alignments 和 galleries 提取每个角色出现的 scene_index
     char_scenes = defaultdict(set)
     for al in alignments:
         for cid_vis in al.visible_characters:
-            char_scenes[cid_vis].add(al.scene_index)
+            char_scenes[resolve_character_id(cid_vis)].add(al.scene_index)
     if galleries:
         for g in galleries:
-            char_scenes[g.character_id].update(g.appearance_scenes)
+            char_scenes[resolve_character_id(g.character_id)].update(g.appearance_scenes)
     chars = []
     for cid, p in profiles.items():
+        if p.merged_into:
+            continue
+        resolved_cid = resolve_character_id(cid)
         chars.append(CharacterDeep(
-            character_id=cid,
+            character_id=resolved_cid,
             display_name=p.names[0] if p.names else cid,
             description=p.description,
             role=None,
-            appearance_scenes=sorted(char_scenes.get(cid, [])),
+            appearance_scenes=sorted(char_scenes.get(resolved_cid, [])),
         ).model_dump())
     chars_path = video_dir / "characters.json"
     chars_path.write_text(

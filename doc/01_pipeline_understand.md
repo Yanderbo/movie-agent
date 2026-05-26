@@ -97,7 +97,9 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
 3. **人脸质量过滤**
    - 先用 `FACE_MIN_DET_SCORE` 过滤低置信度误检。
    - 再用 `max(关键帧短边 * FACE_MIN_FACE_RATIO, FACE_MIN_FACE_PIXEL_FLOOR)` 过滤过小人脸。
-   - 这样不再固定使用 48px，而是能适配 480p、1080p、4K 等不同关键帧尺寸。
+   - 再用 `max(关键帧短边 * FACE_MIN_CROP_RATIO, FACE_MIN_CROP_PIXEL_FLOOR)` 过滤裁剪后仍过小的 gallery 候选。
+   - 默认开启 `FACE_REJECT_SIDE_FACE`：优先用 InsightFace `pose` 的 yaw 判断侧脸，缺失或不明显时再用 5 点 landmarks 的鼻尖偏移作为辅助。
+   - 这样不再固定使用单一像素阈值，而是能适配 480p、1080p、4K 等不同关键帧尺寸。
 
 4. **初始 DBSCAN 聚类**
    - 对归一化后的人脸 embedding 使用 DBSCAN，距离度量为 cosine。
@@ -113,8 +115,9 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
    - 用 `FACE_CLUSTER_MERGE_SIM` 判断簇中心是否足够相似。
    - 用 `FACE_CLUSTER_MERGE_LINK_SIM` 判断两个簇的代表脸之间是否存在高相似“桥接”。
    - 使用代表脸合并时，还要求簇中心至少达到 `FACE_CLUSTER_MERGE_MIN_CENTROID_SIM`，防止误合并。
+   - 对单对代表脸极高相似的碎簇，使用 `FACE_CLUSTER_MERGE_STRONG_LINK_SIM` 和更低的 `FACE_CLUSTER_MERGE_STRONG_MIN_CENTROID_SIM` 做强桥接合并。
    - 如果两个簇在同一关键帧中同时出现过，不合并。
-   - 这一步主要解决同一人物因换发型、换装、侧脸、光照变化被拆成多个 gallery 的问题。
+   - 这一步主要缓解同一人物因换发型、换装、光照变化被拆成多个 gallery 的问题，但不会保证完全消除碎 gallery。
 
 7. **角色分层**
    - **major**：出现 shot 数 ≥ `max(10, 总 shot 数 * 0.05)`。
@@ -125,8 +128,8 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
 8. **代表脸选择与保存**
    - 路人只保留最高置信度 1 张，且默认不保存。
    - 主要/次要角色保留 `FACE_GALLERY_MIN` 到 `FACE_GALLERY_MAX` 张。
-   - 选脸策略：时间轴均匀采样 + embedding 多样性采样 + 高置信度补足。
-   - 保存到 `characters/char_XXX_gallery/face_XX.jpg`，元数据写入 `characters/face_clusters.json`。
+   - 选脸策略：先按 shot 去重，避免同一近景 shot 占满 gallery；再沿角色出现时间轴均匀采样；数量不足时优先补充未使用 shot、且离已选样本时间更远的脸。
+   - 保存到 `characters/char_XXX_gallery/face_XX.jpg`，元数据写入 `characters/face_clusters.json`，并记录每张代表脸的时间戳、来源 shot 和来源关键帧。
 
 **关键参数**：
 
@@ -135,6 +138,11 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
 | `FACE_MIN_DET_SCORE` | `0.65` | InsightFace 检测置信度下限 |
 | `FACE_MIN_FACE_RATIO` | `0.05` | 人脸 bbox 短边占关键帧短边的比例下限 |
 | `FACE_MIN_FACE_PIXEL_FLOOR` | `16` | 人脸 bbox 短边绝对像素兜底 |
+| `FACE_MIN_CROP_RATIO` | `0.08` | gallery 裁剪图短边占关键帧短边的比例下限 |
+| `FACE_MIN_CROP_PIXEL_FLOOR` | `48` | gallery 裁剪图短边绝对像素兜底 |
+| `FACE_REJECT_SIDE_FACE` | `true` | 是否过滤明显侧脸 |
+| `FACE_MAX_POSE_YAW` | `35` | pose yaw 绝对值超过该角度视为侧脸 |
+| `FACE_MAX_LANDMARK_IMBALANCE` | `0.35` | 鼻尖相对双眼中心偏移超过该比例视为侧脸 |
 | `FACE_CLUSTER_EPS` | `0.42` | 初始 DBSCAN 余弦距离阈值 |
 | `FACE_CLUSTER_MIN_SAMPLES` | `3` | DBSCAN 成簇最少样本数 |
 | `FACE_CLUSTER_SPLIT_EPS` | `0.30` | 疑似混簇二次拆分阈值 |
@@ -142,20 +150,28 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
 | `FACE_CLUSTER_MERGE_SIM` | `0.86` | 簇中心相似度合并阈值 |
 | `FACE_CLUSTER_MERGE_LINK_SIM` | `0.78` | 代表脸桥接相似度合并阈值 |
 | `FACE_CLUSTER_MERGE_MIN_CENTROID_SIM` | `0.62` | 桥接合并时要求的最低簇中心相似度 |
+| `FACE_CLUSTER_MERGE_STRONG_LINK_SIM` | `0.82` | 单对代表脸极高相似时的强桥接合并阈值 |
+| `FACE_CLUSTER_MERGE_STRONG_MIN_CENTROID_SIM` | `0.50` | 强桥接合并时要求的最低簇中心相似度 |
 | `FACE_CLUSTER_MERGE_MAX_FACES` | `32` | 每个簇用于合并比较的最多代表脸数量 |
 | `FACE_GALLERY_MIN/MAX` | `3 / 6` | 每个非路人角色的代表脸数量范围 |
 | `FACE_KEEP_PASSERBY_GALLERY` | `false` | 是否保存路人脸谱 |
 
 **参数来源**：
 
-正式参数在 `config.py` 中定义，并可由 `.env` 覆盖。`face_cluster.py` 内部的 `DEFAULT_*` 只用于兼容旧版配置缺失的情况，不作为业务调参入口。
+正式参数在 `config.py` 中定义，并可由 `.env` 覆盖；`face_cluster.py` 只读取这些集中配置，不单独维护业务默认值。
 
 **输出**：
 
 | 路径 | 内容 |
 |------|------|
-| `characters/face_clusters.json` | `CharacterGallery` 列表，包含 `character_id`、gallery 路径、出现 shot、tier、embedding centroid |
-| `characters/char_XXX_gallery/face_XX.jpg` | 代表脸裁剪图，裁剪时会扩大 bbox 以包含头发、肩部和部分衣着上下文 |
+| `characters/face_clusters.json` | `CharacterGallery` 列表，包含 `character_id`、gallery 路径、gallery 时间戳、gallery 来源 shot/关键帧、出现 shot、tier、embedding centroid |
+| `characters/char_XXX_gallery/face_XX.jpg` | 代表脸裁剪图，裁剪时会扩大 bbox 以包含头发、肩部和部分衣着上下文；裁剪后仍过小则丢弃 |
+
+**边界**：
+
+- Step 4 是传统视觉模型阶段，目标是产出“足够稳定、足够干净”的角色脸谱先验，而不是最终人物真值。
+- 同一人物仍可能因极端造型、遮挡、光照或年龄/妆造变化被拆成多个 gallery；当前不在 `face_cluster` 中用语义规则强行聚合。
+- 后续如果在 MinuteChunk / 动态角色档案更新中获得充分证据证明两个 gallery 是同一人物，可以在更高层做角色级聚合；该能力目前仅作为后续扩展方向。
 
 **降级**：
 
@@ -353,9 +369,9 @@ Step 6/7 完成后会回写 `scenes/scenes.json`，持久化 `beat_index` / `sto
 
 ## 当前实现注意事项
 
-- `face_cluster.py` 在 InsightFace 未安装时会跳过，返回空脸谱；此时 MinuteChunk prompt 会用 `unknown_1` 等临时标注，`_normalize_character_id()` 会统一将其转为 `char_tmp_unknown_X`，并在 speaker、characters_present、character_updates 三个渠道保持一致。
+- `face_cluster.py` 在 InsightFace 未安装时会跳过，返回空脸谱；此时 MinuteChunk prompt 会用 `unknown_1` 等临时标注，`_normalize_character_id()` 会统一将其转为 chunk 作用域的 `char_tmp_chunk_XXXX_unknown_X`，避免不同 chunk 的临时人物互相覆盖，并在 speaker、characters_present、character_updates 三个渠道保持一致。
 - `face_cluster.py` 会优先读取 `characters/face_clusters.json` 缓存。修改人脸聚类阈值后，如需重新生成角色脸谱，需要删除该缓存及对应 gallery 目录，或从 face cluster 前置步骤重新跑。
-- 人脸聚类参数以 `config.py` / `.env` 为准；`face_cluster.py` 中的 `DEFAULT_*` 只是旧配置缺失时的兜底值。
+- 人脸聚类参数以 `config.py` / `.env` 为准；修改阈值后需要清理旧 `face_clusters.json` 才会重新生成脸谱。
 - `minute_chunk.py` 的已有产物检查包含 9 个文件（含 `characters.json`, `speaker_map.json`, `multimodal_alignments.json`, `character_profiles.json`）。
 - Step 6/7 无论是新计算还是缓存加载，都会通过 `_backfill_beat_to_shots()` / `_backfill_scene_to_shots()` 回填 shot 的反向链接并持久化到 `scenes/scenes.json`。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和检索索引需要 `final_build` 完成后才具备。

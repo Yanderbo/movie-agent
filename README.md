@@ -68,7 +68,7 @@ Video Memory (JSON)
 | 1 | `ingest` | `ingest.py` | `original.*` + 按需 `compressed.mp4` + `meta.json` | 入库、解析元信息；必要时压缩到 480p / 10fps |
 | 2 | `shot_detect` | `scene_detect.py` | `scenes/scenes.json` | PySceneDetect 镜头边界检测 |
 | 3 | `multi_keyframe` | `keyframe.py` | `scenes/keyframes/*.jpg` | 每个 shot 动态采样多帧关键帧 |
-| 4 | `face_cluster` | `face_cluster.py` | `characters/face_clusters.json` + `char_XXX_gallery/` | 人脸检测、聚类、角色脸谱构建 |
+| 4 | `face_cluster` | `face_cluster.py` | `characters/face_clusters.json` + `char_XXX_gallery/` | 人脸检测、质量过滤、聚类、角色脸谱构建 |
 | 5 | `minute_chunk` | `minute_chunk.py` | `minute_chunks.json` + 回填产物 | ASR、画面、音频、角色、speaker、对齐合并为分钟级融合理解 |
 | 6 | `beat_detect` | `beat_detect.py` | `beats.json` | Shot → Beat 剧情节拍聚合 |
 | 7 | `story_scene_detect` | `story_scene_detect.py` | `story_scenes.json` | Beat → StoryScene 聚合 |
@@ -229,7 +229,7 @@ SearchResult top-k
 
 | 模型 | 说明 |
 |------|------|
-| `CharacterGallery` | Step 4 的角色脸谱，保存代表脸路径、聚类中心、出场镜头和角色层级 |
+| `CharacterGallery` | Step 4 的角色脸谱，保存代表脸路径、来源 shot/关键帧、聚类中心、出场镜头和角色层级 |
 | `CharacterProfile` | Step 5 的动态角色档案，随 chunk 更新名称、外观变化和关键行为 |
 | `MinuteChunk` | 分钟级理解单元，记录 chunk 时间范围、shot 列表、原始理解结果和 suggested beats |
 | `VideoMeta` 压缩字段 | `compressed_path`、`is_compressed`、`original_height/fps`、`compressed_height/fps` |
@@ -345,7 +345,10 @@ python main.py understand --video-id xxx --resume
 | `CHUNK_MERGE_THRESHOLD` | `30` | 尾段低于此值时合并到前一个 chunk |
 | `CHUNK_MIN_DURATION` / `CHUNK_MAX_DURATION` | `90` / `210` | 已配置，当前 chunk 构建逻辑暂未强制使用 |
 | `FACE_GALLERY_MAX` / `FACE_GALLERY_MIN` | `6` / `3` | 每个角色脸谱图片数量范围 |
-| `FACE_CLUSTER_EPS` | `0.5` | DBSCAN 聚类 eps |
+| `FACE_CLUSTER_EPS` | `0.42` | DBSCAN 聚类 eps |
+| `FACE_CLUSTER_MERGE_STRONG_LINK_SIM` | `0.82` | 单对代表脸极高相似时的碎簇合并阈值 |
+| `FACE_MIN_CROP_RATIO` / `FACE_MIN_CROP_PIXEL_FLOOR` | `0.08` / `48` | gallery 裁剪图短边过滤阈值 |
+| `FACE_REJECT_SIDE_FACE` | `true` | 是否过滤侧脸，优先保留正脸/轻微转头作为身份库 |
 | `FACE_PASSERBY_MIN` | `3` | 低于此出场次数视为路人 |
 | `FACE_DETECT_DEVICE` | `auto` | InsightFace 推理设备：`auto` 优先 CUDA，`cuda` 指定 GPU，`cpu` 强制 CPU |
 | `FACE_DETECT_GPU_ID` | `auto` | InsightFace 使用的 CUDA 设备；`auto` 选择显存占用最低的 GPU，也可指定 `0`-`7` |
@@ -359,6 +362,7 @@ python main.py understand --video-id xxx --resume
 - v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 映射到 `minute_chunk`，`edit_signal` / `build_memory` / `indexer` 映射到 `final_build`。
 - Step 5 会保存 `MinuteChunk.suggested_beats`，但当前 `beat_detect.py` 主流程仍基于回填后的台词、画面和人物信息重新让 LLM 分组；`suggested_beats` 更像后续优化入口。
 - `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；InsightFace 默认 `FACE_DETECT_DEVICE=auto`，检测到 `CUDAExecutionProvider` 时使用 GPU，`FACE_DETECT_GPU_ID=auto` 会选择显存占用最低的 CUDA 设备，否则回退 CPU。
+- Step 4 的人脸聚类是传统视觉模型的身份先验：会保守拆分混簇、合并高相似碎簇，并过滤小脸/侧脸，但仍可能把同一个人物拆成多个 gallery。跨 gallery 的语义归并留给后续大模型理解阶段基于剧情、台词和外观证据处理，当前不在 `face_cluster` 中实现。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和索引要等 `final_build` 完成后才会出现在 `memory.json` / `index/`。
 
 ---

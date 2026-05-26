@@ -87,6 +87,8 @@ class CharacterProfile(BaseModel):
     is_human: bool = True             # False = 动物/机器人等
     entity_type: str = "human"        # human / animal / robot / other
     gallery_ref: str = ""             # 关联的 CharacterGallery.character_id
+    merge_suggestions: list[dict] = Field(default_factory=list)  # [{duplicate_id, confidence, reason, chunk_index}]
+    merged_into: str = ""             # 如果该角色已被合并，记录目标角色ID
 
 
 class MinuteChunk(BaseModel):

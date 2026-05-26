@@ -333,6 +333,54 @@ class LLMClient:
             raise RuntimeError(f"LLM 调用失败: {result['error']}")
         return result["content"]
 
+    def chat_with_labeled_media(
+        self,
+        content_parts: list[dict],
+        system_prompt: str = None,
+        temperature: float = 0.7,
+        max_tokens: int = None,
+        response_format: str = None,
+    ) -> str:
+        """
+        带结构化标签的多媒体对话 — 文字与媒体交错排列。
+
+        content_parts 中每个元素:
+          {"type": "text",  "text": "..."}
+          {"type": "media", "path": "/path/to/file"}
+
+        这样可以在每张图片前插入文字标签，让模型精确知道
+        每张图片的身份归属，避免扁平列表导致的计数歧义。
+        """
+        content = []
+        for part in content_parts:
+            if part["type"] == "text":
+                content.append({"type": "text", "text": part["text"]})
+            elif part["type"] == "media":
+                path = part["path"]
+                if not Path(path).exists():
+                    logger.warning(f"媒体文件不存在，跳过: {path}")
+                    continue
+                mime_type = self.get_mime_type(path)
+                b64_data = self.encode_file_to_base64(path)
+                data_url = f"data:{mime_type};base64,{b64_data}"
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": data_url, "mime_type": mime_type},
+                })
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": content})
+
+        result = self._request_with_retry(
+            messages, temperature=temperature,
+            max_tokens=max_tokens, response_format=response_format,
+        )
+        if not result["success"]:
+            raise RuntimeError(f"LLM 调用失败: {result['error']}")
+        return result["content"]
+
     def chat_json(
         self,
         prompt: str,

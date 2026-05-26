@@ -105,10 +105,12 @@ Shot 仍是整个系统的时间轴锚点。v4.1 在调用大模型前增加 `fa
 
 | 产物 | 用途 |
 |------|------|
-| `characters/face_clusters.json` | 保存角色聚类、出现镜头、角色层级和聚类中心 |
-| `characters/char_XXX_gallery/` | 每个主要/次要角色的代表脸，用作 MinuteChunk 身份先验 |
+| `characters/face_clusters.json` | 保存角色聚类、代表脸来源、出现镜头、角色层级和聚类中心 |
+| `characters/char_XXX_gallery/` | 每个主要/次要角色的正脸/轻微转头代表脸，用作 MinuteChunk 身份先验 |
 
-该步骤先用 InsightFace 从 Step 3 的关键帧中提取人脸 bbox 与 embedding，再用 DBSCAN 聚类。聚类后会先拆分疑似混簇（同关键帧冲突、簇半径过大），再合并疑似碎簇（簇中心相似、代表脸桥接相似），以降低“不同人物混成一个角色”和“同一人物被拆成多个 gallery”的风险。人脸大小过滤使用关键帧短边比例而非固定像素，以适配不同分辨率。
+该步骤先用 InsightFace 从 Step 3 的关键帧中提取人脸 bbox、pose/landmarks 与 embedding，并过滤低置信度、小脸、小裁剪图和明显侧脸，再用 DBSCAN 聚类。聚类后会先拆分疑似混簇（同关键帧冲突、簇半径过大），再合并疑似碎簇（簇中心相似、代表脸桥接相似、强单点桥接相似），以降低“不同人物混成一个角色”和“同一人物被拆成多个 gallery”的风险。过滤阈值使用关键帧短边比例加像素兜底，以适配不同分辨率。
+
+`face_cluster` 只负责提供稳定的本地身份先验，不追求用传统模型解决所有跨造型/跨光照的同人归并。若后续大模型在 MinuteChunk 或角色档案更新中有充分语义证据证明两个 gallery 是同一人物，可以在更高层处理；当前 Step 4 不做这类语义聚合。
 
 InsightFace 不可用时，该步骤返回空脸谱，MinuteChunk 会让 Gemini 自行识别人物。
 
