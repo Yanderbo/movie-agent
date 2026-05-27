@@ -41,8 +41,14 @@ CHUNK_UNDERSTAND_PROMPT = """你是一个专业的影视分析系统。请分析
 
 请完成以下分析，以 JSON 格式输出：
 
+== 强制覆盖要求 ==
+1. per_shot 必须输出 {n_shots} 个对象，逐一覆盖“镜头边界”中的每个 local_shot_index，不要只分析前几个镜头。
+2. 每个 per_shot 对象必须同时包含 local_shot_index 和 scene_index；scene_index 必须使用镜头边界中给出的全局 scene_index。
+3. 每个镜头的 vision/audio 都要填写。即使镜头很短或画面较模糊，也要给出最合理的简短描述；确实无法辨认时写“无法判断”，不要留空字符串。
+4. ocr_texts 只有在画面没有文字时才可以为空数组。
+
 A. **ASR 语音转录** — 逐句转录音频中的语音
-   - 标注相对于片段起始的时间戳
+   - start_time/end_time 必须标注相对于片段起始的时间戳，不要使用全片绝对时间戳
    - 说话人用角色ID标注（如 char_000），无法匹配已知角色则用 "unknown_1", "unknown_2" 等临时编号区分不同人
    - type: dialogue / narration / voiceover
 
@@ -84,9 +90,10 @@ F. **角色身份合并建议**（仅在你有充分证据时才填写）
   ],
   "per_shot": [
     {{
+      "local_shot_index": 0,
       "scene_index": {first_shot_index},
-      "vision": {{"description": "", "objects": [], "mood": "", "scene_type": "", "camera_motion": "", "shot_scale": "", "action_description": "", "ocr_texts": []}},
-      "audio": {{"has_music": false, "music_mood": "", "has_sfx": false, "sfx_tags": [], "silence_ratio": 0, "speech_rate": "", "volume_peak": 0, "speech_emotion": ""}},
+      "vision": {{"description": "简要描述该镜头画面", "objects": [], "mood": "无法判断", "scene_type": "无法判断", "camera_motion": "static", "shot_scale": "无法判断", "action_description": "简要描述该镜头动作", "ocr_texts": []}},
+      "audio": {{"has_music": false, "music_mood": "无法判断", "has_sfx": false, "sfx_tags": [], "silence_ratio": 0, "speech_rate": "normal", "volume_peak": 0, "speech_emotion": "neutral"}},
       "characters_present": []
     }}
   ],
@@ -204,6 +211,7 @@ def run_minute_chunk_understand(
                 segment_path = None
 
         chunk_shots = [s for s in shots if s.scene_index in chunk.shot_indices]
+        keyframe_records = _build_keyframe_records(chunk_shots)
 
         # 构建结构化 gallery 记录
         gallery_records = _build_gallery_records(galleries, profiles)
@@ -213,7 +221,7 @@ def run_minute_chunk_understand(
 
         # 构建结构化 content（text-media 交错，每张图前带标签）
         content_parts = _build_structured_content(
-            prompt, segment_path, gallery_records
+            prompt, segment_path, gallery_records, keyframe_records
         )
 
         # 调用 Gemini（使用结构化标签接口）
@@ -252,11 +260,25 @@ def run_minute_chunk_understand(
 
     # 补全未覆盖的 shot
     covered_indices = {v.scene_index for v in all_vision}
+    transcript_scene_indices = {t.scene_index for t in all_transcripts if t.scene_index >= 0}
+    missing_indices = [s.scene_index for s in shots if s.scene_index not in covered_indices]
+    if missing_indices:
+        logger.warning(
+            f"MinuteChunk 缺少 {len(missing_indices)} 个 shot 的 per_shot 回填，"
+            f"将写入占位分析: {missing_indices[:20]}"
+        )
     for s in shots:
         if s.scene_index not in covered_indices:
-            all_vision.append(VisionSummary(scene_index=s.scene_index, timestamp=s.start_time, description=""))
+            all_vision.append(VisionSummary(
+                scene_index=s.scene_index,
+                timestamp=s.start_time,
+                description="模型未返回该镜头画面分析",
+            ))
             all_ocr.append(OCRResult(scene_index=s.scene_index, timestamp=s.start_time))
-            all_audio.append(AudioProsody(scene_index=s.scene_index))
+            all_audio.append(AudioProsody(
+                scene_index=s.scene_index,
+                speech_rate="unknown" if s.scene_index in transcript_scene_indices else "",
+            ))
 
     # 排序
     all_transcripts.sort(key=lambda t: t.start_time)
@@ -381,6 +403,25 @@ def _collect_keyframes(chunk_shots: list[Shot]) -> list[str]:
     return paths
 
 
+def _build_keyframe_records(chunk_shots: list[Shot]) -> list[dict]:
+    """构建逐 shot 关键帧记录，用于辅助 Gemini 按镜头回填 vision/OCR。"""
+    records = []
+    for local_idx, shot in enumerate(chunk_shots):
+        kf = shot.keyframe_path
+        if not kf and shot.keyframe_paths:
+            kf = shot.keyframe_paths[0] if shot.keyframe_paths else None
+        if not kf or not Path(kf).exists():
+            continue
+        records.append({
+            "local_shot_index": local_idx,
+            "scene_index": shot.scene_index,
+            "start_time": shot.start_time,
+            "end_time": shot.end_time,
+            "path": kf,
+        })
+    return records
+
+
 def _build_gallery_records(galleries, profiles):
     """构建结构化 gallery 记录，替代旧的扁平 _collect_gallery_images。
 
@@ -421,9 +462,10 @@ def _build_gallery_records(galleries, profiles):
     return records
 
 
-def _build_structured_content(prompt, segment_path, gallery_records):
+def _build_structured_content(prompt, segment_path, gallery_records, keyframe_records=None):
     """构建 text-media 交错排列的结构化 content。
 
+    每个 shot 的关键帧前会插入 local/global 双索引标签，辅助逐镜头回填。
     每张 gallery 图片前都插入独立的文字标签：
       char_000 / 张三 / face 1 of 4 / source shot 12 / time 35.2s
       [image]
@@ -432,9 +474,24 @@ def _build_structured_content(prompt, segment_path, gallery_records):
 
     # 视频片段
     if segment_path and Path(segment_path).exists():
+        parts.append({"type": "text", "text": "== Chunk 视频片段 =="})
         parts.append({"type": "media", "path": segment_path})
 
+    # 逐 shot 关键帧
+    if keyframe_records:
+        parts.append({"type": "text", "text": "== 逐 shot 关键帧参考（用于 vision/OCR/audio 对齐）=="})
+        for rec in keyframe_records:
+            label = (
+                f"shot keyframe / local_shot_index {rec['local_shot_index']}"
+                f" / scene_index {rec['scene_index']}"
+                f" / time {rec['start_time']:.1f}s-{rec['end_time']:.1f}s"
+            )
+            parts.append({"type": "text", "text": label})
+            parts.append({"type": "media", "path": rec["path"]})
+
     # 逐角色、逐图带标签
+    if gallery_records:
+        parts.append({"type": "text", "text": "== 角色参考脸谱 =="})
     for rec in gallery_records:
         cid = rec["character_id"]
         name = rec["name"]
@@ -455,9 +512,12 @@ def _build_prompt(chunk, chunk_shots, profiles, gallery_records):
     """构建 Gemini prompt（纯文字部分）"""
     # 镜头边界
     boundaries = []
-    for s in chunk_shots:
+    for local_idx, s in enumerate(chunk_shots):
         boundaries.append(
-            f"Shot {s.scene_index}: {s.start_time:.1f}s-{s.end_time:.1f}s ({s.duration:.1f}s)"
+            f"local_shot_index {local_idx} | scene_index {s.scene_index} | "
+            f"abs {s.start_time:.1f}s-{s.end_time:.1f}s | "
+            f"rel {s.start_time - chunk.start_time:.1f}s-{s.end_time - chunk.start_time:.1f}s | "
+            f"duration {s.duration:.1f}s"
         )
 
     # 角色部分
@@ -575,6 +635,141 @@ def _normalize_character_id(raw_id: str, profiles: dict, chunk_index: int = -1) 
     return None
 
 
+def _safe_float(value, default=0.0) -> float:
+    """安全解析普通浮点数，不做 0-1 置信度裁剪。"""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_text(value, default="") -> str:
+    """安全转成去空白字符串。"""
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _safe_bool(value, default=False) -> bool:
+    """安全解析 LLM 返回的布尔值。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "y", "1", "是", "有"}:
+        return True
+    if text in {"false", "no", "n", "0", "否", "无", "none", "null", ""}:
+        return False
+    return default
+
+
+def _as_str_list(value) -> list[str]:
+    """兼容 LLM 将数组字段返回为字符串、对象或混合列表。"""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+
+    result = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("name") or item.get("label") or json.dumps(item, ensure_ascii=False)
+        else:
+            text = str(item)
+        text = text.strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _coerce_int(value) -> int | None:
+    """安全解析整数索引。"""
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def _infer_transcript_time_mode(transcript_items, chunk) -> str:
+    """推断 transcript 时间戳是相对 chunk 起点还是全局绝对时间。"""
+    if chunk.start_time <= 0.5:
+        return "relative"
+    times = []
+    for item in transcript_items:
+        if not isinstance(item, dict):
+            continue
+        times.append(_safe_float(item.get("start_time"), -1.0))
+        times.append(_safe_float(item.get("end_time"), -1.0))
+    times = [t for t in times if t >= 0]
+    if not times:
+        return "relative"
+
+    duration = max(chunk.duration, chunk.end_time - chunk.start_time)
+    relative_score = sum(1 for t in times if 0 <= t <= duration + 1.0)
+    absolute_score = sum(1 for t in times if chunk.start_time - 1.0 <= t <= chunk.end_time + 1.0)
+    if absolute_score > relative_score and min(times) >= chunk.start_time - 1.0:
+        return "absolute"
+    return "relative"
+
+
+def _chunk_time_to_abs(value, chunk, mode="relative") -> float:
+    """将 LLM 返回的时间转换为全局时间。"""
+    value = _safe_float(value, 0.0)
+    if mode == "absolute":
+        return round(value, 1)
+    return round(value + chunk.start_time, 1)
+
+
+def _infer_scene_index_mode(per_shot_items, shot_map, local_to_global) -> str:
+    """推断 per_shot.scene_index 更像全局 scene_index 还是局部索引。"""
+    raw_indices = [
+        _coerce_int(item.get("scene_index"))
+        for item in per_shot_items
+        if isinstance(item, dict)
+    ]
+    raw_indices = [i for i in raw_indices if i is not None]
+    local_score = sum(1 for i in raw_indices if i in local_to_global)
+    global_score = sum(1 for i in raw_indices if i in shot_map)
+    return "local" if local_score > global_score else "global"
+
+
+def _resolve_per_shot_scene_index(item, shot_map, local_to_global, scene_index_mode) -> int | None:
+    """解析 per_shot 对应的全局 scene_index，优先使用 local_shot_index 双锚点。"""
+    local_idx = _coerce_int(item.get("local_shot_index"))
+    if local_idx in local_to_global:
+        return local_to_global[local_idx]
+
+    scene_idx = _coerce_int(item.get("scene_index"))
+    if scene_idx is None:
+        return None
+    if scene_index_mode == "local" and scene_idx in local_to_global:
+        return local_to_global[scene_idx]
+    if scene_idx in shot_map:
+        return scene_idx
+    if scene_idx in local_to_global:
+        return local_to_global[scene_idx]
+    return None
+
+
+def _extract_character_id(value):
+    """兼容 characters_present 中的字符串或 {character_id, confidence} 对象。"""
+    if isinstance(value, dict):
+        return value.get("character_id") or value.get("id")
+    return value
+
+
 def _backfill_chunk_result(result, chunk, chunk_shots, profiles, chunk_index=-1):
     """将 chunk 结果回填到 shot 级数据结构"""
     transcripts = []
@@ -588,14 +783,21 @@ def _backfill_chunk_result(result, chunk, chunk_shots, profiles, chunk_index=-1)
     local_to_global = {i: s.scene_index for i, s in enumerate(chunk_shots)}
 
     # 回填 ASR
-    for item in result.get("transcripts", []):
-        seg_start = round(float(item.get("start_time", 0)) + chunk.start_time, 1)
-        seg_end = round(float(item.get("end_time", 0)) + chunk.start_time, 1)
-        text = item.get("text", "").strip()
+    transcript_items = [
+        item for item in result.get("transcripts", [])
+        if isinstance(item, dict)
+    ]
+    time_mode = _infer_transcript_time_mode(transcript_items, chunk)
+    for item in transcript_items:
+        seg_start = _chunk_time_to_abs(item.get("start_time", 0), chunk, time_mode)
+        seg_end = _chunk_time_to_abs(item.get("end_time", 0), chunk, time_mode)
+        if seg_end < seg_start:
+            seg_end = seg_start
+        text = _safe_text(item.get("text", ""))
         if not text:
             continue
 
-        speaker = item.get("speaker", "unknown")
+        speaker = _safe_text(item.get("speaker", "unknown"), "unknown")
         char_id = _normalize_character_id(speaker, profiles, chunk_index=chunk_index)
         if char_id and str(speaker or "").strip().startswith("unknown_"):
             speaker = char_id
@@ -610,61 +812,109 @@ def _backfill_chunk_result(result, chunk, chunk_shots, profiles, chunk_index=-1)
         if scene_index == -1 and chunk_shots:
             scene_index = min(chunk_shots, key=lambda s: abs(s.start_time - mid)).scene_index
 
+        shot = shot_map.get(scene_index)
+        cross_shot = False
+        if shot:
+            cross_shot = seg_start < shot.start_time or seg_end > shot.end_time
+
         seg = TranscriptSegment(
             start_time=seg_start, end_time=seg_end, text=text,
             speaker=speaker, character_id=char_id,
             scene_index=scene_index,
-            transcript_type=item.get("type", "dialogue"),
-            cross_shot=(seg_start < shot_map.get(scene_index, chunk_shots[0]).start_time
-                        if scene_index in shot_map else False),
+            transcript_type=_safe_text(item.get("type", "dialogue"), "dialogue"),
+            cross_shot=cross_shot,
         )
         transcripts.append(seg)
 
     # 回填 Vision / Audio / OCR
-    for item in result.get("per_shot", []):
-        si = item.get("scene_index", -1)
-        # 尝试全局索引，失败则尝试局部索引映射
-        if si not in shot_map and si in local_to_global:
-            si = local_to_global[si]
-        if si not in shot_map:
+    per_shot_items = [
+        item for item in result.get("per_shot", [])
+        if isinstance(item, dict)
+    ]
+    scene_index_mode = _infer_scene_index_mode(
+        per_shot_items, shot_map, local_to_global
+    )
+    per_shot_by_scene = {}
+
+    def _per_shot_quality(item):
+        vis = item.get("vision", {}) if isinstance(item.get("vision", {}), dict) else {}
+        aud = item.get("audio", {}) if isinstance(item.get("audio", {}), dict) else {}
+        return (
+            len(str(vis.get("description", "")).strip())
+            + len(str(vis.get("action_description", "")).strip())
+            + len(_as_str_list(vis.get("objects", []))) * 8
+            + len(_as_str_list(vis.get("ocr_texts", []))) * 8
+            + (5 if aud.get("speech_emotion") else 0)
+            + (5 if aud.get("music_mood") else 0)
+        )
+
+    for item in per_shot_items:
+        si = _resolve_per_shot_scene_index(
+            item, shot_map, local_to_global, scene_index_mode
+        )
+        if si is None or si not in shot_map:
             continue
+        existing = per_shot_by_scene.get(si)
+        if existing is None or _per_shot_quality(item) > _per_shot_quality(existing):
+            per_shot_by_scene[si] = item
+
+    missing = [s.scene_index for s in chunk_shots if s.scene_index not in per_shot_by_scene]
+    if missing:
+        logger.warning(
+            f"  Chunk {chunk.chunk_index} per_shot 覆盖不足: "
+            f"{len(per_shot_by_scene)}/{len(chunk_shots)}，缺失 scene_index={missing[:10]}"
+        )
+
+    for si in [s.scene_index for s in chunk_shots if s.scene_index in per_shot_by_scene]:
+        item = per_shot_by_scene[si]
         shot = shot_map[si]
 
         vis = item.get("vision", {})
+        if not isinstance(vis, dict):
+            vis = {}
         vision_summaries.append(VisionSummary(
             scene_index=si, timestamp=shot.start_time,
-            description=vis.get("description", ""),
-            objects=vis.get("objects", []),
-            mood=vis.get("mood", ""),
-            scene_type=vis.get("scene_type", ""),
-            camera_motion=vis.get("camera_motion", ""),
-            shot_scale=vis.get("shot_scale", ""),
-            action_description=vis.get("action_description", ""),
-            props=vis.get("props", []),
+            description=_safe_text(vis.get("description"), "无法判断"),
+            objects=_as_str_list(vis.get("objects", [])),
+            mood=_safe_text(vis.get("mood", "")),
+            scene_type=_safe_text(vis.get("scene_type", "")),
+            camera_motion=_safe_text(vis.get("camera_motion", "")),
+            shot_scale=_safe_text(vis.get("shot_scale", "")),
+            action_description=_safe_text(vis.get("action_description", "")),
+            props=_as_str_list(vis.get("props", [])),
         ))
 
         ocr_results.append(OCRResult(
             scene_index=si, timestamp=shot.start_time,
-            texts=vis.get("ocr_texts", []),
+            texts=_as_str_list(vis.get("ocr_texts", [])),
         ))
 
         aud = item.get("audio", {})
+        if not isinstance(aud, dict):
+            aud = {}
+        has_music = _safe_bool(aud.get("has_music", False))
+        has_sfx = _safe_bool(aud.get("has_sfx", False))
         audio_prosodies.append(AudioProsody(
             scene_index=si,
-            has_music=bool(aud.get("has_music", False)),
-            music_mood=aud.get("music_mood", ""),
-            has_sfx=bool(aud.get("has_sfx", False)),
-            sfx_tags=aud.get("sfx_tags", []),
-            silence_ratio=float(aud.get("silence_ratio", 0)),
-            speech_rate=aud.get("speech_rate", ""),
-            volume_peak=float(aud.get("volume_peak", 0)),
-            speech_emotion=aud.get("speech_emotion", ""),
+            has_music=has_music,
+            music_mood=_safe_text(aud.get("music_mood", "")),
+            has_sfx=has_sfx,
+            sfx_tags=_as_str_list(aud.get("sfx_tags", [])),
+            silence_ratio=_safe_parse_float(aud.get("silence_ratio", 0)),
+            speech_rate=_safe_text(aud.get("speech_rate", "")),
+            volume_peak=_safe_parse_float(aud.get("volume_peak", 0)),
+            speech_emotion=_safe_text(aud.get("speech_emotion", "")),
         ))
 
         # 多模态对齐（从结果直接派生）
         chars_present = []
-        for c in item.get("characters_present", []):
-            normalized = _normalize_character_id(c, profiles, chunk_index=chunk_index)
+        raw_chars = item.get("characters_present", [])
+        if isinstance(raw_chars, (str, dict)):
+            raw_chars = [raw_chars]
+        for c in raw_chars or []:
+            normalized = _normalize_character_id(
+                _extract_character_id(c), profiles, chunk_index=chunk_index
+            )
             if normalized:
                 chars_present.append(normalized)
         shot_trans = [t for t in transcripts if t.scene_index == si]
@@ -673,12 +923,12 @@ def _backfill_chunk_result(result, chunk, chunk_shots, profiles, chunk_index=-1)
         active = []
         if shot_trans:
             active.append("speech")
-        if aud.get("has_music"):
+        if has_music:
             active.append("music")
-        if aud.get("has_sfx"):
+        if has_sfx:
             active.append("sfx")
 
-        dominant = "speech" if shot_trans else ("music" if aud.get("has_music") else "visual")
+        dominant = "speech" if shot_trans else ("music" if has_music else "visual")
 
         alignments.append(MultimodalAlignment(
             scene_index=si, start_time=shot.start_time, end_time=shot.end_time,

@@ -375,4 +375,4 @@ Step 6/7 完成后会回写 `scenes/scenes.json`，持久化 `beat_index` / `sto
 - `minute_chunk.py` 的已有产物检查包含 9 个文件（含 `characters.json`, `speaker_map.json`, `multimodal_alignments.json`, `character_profiles.json`）。
 - Step 6/7 无论是新计算还是缓存加载，都会通过 `_backfill_beat_to_shots()` / `_backfill_scene_to_shots()` 回填 shot 的反向链接并持久化到 `scenes/scenes.json`。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和检索索引需要 `final_build` 完成后才具备。
-- Prompt 示例中的 `scene_index` / `shot_indices` 使用动态占位符，回填时还有局部→全局索引映射作为防御。
+- Prompt 的镜头边界同时给出 `local_shot_index` 和全局 `scene_index`，并要求 `per_shot` 覆盖每个 local shot；回填时优先使用 `local_shot_index`，再用局部/全局索引模式推断作为防御。
