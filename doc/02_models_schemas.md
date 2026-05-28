@@ -113,6 +113,8 @@ Step 5 `minute_chunk.py` 在每个 chunk 处理后逐步更新的角色档案。
 | `entity_type` | str | human / animal / robot / other |
 | `gallery_ref` | str | 关联的 `CharacterGallery.character_id` |
 
+更新策略：`minute_chunk.py` 会保留 `appearance_changes` 历史，但不会让“无”“无明显变化”“无法判断”等占位文本覆盖已有 `description`；`names` 和 `key_actions` 仍会过滤这类空泛输出。
+
 ### MinuteChunk（分钟级理解单元）v4.1
 
 Step 5 的核心中间模型。它不是最终检索单元，而是用于承载 chunk 级 Gemini 原始理解结果，再回填为 shot 级散文件。
@@ -128,6 +130,8 @@ Step 5 的核心中间模型。它不是最终检索单元，而是用于承载 
 | `character_updates` | list[dict] | 角色动态更新 |
 | `cross_shot_analysis` | dict | 跨 shot 叙事连续性、情绪弧线等 |
 | `suggested_beats` | list[list[int]] | Gemini 建议的 beat 分组 |
+
+注意：Step 3 的 `Shot.keyframe_paths` 不会作为 MinuteChunk Gemini 输入；MinuteChunk 使用视频片段、角色脸谱和动态角色档案。逐 shot 回填依赖 `local_shot_index` 与全局 `scene_index` 的双锚点解析。
 
 ### Shot（镜头）
 
@@ -196,6 +200,8 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | `dominant_modality` | str | 主导模态 |
 | `alignment_confidence` | float | 对齐置信度 0-1 |
 | `notes` | str | 冲突说明（如画外音检测） |
+
+`visible_characters` 是角色出场统计的重要来源，只应来自画面中真实可见且可识别的人物；旁白提及、台词提及或剧情推断不应写入该字段。
 
 ### Beat（剧情节拍）
 

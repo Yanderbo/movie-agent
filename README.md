@@ -152,6 +152,8 @@ video.mp4
 
 处理完成后，chunk 结果会按 shot 时间戳回填为传统散文件，兼容下游现有的 Beat、StoryScene、Chapter、Event 和 Memory 构建逻辑。
 
+角色回填采用保守策略：`characters_present` 只代表画面中真实可见且有足够视觉证据识别的人物；仅在台词、旁白或剧情中被提到的人物不会写入 `visible_characters`。回填时会同时检查 `local_shot_index` 和全局 `scene_index`，降低 LLM 把局部编号/全局编号混用导致的 shot 错位风险；如果模型漏掉某些 shot，会写入占位 `vision` / `ocr` / `audio` / `multimodal_alignment`，避免散文件断档。角色档案会保留 `appearance_changes` 历史，但“无”“无明显变化”“无法判断”等占位文本不会覆盖已有有效描述。
+
 ---
 
 ## 三类剪辑信号
@@ -361,6 +363,8 @@ python main.py understand --video-id xxx --resume
 - `understand --resume --video-id xxx` 依赖 `progress.json` 判断断点；如果进度文件缺失，当前代码不会自动从散文件推断完成步骤。
 - v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 映射到 `minute_chunk`，`edit_signal` / `build_memory` / `indexer` 映射到 `final_build`。
 - Step 5 会保存 `MinuteChunk.suggested_beats`，但当前 `beat_detect.py` 主流程仍基于回填后的台词、画面和人物信息重新让 LLM 分组；`suggested_beats` 更像后续优化入口。
+- Step 5 的 `characters.json.appearance_scenes` 来自 Gemini 回填的可见角色和 Step 4 gallery 出场镜头的合并。调试角色出场异常时，应优先检查 `multimodal_alignments.json.visible_characters` 是否被误标。
+- Step 9 的人物关系分析会读取 `character_profiles.json` 的有效别名、外观变化和关键行为，并根据 `characters.json.appearance_scenes` 计算共现；如果 `character_arcs.json` / `character_relations.json` 已存在，会直接加载缓存，不会自动重算。
 - `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；InsightFace 默认 `FACE_DETECT_DEVICE=auto`，检测到 `CUDAExecutionProvider` 时使用 GPU，`FACE_DETECT_GPU_ID=auto` 会选择显存占用最低的 CUDA 设备，否则回退 CPU。
 - Step 4 的人脸聚类是传统视觉模型的身份先验：会保守拆分混簇、合并高相似碎簇，并过滤小脸/侧脸，但仍可能把同一个人物拆成多个 gallery。跨 gallery 的语义归并留给后续大模型理解阶段基于剧情、台词和外观证据处理，当前不在 `face_cluster` 中实现。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和索引要等 `final_build` 完成后才会出现在 `memory.json` / `index/`。

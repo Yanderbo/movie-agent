@@ -73,6 +73,167 @@ ARC_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析�
 """
 
 
+_PLACEHOLDER_TEXTS = {
+    "无", "无变化", "无明显变化", "没有变化", "没有明显变化", "暂无",
+    "暂无描述", "无法判断", "无法辨认", "不确定", "未知", "none",
+    "null", "n/a", "na", "-", "--",
+}
+
+
+def _safe_text(value, default="") -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _is_placeholder_text(value) -> bool:
+    text = _safe_text(value)
+    if not text:
+        return True
+    normalized = text.strip(" \t\r\n。.!！,，;；:：").lower()
+    return normalized in _PLACEHOLDER_TEXTS
+
+
+def _as_text_list(value) -> list[str]:
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    texts = []
+    for item in items:
+        if item is None:
+            continue
+        text = _safe_text(item)
+        if text and not _is_placeholder_text(text):
+            texts.append(text)
+    return texts
+
+
+def _load_profile_map(video_dir: Path) -> dict:
+    profiles_path = video_dir / "character_profiles.json"
+    if not profiles_path.exists():
+        return {}
+    try:
+        data = json.loads(profiles_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"读取 character_profiles.json 失败，人物关系将不使用动态档案: {e}")
+        return {}
+    if not isinstance(data, list):
+        return {}
+    return {
+        item.get("character_id"): item
+        for item in data
+        if isinstance(item, dict) and item.get("character_id")
+    }
+
+
+def _valid_profile_descriptions(items, key="description", limit=5) -> list[str]:
+    values = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        text = _safe_text(item.get(key, ""))
+        if text and not _is_placeholder_text(text) and text not in values:
+            values.append(text)
+    return values[-limit:]
+
+
+def _profile_context(profile: dict | None) -> list[str]:
+    if not profile:
+        return []
+
+    lines = []
+    names = _as_text_list(profile.get("names", []))
+    if names:
+        lines.append(f"  档案称呼/别名: {', '.join(names[:5])}")
+
+    appearances = _valid_profile_descriptions(
+        profile.get("appearance_changes", []),
+        key="description",
+        limit=4,
+    )
+    if appearances:
+        lines.append(f"  有效外观线索: {'; '.join(appearances)}")
+
+    actions = _valid_profile_descriptions(
+        profile.get("key_actions", []),
+        key="action",
+        limit=6,
+    )
+    if actions:
+        lines.append(f"  关键行为线索: {'; '.join(actions)}")
+
+    return lines
+
+
+def _profile_description_fallback(profile: dict | None) -> str:
+    if not profile:
+        return ""
+    desc = _safe_text(profile.get("description", ""))
+    if desc and not _is_placeholder_text(desc):
+        return desc
+    appearances = _valid_profile_descriptions(
+        profile.get("appearance_changes", []),
+        key="description",
+        limit=1,
+    )
+    return appearances[-1] if appearances else ""
+
+
+def _build_cooccurrence_info(characters: list[CharacterDeep], limit=40) -> str:
+    pairs = []
+    co_map = defaultdict(set)
+    for i, char_a in enumerate(characters):
+        scenes_a = set(char_a.appearance_scenes)
+        if not scenes_a:
+            continue
+        for char_b in characters[i + 1:]:
+            scenes_b = set(char_b.appearance_scenes)
+            if not scenes_b:
+                continue
+            shared = sorted(scenes_a & scenes_b)
+            if not shared:
+                continue
+            pairs.append((len(shared), char_a.character_id, char_b.character_id, shared))
+            co_map[char_a.character_id].add(char_b.character_id)
+            co_map[char_b.character_id].add(char_a.character_id)
+
+    for c in characters:
+        if co_map.get(c.character_id):
+            c.co_appearing_characters = sorted(co_map[c.character_id])
+
+    if not pairs:
+        return "（无共现数据）"
+
+    pairs.sort(key=lambda p: (-p[0], p[1], p[2]))
+    lines = []
+    for count, char_a, char_b, shared in pairs[:limit]:
+        sample = ", ".join(str(si) for si in shared[:12])
+        suffix = "..." if len(shared) > 12 else ""
+        lines.append(f"- {char_a} 与 {char_b} 共现 {count} 个 shot: {sample}{suffix}")
+    return "\n".join(lines)
+
+
+def _select_events_for_prompt(events: list[Event], limit=60) -> list[Event]:
+    selected = []
+    seen = set()
+
+    def add(event):
+        if event.event_index in seen:
+            return
+        selected.append(event)
+        seen.add(event.event_index)
+
+    for event in events[:20]:
+        add(event)
+    for event in events:
+        if getattr(event, "importance", 0) >= 7 or len(event.characters) >= 2:
+            add(event)
+
+    selected.sort(key=lambda e: e.start_time)
+    return selected[:limit]
+
+
 def analyze_character_arcs(
     video_id: str,
     characters: list[CharacterDeep],
@@ -140,33 +301,44 @@ def analyze_character_arcs(
             e.event_index for e in events if c.character_id in e.characters
         ]
 
+    profile_map = _load_profile_map(video_dir)
+
     # 构造 prompt
     char_lines = []
     for c in characters:
-        char_lines.append(
-            f"- {c.character_id} ({c.display_name}): {c.description}\n"
-            f"  出镜: {c.total_screen_time:.0f}s, 台词: {c.dialogue_count}句, "
-            f"重要性: {c.importance_score:.2f}, "
-            f"出场: {c.first_appearance:.0f}s-{c.last_appearance:.0f}s"
-        )
+        profile = profile_map.get(c.character_id)
+        description = _safe_text(c.description)
+        if _is_placeholder_text(description):
+            description = _profile_description_fallback(profile) or "（暂无有效外观描述）"
+
+        lines = [
+            f"- {c.character_id} ({c.display_name}): {description}",
+            (
+                f"  出镜: {c.total_screen_time:.0f}s, 台词: {c.dialogue_count}句, "
+                f"重要性: {c.importance_score:.2f}, "
+                f"出场: {c.first_appearance:.0f}s-{c.last_appearance:.0f}s"
+            ),
+        ]
+        lines.extend(_profile_context(profile))
+        if c.key_event_indices:
+            lines.append(
+                "  关联事件: "
+                + ", ".join(str(idx) for idx in c.key_event_indices[:12])
+            )
+        char_lines.append("\n".join(lines))
     characters_info = "\n".join(char_lines)
 
+    selected_events = _select_events_for_prompt(events)
     event_lines = []
-    for e in events[:30]:
+    for e in selected_events:
         event_lines.append(
             f"Event {e.event_index} [{e.start_time:.0f}s-{e.end_time:.0f}s] "
-            f"[{e.event_type}] 人物: {','.join(e.characters)} — {e.description}"
+            f"[{e.event_type}] 人物: {','.join(e.characters)} "
+            f"重要性:{getattr(e, 'importance', 5)} — {e.description}"
         )
     events_info = "\n".join(event_lines) if event_lines else "（无事件）"
 
-    # 共现信息
-    co_lines = []
-    for c in characters:
-        if c.co_appearing_characters:
-            co_lines.append(
-                f"- {c.character_id} 与 {', '.join(c.co_appearing_characters)} 共同出现"
-            )
-    cooccurrence_info = "\n".join(co_lines) if co_lines else "（无共现数据）"
+    cooccurrence_info = _build_cooccurrence_info(characters)
 
     prompt = ARC_PROMPT_TEMPLATE.format(
         characters_info=characters_info,
