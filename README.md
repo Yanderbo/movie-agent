@@ -142,7 +142,7 @@ video.mp4
 
 ## MinuteChunk 融合理解
 
-`pipeline/minute_chunk.py` 是 v4.1 的核心模块。它以 shot 边界为基础，把连续镜头拼接为约 150 秒的 chunk，截取视频片段并附带关键帧、角色脸谱和前序角色档案，让 Gemini 一次输出：
+`pipeline/minute_chunk.py` 是 v4.1 的核心模块。它以 shot 边界为基础，把连续镜头拼接为约 150 秒的 chunk，截取视频片段并附带角色脸谱和前序角色档案，让 Gemini 一次输出。Step 3 关键帧保留给脸谱构建和后续多模态 RAG / 索引，不随 chunk 视频一起送入 Gemini：
 
 - ASR 转录：逐句台词、时间戳、speaker、`character_id`
 - 逐 shot 视觉摘要：描述、物体、情绪、场景类型、镜头运动、景别、OCR
@@ -374,7 +374,7 @@ python main.py understand --video-id xxx --resume
 | **流程步骤** | 10 步 | 14 步 | 17 步 | 10 步 |
 | **理解策略** | 按 shot 独立分析 | 多帧 + 层级聚合 | 音频/对齐/章节增强 | MinuteChunk 融合 ASR/Vision/Audio/角色/对齐 |
 | **叙事结构** | 扁平 Shot 列表 | Shot → Beat → StoryScene → EventGraph | Shot → Beat → StoryScene → Chapter → EventGraph | 同 v3 |
-| **关键帧/画面字段** | 每 shot 1 帧 | 每 shot 1-6 帧 | 同 v2，并增加镜头运动、景别、人物互动等字段 | 同 v3，用于 chunk 输入 |
+| **关键帧/画面字段** | 每 shot 1 帧 | 每 shot 1-6 帧 | 同 v2，并增加镜头运动、景别、人物互动等字段 | 同 v3，用于脸谱构建与多模态 RAG / 索引 |
 | **ASR / Vision / Audio** | 多为独立处理 | 独立增强 | 独立模块分步执行 | 并入 MinuteChunk，一次多模态理解后回填 |
 | **人物** | 基础聚类 + 描述 | 弧线/关系图/重要性 | 进入多模态对齐 | Step 4 脸谱 + Step 5 动态角色档案 + Step 9 弧线 |
 | **剪辑信号** | 无 | 8 维 EditSignal | 三类信号 | 同 v3，合并到 Step 10 |

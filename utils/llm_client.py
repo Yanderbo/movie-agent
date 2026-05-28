@@ -287,52 +287,6 @@ class LLMClient:
             raise RuntimeError(f"LLM 调用失败: {result['error']}")
         return result["content"]
 
-    def chat_with_multi_media(
-        self,
-        prompt: str,
-        media_paths: list[str],
-        system_prompt: str = None,
-        temperature: float = 0.7,
-        max_tokens: int = None,
-        response_format: str = None,
-    ) -> str:
-        """
-        带多个媒体文件的对话（混合视频/图片/音频），返回文本内容。
-
-        v4.1 新增：用于 MinuteChunk 处理，一次发送视频片段 + 关键帧 + 角色脸谱。
-
-        Args:
-            prompt: 文本提示
-            media_paths: 媒体文件路径列表（视频/图片/音频混合）
-            system_prompt: 系统提示
-            temperature: 温度
-        """
-        content = [{"type": "text", "text": prompt}]
-        for media_path in media_paths:
-            if not Path(media_path).exists():
-                logger.warning(f"媒体文件不存在，跳过: {media_path}")
-                continue
-            mime_type = self.get_mime_type(media_path)
-            b64_data = self.encode_file_to_base64(media_path)
-            data_url = f"data:{mime_type};base64,{b64_data}"
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": data_url, "mime_type": mime_type},
-            })
-
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": content})
-
-        result = self._request_with_retry(
-            messages, temperature=temperature,
-            max_tokens=max_tokens, response_format=response_format,
-        )
-        if not result["success"]:
-            raise RuntimeError(f"LLM 调用失败: {result['error']}")
-        return result["content"]
-
     def chat_with_labeled_media(
         self,
         content_parts: list[dict],
@@ -348,8 +302,8 @@ class LLMClient:
           {"type": "text",  "text": "..."}
           {"type": "media", "path": "/path/to/file"}
 
-        这样可以在每张图片前插入文字标签，让模型精确知道
-        每张图片的身份归属，避免扁平列表导致的计数歧义。
+        这样可以在每段视频或每张图片前插入文字标签，让模型精确知道
+        附件语义，避免扁平列表导致的计数歧义。
         """
         content = []
         for part in content_parts:

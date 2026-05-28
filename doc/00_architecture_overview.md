@@ -97,7 +97,7 @@
 
 ### 1. 入库压缩降低理解成本
 
-Step 1 会保留 `original.*` 供渲染使用，同时按需生成 `compressed.mp4` 供理解流水线使用。默认阈值是高度 `480`、帧率 `10fps`，这会显著降低后续关键帧、视频片段和多模态 API 的输入成本。
+Step 1 会保留 `original.*` 供渲染使用，同时按需生成 `compressed.mp4` 供理解流水线使用。默认阈值是高度 `480`、帧率 `10fps`，这会显著降低后续关键帧处理、视频片段截取和多模态 API 调用成本。
 
 ### 2. 先切分，再构建角色脸谱
 
@@ -116,7 +116,7 @@ InsightFace 不可用时，该步骤返回空脸谱，MinuteChunk 会让 Gemini 
 
 ### 3. MinuteChunk 替代六个独立理解步骤
 
-v4.1 将 v3 的 `asr_windowed`、`vision`、`audio_analysis`、`character_deep`、`speaker_bind`、`multimodal_align` 合并到 `minute_chunk`。每个 chunk 使用视频片段、关键帧、角色脸谱和动态角色档案作为输入，一次输出并回填：
+v4.1 将 v3 的 `asr_windowed`、`vision`、`audio_analysis`、`character_deep`、`speaker_bind`、`multimodal_align` 合并到 `minute_chunk`。每个 chunk 使用视频片段、角色脸谱和动态角色档案作为输入，一次输出并回填；Step 3 关键帧保留给脸谱构建与后续多模态 RAG / 索引，不随 chunk 视频一起送入 Gemini：
 
 | 回填文件 | 内容 |
 |----------|------|

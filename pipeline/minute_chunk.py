@@ -211,7 +211,6 @@ def run_minute_chunk_understand(
                 segment_path = None
 
         chunk_shots = [s for s in shots if s.scene_index in chunk.shot_indices]
-        keyframe_records = _build_keyframe_records(chunk_shots)
 
         # 构建结构化 gallery 记录
         gallery_records = _build_gallery_records(galleries, profiles)
@@ -221,7 +220,7 @@ def run_minute_chunk_understand(
 
         # 构建结构化 content（text-media 交错，每张图前带标签）
         content_parts = _build_structured_content(
-            prompt, segment_path, gallery_records, keyframe_records
+            prompt, segment_path, gallery_records
         )
 
         # 调用 Gemini（使用结构化标签接口）
@@ -245,13 +244,31 @@ def run_minute_chunk_understand(
             # 处理角色合并建议（顶层独立字段）
             _process_merge_suggestions(profiles, result, chunk.chunk_index)
 
-            # 保存 chunk 原始结果
-            chunk.raw_transcripts = result.get("transcripts", [])
-            chunk.per_shot_vision = [s.get("vision", {}) for s in result.get("per_shot", [])]
-            chunk.per_shot_audio = [s.get("audio", {}) for s in result.get("per_shot", [])]
-            chunk.character_updates = result.get("character_updates", [])
-            chunk.cross_shot_analysis = result.get("cross_shot", {})
-            chunk.suggested_beats = result.get("cross_shot", {}).get("suggested_beats", [])
+            # 保存 chunk 原始结果；LLM 偶尔会返回非预期类型，这里只做轻量防御。
+            raw_transcripts = result.get("transcripts", [])
+            if not isinstance(raw_transcripts, list):
+                raw_transcripts = []
+            raw_transcripts = [t for t in raw_transcripts if isinstance(t, dict)]
+
+            raw_per_shot = result.get("per_shot", [])
+            if not isinstance(raw_per_shot, list):
+                raw_per_shot = []
+            raw_per_shot = [s for s in raw_per_shot if isinstance(s, dict)]
+
+            raw_updates = result.get("character_updates", [])
+            if not isinstance(raw_updates, list):
+                raw_updates = []
+
+            cross_shot = result.get("cross_shot", {})
+            if not isinstance(cross_shot, dict):
+                cross_shot = {}
+
+            chunk.raw_transcripts = raw_transcripts
+            chunk.per_shot_vision = [s.get("vision", {}) for s in raw_per_shot]
+            chunk.per_shot_audio = [s.get("audio", {}) for s in raw_per_shot]
+            chunk.character_updates = raw_updates
+            chunk.cross_shot_analysis = cross_shot
+            chunk.suggested_beats = cross_shot.get("suggested_beats", [])
         else:
             logger.warning(f"  Chunk {chunk.chunk_index} 处理失败，跳过")
 
@@ -391,37 +408,6 @@ def _init_profiles(galleries: list[CharacterGallery]) -> dict[str, CharacterProf
     return profiles
 
 
-def _collect_keyframes(chunk_shots: list[Shot]) -> list[str]:
-    """收集 chunk 内所有 shot 的首帧关键帧"""
-    paths = []
-    for s in chunk_shots:
-        kf = s.keyframe_path
-        if not kf and s.keyframe_paths:
-            kf = s.keyframe_paths[0] if s.keyframe_paths else None
-        if kf and Path(kf).exists():
-            paths.append(kf)
-    return paths
-
-
-def _build_keyframe_records(chunk_shots: list[Shot]) -> list[dict]:
-    """构建逐 shot 关键帧记录，用于辅助 Gemini 按镜头回填 vision/OCR。"""
-    records = []
-    for local_idx, shot in enumerate(chunk_shots):
-        kf = shot.keyframe_path
-        if not kf and shot.keyframe_paths:
-            kf = shot.keyframe_paths[0] if shot.keyframe_paths else None
-        if not kf or not Path(kf).exists():
-            continue
-        records.append({
-            "local_shot_index": local_idx,
-            "scene_index": shot.scene_index,
-            "start_time": shot.start_time,
-            "end_time": shot.end_time,
-            "path": kf,
-        })
-    return records
-
-
 def _build_gallery_records(galleries, profiles):
     """构建结构化 gallery 记录，替代旧的扁平 _collect_gallery_images。
 
@@ -462,10 +448,9 @@ def _build_gallery_records(galleries, profiles):
     return records
 
 
-def _build_structured_content(prompt, segment_path, gallery_records, keyframe_records=None):
+def _build_structured_content(prompt, segment_path, gallery_records):
     """构建 text-media 交错排列的结构化 content。
 
-    每个 shot 的关键帧前会插入 local/global 双索引标签，辅助逐镜头回填。
     每张 gallery 图片前都插入独立的文字标签：
       char_000 / 张三 / face 1 of 4 / source shot 12 / time 35.2s
       [image]
@@ -476,18 +461,6 @@ def _build_structured_content(prompt, segment_path, gallery_records, keyframe_re
     if segment_path and Path(segment_path).exists():
         parts.append({"type": "text", "text": "== Chunk 视频片段 =="})
         parts.append({"type": "media", "path": segment_path})
-
-    # 逐 shot 关键帧
-    if keyframe_records:
-        parts.append({"type": "text", "text": "== 逐 shot 关键帧参考（用于 vision/OCR/audio 对齐）=="})
-        for rec in keyframe_records:
-            label = (
-                f"shot keyframe / local_shot_index {rec['local_shot_index']}"
-                f" / scene_index {rec['scene_index']}"
-                f" / time {rec['start_time']:.1f}s-{rec['end_time']:.1f}s"
-            )
-            parts.append({"type": "text", "text": label})
-            parts.append({"type": "media", "path": rec["path"]})
 
     # 逐角色、逐图带标签
     if gallery_records:
@@ -564,28 +537,6 @@ def _build_prompt(chunk, chunk_shots, profiles, gallery_records):
         character_section=char_section,
         first_shot_index=chunk.shot_indices[0] if chunk.shot_indices else 0,
     )
-
-
-def _call_gemini(client, prompt, media_paths) -> dict | None:
-    """调用 Gemini API 并解析结果（旧接口，保留兼容）"""
-    try:
-        if media_paths:
-            response = client.chat_with_multi_media(
-                prompt=prompt,
-                media_paths=media_paths,
-                temperature=0.2,
-            )
-        else:
-            response = client.chat(prompt=prompt, temperature=0.2)
-
-        parsed = client.parse_json(response)
-        if parsed and isinstance(parsed, dict):
-            return parsed
-        logger.warning("Gemini 响应解析失败")
-        return None
-    except Exception as e:
-        logger.error(f"Gemini 调用失败: {e}")
-        return None
 
 
 def _call_gemini_structured(client, content_parts) -> dict | None:
