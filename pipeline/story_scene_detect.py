@@ -222,8 +222,8 @@ def _finalize_story_scenes(
         ss.start_time = min(b.start_time for b in bs)
         ss.end_time = max(b.end_time for b in bs)
         ss.duration = ss.end_time - ss.start_time
-        if not ss.characters:
-            ss.characters = sorted({c for b in bs for c in b.characters})
+        # 始终从当前拥有的 beats 重新聚合角色，防止去重后残留已不属于本场景的 beat 角色
+        ss.characters = sorted({c for b in bs for c in b.characters})
     return scenes
 
 

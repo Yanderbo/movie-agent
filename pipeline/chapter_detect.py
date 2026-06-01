@@ -102,12 +102,13 @@ def detect_chapters(
     # 短视频：整部视频一个 Chapter
     if meta_duration < 600 or len(story_scenes) <= 3:
         logger.info(f"短视频或少量场景（{len(story_scenes)} 个），整体为一个 Chapter")
-        chapters = _single_chapter(story_scenes)
+        chapters = [_single_chapter(story_scenes)]
     else:
         logger.info(f"开始 Chapter 检测: {len(story_scenes)} 个 StoryScene")
         chapters = _detect_via_llm(story_scenes, meta_duration)
-        # 覆盖兜底 + 全局重排：保证每个 StoryScene 恰好归属一个 Chapter
-        chapters = _finalize_chapters(chapters, story_scenes)
+
+    # 统一走 _finalize_chapters 保证覆盖 + 去重 + 索引连续
+    chapters = _finalize_chapters(chapters, story_scenes)
 
     chapters_path.write_text(
         json.dumps([c.model_dump() for c in chapters], indent=2, ensure_ascii=False),
@@ -117,8 +118,8 @@ def detect_chapters(
     return chapters
 
 
-def _single_chapter(story_scenes: list[StoryScene]) -> list[Chapter]:
-    """短视频：整部视频作为一个 Chapter"""
+def _single_chapter(story_scenes: list[StoryScene]) -> Chapter:
+    """短视频：整部视频作为一个 Chapter（返回单个 Chapter，由调用方包装为列表）"""
     ch = Chapter(
         chapter_index=0,
         title="全篇",
@@ -132,7 +133,7 @@ def _single_chapter(story_scenes: list[StoryScene]) -> list[Chapter]:
         chapter_type="act_1",
         characters=sorted({c for ss in story_scenes for c in ss.characters}),
     )
-    return [ch]
+    return ch
 
 
 def _detect_via_llm(
@@ -245,8 +246,8 @@ def _finalize_chapters(
         c.start_time = min(ss.start_time for ss in sscs)
         c.end_time = max(ss.end_time for ss in sscs)
         c.duration = c.end_time - c.start_time
-        if not c.characters:
-            c.characters = sorted({ch for ss in sscs for ch in ss.characters})
+        # 始终从当前拥有的 story_scenes 重新聚合角色，防止去重后残留已不属于本章节的角色
+        c.characters = sorted({ch for ss in sscs for ch in ss.characters})
     return chapters
 
 
