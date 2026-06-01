@@ -363,6 +363,7 @@ python main.py understand --video-id xxx --resume
 - `understand --resume --video-id xxx` 依赖 `progress.json` 判断断点；如果进度文件缺失，当前代码不会自动从散文件推断完成步骤。
 - v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 映射到 `minute_chunk`，`edit_signal` / `build_memory` / `indexer` 映射到 `final_build`。
 - Step 5 会保存 `MinuteChunk.suggested_beats`，但当前 `beat_detect.py` 主流程仍基于回填后的台词、画面和人物信息重新让 LLM 分组；`suggested_beats` 更像后续优化入口。
+- Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验（仅保留名册内 ID 或 `unknown_N`），避免编造与 face_cluster `char_xxx` 体系不一致的角色 ID；`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）。
 - Step 5 的 `characters.json.appearance_scenes` 来自 Gemini 回填的可见角色和 Step 4 gallery 出场镜头的合并。调试角色出场异常时，应优先检查 `multimodal_alignments.json.visible_characters` 是否被误标。
 - Step 9 的人物关系分析会读取 `character_profiles.json` 的有效别名、外观变化和关键行为，并根据 `characters.json.appearance_scenes` 计算共现；如果 `character_arcs.json` / `character_relations.json` 已存在，会直接加载缓存，不会自动重算。
 - `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；InsightFace 默认 `FACE_DETECT_DEVICE=auto`，检测到 `CUDAExecutionProvider` 时使用 GPU，`FACE_DETECT_GPU_ID=auto` 会选择显存占用最低的 CUDA 设备，否则回退 CPU。

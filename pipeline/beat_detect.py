@@ -76,7 +76,7 @@ def detect_beats(
     shots: list[Shot],
     transcripts: list[TranscriptSegment],
     vision_summaries: list[VisionSummary],
-    characters: list[Character],
+    characters: list[Character],  # 运行时通常为 CharacterDeep（Character 子类），也可能为空列表
 ) -> list[Beat]:
     """
     将连续 shots 按叙事节拍聚合为 beats。
@@ -86,7 +86,9 @@ def detect_beats(
         shots: 镜头列表
         transcripts: 台词列表
         vision_summaries: 画面摘要列表
-        characters: 人物列表
+        characters: 人物列表，元素为 Character 或其子类 CharacterDeep，可能为空。
+            仅用于构建"已知角色名册"并校验 LLM 返回的 beat.characters；
+            字段访问全部走 getattr 防御，兼容缺失 description 等字段的情形。
 
     Returns:
         Beat 列表
