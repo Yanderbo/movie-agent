@@ -180,14 +180,32 @@ def _profile_description_fallback(profile: dict | None) -> str:
     return appearances[-1] if appearances else ""
 
 
+def _is_temp_character_id(cid: str) -> bool:
+    """chunk 作用域的临时未知角色（char_tmp_*）无法跨 chunk 归并，
+    不应进入人物关系图，否则会污染稳定角色的 co_appearing/relations。"""
+    return str(cid or "").startswith("char_tmp_")
+
+
+def _relationship_character_ids(characters: list[CharacterDeep]) -> set:
+    """关系图允许的角色集合：存在稳定角色时排除临时角色；
+    若全是临时角色（无脸谱降级场景），则保留全部以免关系图为空。"""
+    stable = {c.character_id for c in characters if not _is_temp_character_id(c.character_id)}
+    return stable if stable else {c.character_id for c in characters}
+
+
 def _build_cooccurrence_info(characters: list[CharacterDeep], limit=40) -> str:
+    allowed = _relationship_character_ids(characters)
     pairs = []
     co_map = defaultdict(set)
     for i, char_a in enumerate(characters):
+        if char_a.character_id not in allowed:
+            continue
         scenes_a = set(char_a.appearance_scenes)
         if not scenes_a:
             continue
         for char_b in characters[i + 1:]:
+            if char_b.character_id not in allowed:
+                continue
             scenes_b = set(char_b.appearance_scenes)
             if not scenes_b:
                 continue
@@ -372,11 +390,16 @@ def analyze_character_arcs(
                         break
                 arcs_data_out.append(arc.model_dump())
 
-            # 解析关系
+            # 解析关系（排除 chunk 作用域临时角色，避免污染关系图）
+            allowed_rel_ids = _relationship_character_ids(characters)
             for rel_item in parsed.get("relations", []):
+                rel_a = rel_item.get("character_a", "")
+                rel_b = rel_item.get("character_b", "")
+                if rel_a not in allowed_rel_ids or rel_b not in allowed_rel_ids:
+                    continue
                 rel = CharacterRelation(
-                    character_a=rel_item.get("character_a", ""),
-                    character_b=rel_item.get("character_b", ""),
+                    character_a=rel_a,
+                    character_b=rel_b,
                     relation_type=rel_item.get("relation_type", "stranger"),
                     description=rel_item.get("description", ""),
                     strength=float(rel_item.get("strength", 0.5)),
