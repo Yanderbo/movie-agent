@@ -1,7 +1,28 @@
 # 工具库 (utils/)
 
-> 文件：`utils/llm_client.py`、`utils/ffmpeg_utils.py`、`utils/logger.py`
-> 职责：为系统提供 LLM 调用、FFmpeg 操作和日志三大基础能力
+> 文件：`utils/__init__.py`、`utils/llm_client.py`、`utils/ffmpeg_utils.py`、`utils/logger.py`
+> 职责：为系统提供通用序列工具、LLM 调用、FFmpeg 操作和日志四大基础能力
+
+---
+
+## 通用工具 (utils/__init__.py)
+
+### `group_consecutive(items, index_of)`
+
+把一组对象按其整数序号是否连续切分为若干分组。
+
+```python
+from utils import group_consecutive
+
+# 把未覆盖的 shot 按 scene_index 相邻关系分组
+groups = group_consecutive(uncovered_shots, lambda s: s.scene_index)
+```
+
+- `items`：待分组对象列表。
+- `index_of`：从对象取出整数序号的函数（如 `shot -> scene_index`）。
+- 返回：分组列表，组内序号严格连续（step=1），组按序号升序。
+
+用途：理解流水线 Step 6/7/8（`beat_detect` / `story_scene_detect` / `chapter_detect`）的层级覆盖兜底——把 LLM 漏分的 shot / beat / story_scene 按相邻关系聚合成 `transition` 过渡单元，避免散落丢失。三个模块共用此函数，消除重复实现。
 
 ---
 

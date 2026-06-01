@@ -11,12 +11,12 @@ Beat 是介于 shot 和 story_scene 之间的叙事微单元，
 """
 import json
 import time
-from pathlib import Path
 
 import config
 from models.schemas import (
     Shot, Beat, TranscriptSegment, VisionSummary, Character,
 )
+from utils import group_consecutive
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
@@ -196,9 +196,9 @@ def detect_beats(
                     if not shot_indices:
                         continue
                     # 尝试全局索引，失败则尝试局部索引映射
-                    shot_indices = [local_to_global.get(si, si) for si in shot_indices]
-                    # 计算时间范围
-                    beat_shots = [s for s in seg_shots if s.scene_index in shot_indices]
+                    mapped = {local_to_global.get(si, si) for si in shot_indices}
+                    # 仅保留当前段内真实存在的 shot，过滤越界/幻觉索引
+                    beat_shots = [s for s in seg_shots if s.scene_index in mapped]
                     if not beat_shots:
                         continue
                     # 校验 LLM 返回的角色 ID：有名册时只保留名册内 ID 或 unknown_N，
@@ -216,12 +216,15 @@ def detect_beats(
                             if isinstance(cid, str) and cid.strip()
                         ]
                     b = Beat(
-                        # beat_index 用全局自增重编号，忽略 LLM 返回值以保证唯一
+                        # beat_index 临时编号，最终由 _finalize_beats 按时间统一重排
                         beat_index=beat_offset + len(beats),
                         start_time=min(s.start_time for s in beat_shots),
                         end_time=max(s.end_time for s in beat_shots),
-                        duration=sum(s.duration for s in beat_shots),
-                        shot_indices=sorted(shot_indices),
+                        duration=(
+                            max(s.end_time for s in beat_shots)
+                            - min(s.start_time for s in beat_shots)
+                        ),
+                        shot_indices=sorted(s.scene_index for s in beat_shots),
                         beat_type=item.get("beat_type", ""),
                         description=item.get("description", ""),
                         emotion=item.get("emotion", ""),
@@ -237,6 +240,9 @@ def detect_beats(
         beat_offset += len(beats)
         time.sleep(0.5)
 
+    # 覆盖兜底 + 全局重排：保证每个 shot 恰好归属一个 beat，beat_index 连续唯一
+    all_beats = _finalize_beats(all_beats, shots)
+
     # 回填 shot 的 beat_index 并持久化
     _backfill_beat_to_shots(shots, all_beats, video_id)
 
@@ -248,6 +254,54 @@ def detect_beats(
 
     logger.info(f"Beat 检测完成: {len(all_beats)} 个 beat")
     return all_beats
+
+
+def _finalize_beats(beats: list[Beat], shots: list[Shot]) -> list[Beat]:
+    """
+    规范化 beats，保证它对 shots 构成一个完整且不重叠的划分：
+
+    1. 跨 beat 去重 shot（保留先出现者），过滤非法 shot 索引；
+    2. 把未被任何 beat 覆盖的 shot 按相邻关系聚合为 ``transition`` beat；
+    3. 按时间统一排序，重排 beat_index 为连续唯一值，并重算时间范围/时长。
+
+    这样可避免 LLM 漏分镜头导致 shot 脱离叙事层级（beat_index=None）。
+    """
+    if not shots:
+        return []
+    shot_map = {s.scene_index: s for s in shots}
+
+    # 1. 去空 + 按时间排序 + 跨 beat 去重 shot
+    beats = [b for b in beats if b.shot_indices]
+    beats.sort(key=lambda b: b.start_time)
+    seen: set[int] = set()
+    for b in beats:
+        kept = [si for si in b.shot_indices if si in shot_map and si not in seen]
+        seen.update(kept)
+        b.shot_indices = sorted(kept)
+    beats = [b for b in beats if b.shot_indices]
+
+    # 2. 未覆盖 shot → transition beat
+    uncovered = [s for s in shots if s.scene_index not in seen]
+    for group in group_consecutive(uncovered, lambda s: s.scene_index):
+        beats.append(Beat(
+            beat_index=-1,
+            start_time=group[0].start_time,
+            end_time=group[-1].end_time,
+            duration=group[-1].end_time - group[0].start_time,
+            shot_indices=[s.scene_index for s in group],
+            beat_type="transition",
+            description="",
+        ))
+
+    # 3. 统一重排并重算时间范围/时长（duration 采用墙钟跨度）
+    beats.sort(key=lambda b: min(shot_map[si].start_time for si in b.shot_indices))
+    for i, b in enumerate(beats):
+        bs = [shot_map[si] for si in b.shot_indices]
+        b.beat_index = i
+        b.start_time = min(s.start_time for s in bs)
+        b.end_time = max(s.end_time for s in bs)
+        b.duration = b.end_time - b.start_time
+    return beats
 
 
 def _backfill_beat_to_shots(shots: list[Shot], beats: list[Beat], video_id: str):
@@ -277,7 +331,7 @@ def _fallback_beats(shots: list[Shot], offset: int) -> list[Beat]:
             beat_index=offset + len(beats),
             start_time=group[0].start_time,
             end_time=group[-1].end_time,
-            duration=sum(s.duration for s in group),
+            duration=group[-1].end_time - group[0].start_time,
             shot_indices=[s.scene_index for s in group],
             beat_type="unknown",
             description="",

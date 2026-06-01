@@ -245,27 +245,46 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 关键约束（v4.1.1 修复）：
 
 - **角色名册注入与校验**：`characters` 列表会被转成"已知角色名册"写入 prompt（`char_id: 名字 — 描述`）。LLM 在 `beat.characters` 中只能引用名册内的 ID，画面里出现但不在名册的人用 `unknown_N` 临时编号。回填时按白名单过滤，丢弃编造的 `char_` ID；当名册为空时退化为保留非空字符串（无法校验）。这避免了 beat 角色 ID 与 Step 4 face_cluster 的 `char_xxx` 体系错配。
-- **beat_index 全局唯一**：`beat_index` 由全局自增计数器（`beat_offset + len(beats)`）统一编号，忽略 LLM 返回的 `beat_index`，防止跨段重复索引破坏 `shot → beat` 反向链接和下游 story_scene 关联。
+- **全覆盖 + 不重叠划分（`_finalize_beats`）**：分段 LLM 结果汇总后统一规范化——跨 beat 去重 shot（保留先出现者）、过滤越界/幻觉 shot 索引、把 LLM 漏分的 shot 按相邻关系聚合为 `transition` beat。保证每个 shot 恰好归属一个 beat，杜绝 `beat_index=None` 的孤儿镜头脱离叙事层级。
+- **beat_index 全局唯一且按时间连续**：规范化阶段按时间统一排序并重排 `beat_index` 为 `0..N-1`，忽略 LLM 返回值，防止跨段重复索引破坏 `shot → beat` 反向链接和下游 story_scene 关联。
+- **duration 采用墙钟跨度**：`beat.duration = end_time - start_time`（与 StoryScene / Chapter 统一），不再用子 shot 时长求和，避免漏分/非连续时口径漂移。
 - **缓存分支幂等**：`understand.py` 的 Step 6 续跑分支同样调用 `detect_beats()`；命中 `beats.json` 时不触发 LLM，但仍会回填 `shot.beat_index`，与新建分支行为一致。
-- LLM 解析失败时回退到"每 4 个 shot 一组"的默认分组（`_fallback_beats`）。
+- LLM 解析失败时回退到"每 4 个 shot 一组"的默认分组（`_fallback_beats`），同样进入 `_finalize_beats` 规范化。
 
 说明：MinuteChunk 原始结果中会保存 `suggested_beats`，但当前 `detect_beats()` 主入口尚未直接读取 `minute_chunks.json`，因此 `suggested_beats` 更像后续优化入口；现阶段 Beat 仍由 `beat_detect.py` 基于回填后的台词、画面和人物信息重新让 LLM 判断。
 
 ---
 
-## Step 7: Story Scene Detect
+## Step 7: Story Scene Detect（故事场景检测）
 
 **模块**：`pipeline/story_scene_detect.py`
 
-不变。将连续 beat 分组为故事场景。
+将连续 Beat 聚合为故事场景 StoryScene，输出 `story_scenes.json` 并回填 `shot.story_scene_index`。
+
+关键约束（v4.1.1 修复，与 Beat 对齐）：
+
+- **分段调用，长视频不丢尾**：beats 按 `SEGMENT_SIZE`（默认 40）分窗送入 LLM（`_detect_segment`），避免一次性把全部 beat 塞进单个 prompt 导致超长截断、尾部 beat 静默丢失。
+- **story_scene_index 本地自增**：不再信任 LLM 返回的 `story_scene_index`（旧实现 `item.get("story_scene_index", ...)` 有重复/跳号风险，会污染 `memory_builder` 按索引做 key 的 scene 单元和 EditSignal 映射）。最终索引由 `_finalize_story_scenes` 统一重排为 `0..N-1`。
+- **characters 从子 Beat 聚合**：StoryScene 的 `characters` 直接取所属 beat 的并集，而非采信 LLM 返回值。由于 beat 已做角色白名单，这保证了 StoryScene 角色 ID 与 face_cluster 的 `char_xxx` 体系一致，不会重新引入幻觉 ID。
+- **全覆盖兜底（`_finalize_story_scenes`）**：跨场景去重 beat、过滤非法 beat 索引、把漏分的 beat 聚合为 `transition` 场景，保证每个 beat 恰好归属一个 StoryScene。
+- **duration 采用墙钟跨度**：`story_scene.duration = end_time - start_time`。
+- LLM 解析失败时按"每 3 个 beat 一组"降级（`_fallback_story_scenes`），同样进入规范化。
 
 ---
 
-## Step 8: Chapter Detect
+## Step 8: Chapter Detect（大段落检测）
 
 **模块**：`pipeline/chapter_detect.py`
 
-不变。将连续 story_scene 分组为大段落。
+将连续 StoryScene 聚合为 Chapter（长视频大段落）。短视频（`< 600s` 或 StoryScene `≤ 3`）整体作为一个 Chapter；否则走 LLM 分组。
+
+关键约束（v4.1.1 修复，与 Beat / StoryScene 对齐）：
+
+- **chapter_index 本地自增**：不再信任 LLM 返回的 `chapter_index`；最终由 `_finalize_chapters` 统一重排为 `0..N-1`，避免索引碰撞破坏 `memory_builder` 按 `chapter_index` 做 key 的 chapter 单元。
+- **characters 从子 StoryScene 聚合**：Chapter 的 `characters` 取所属 StoryScene 的并集，不采信 LLM 返回值，保持角色 ID 体系一致。
+- **全覆盖兜底（`_finalize_chapters`）**：跨章节去重 StoryScene、过滤非法索引、把漏分的 StoryScene 聚合为 `transition` 章节，保证每个 StoryScene 恰好归属一个 Chapter。
+- **duration 口径统一**：单章节路径与 LLM 路径均使用 `end_time - start_time`（旧实现 LLM 路径用子时长求和、单章节路径用墙钟跨度，二者不一致）。
+- 移除了旧实现中未使用的 `beat_map` 死代码；LLM 解析失败时按"每 3 个 StoryScene 一组"降级（`_fallback_chapters`），同样进入规范化。
 
 ---
 
@@ -333,7 +352,7 @@ video.mp4
 | SpeakerBind | 1 | 0 |
 | **MinuteChunk** | — | **~12** |
 | Beat | 7 | 0-2 |
-| StoryScene | 1 | 1 |
+| StoryScene | 1 | 1-2 (按 40 beat 分窗) |
 | Chapter | 1 | 1 |
 | Event+Arc | 4 | 2-3 |
 | EditSignal | ~15 | ~8 |
@@ -388,5 +407,9 @@ Step 6/7 完成后会回写 `scenes/scenes.json`，持久化 `beat_index` / `sto
 - 人脸聚类参数以 `config.py` / `.env` 为准；修改阈值后需要清理旧 `face_clusters.json` 才会重新生成脸谱。
 - `minute_chunk.py` 的已有产物检查包含 9 个文件（含 `characters.json`, `speaker_map.json`, `multimodal_alignments.json`, `character_profiles.json`）。
 - Step 6/7 无论是新计算还是缓存加载，都会通过 `_backfill_beat_to_shots()` / `_backfill_scene_to_shots()` 回填 shot 的反向链接并持久化到 `scenes/scenes.json`。
+- Step 6/7/8 都通过 `_finalize_*` 规范化保证层级是「完整且不重叠的划分」：LLM 漏分的 shot/beat/story_scene 会被聚合成 `transition` 单元补回，索引按时间重排为连续唯一值。因此 `beats.json` / `story_scenes.json` / `chapters.json` 中可能出现 `beat_type="transition"` 或 `plot_function="transition"` 或 `chapter_type="transition"` 的兜底单元，属于预期行为。
+- Step 7/8 的 `characters` 一律从子层（beat / story_scene）聚合，不采信 LLM 返回的角色列表，以保持与 Step 4 face_cluster 的 `char_xxx` 体系一致。
+- Beat / StoryScene / Chapter 的 `duration` 统一为 `end_time - start_time`（墙钟跨度），不是子单元时长求和。
+- `utils.group_consecutive()` 是 Step 6/7/8 共用的「相邻分组」工具，用于把未覆盖的单元按序号连续性聚合为过渡单元。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和检索索引需要 `final_build` 完成后才具备。
 - Prompt 的镜头边界同时给出 `local_shot_index` 和全局 `scene_index`，并要求 `per_shot` 覆盖每个 local shot；回填时会处理两者冲突，并按整体局部/全局索引模式推断作为防御。
