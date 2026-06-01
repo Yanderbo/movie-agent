@@ -337,7 +337,7 @@ def run_minute_chunk_understand(
     _save_all_outputs(
         video_dir, all_transcripts, all_ocr, all_vision,
         all_audio, all_alignments, profiles, speaker_map, processed_chunks,
-        galleries=galleries,
+        galleries=galleries, shots=shots,
     )
 
     logger.info(
@@ -1275,7 +1275,7 @@ def _load_all_outputs(video_dir):
 def _save_all_outputs(
     video_dir, transcripts, ocr_results, vision_summaries,
     audio_prosodies, alignments, profiles, speaker_map, chunks,
-    galleries=None,
+    galleries=None, shots=None,
 ):
     """保存所有产物"""
     def _save(filename, data_list):
@@ -1323,17 +1323,33 @@ def _save_all_outputs(
     if galleries:
         for g in galleries:
             char_scenes[resolve_character_id(g.character_id)].update(g.appearance_scenes)
+
+    # scene_index -> (start, end)，用于聚合出镜时长/首末出场时间。
+    # 优先用 shots（权威镜头边界），缺失时回退 alignments。
+    scene_time = {}
+    if shots:
+        for s in shots:
+            scene_time[s.scene_index] = (s.start_time, s.end_time)
+    else:
+        for al in alignments:
+            scene_time.setdefault(al.scene_index, (al.start_time, al.end_time))
+
     chars = []
     for cid, p in profiles.items():
         if p.merged_into:
             continue
         resolved_cid = resolve_character_id(cid)
+        appearance = sorted(char_scenes.get(resolved_cid, []))
+        spans = [scene_time[i] for i in appearance if i in scene_time]
         chars.append(CharacterDeep(
             character_id=resolved_cid,
             display_name=p.names[0] if p.names else cid,
             description=p.description,
             role=None,
-            appearance_scenes=sorted(char_scenes.get(resolved_cid, [])),
+            appearance_scenes=appearance,
+            total_screen_time=round(sum(e - s for s, e in spans), 1),
+            first_appearance=round(min((s for s, e in spans), default=0.0), 1),
+            last_appearance=round(max((e for s, e in spans), default=0.0), 1),
         ).model_dump())
     chars_path = video_dir / "characters.json"
     chars_path.write_text(
