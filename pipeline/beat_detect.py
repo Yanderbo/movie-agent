@@ -34,6 +34,10 @@ BEAT_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析
 === 镜头列表 ===
 {shots_info}
 
+=== 已知角色名册 ===
+（characters 字段只能填写以下角色 ID；画面中出现但不在名册内的人，用 "unknown_1"/"unknown_2" 等临时编号区分，不要编造新的 char_ ID）
+{character_roster}
+
 请将这些镜头分组为若干 Beat，输出 JSON 数组。每个 Beat 包含：
 - beat_index: 从 {beat_offset} 开始编号
 - shot_indices: 包含的镜头索引列表（必须连续）
@@ -48,6 +52,7 @@ BEAT_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析
 2. 当场景/话题/情绪发生明显转换时，开启新 Beat
 3. 每个 Beat 通常包含 2-8 个镜头，但不强制
 4. 所有镜头都必须被分配到某个 Beat
+5. characters 字段只能填写"已知角色名册"中的 ID；无法对应名册的人用 "unknown_N" 临时编号，不要编造新的 char_ ID
 
 只输出 JSON：
 ```json
@@ -103,6 +108,26 @@ def detect_beats(
     client = get_llm_client()
     all_beats = []
 
+    # 构建已知角色名册（供 LLM 在 characters 字段引用，避免编造 ID）
+    valid_char_ids = set()
+    roster_lines = []
+    for c in (characters or []):
+        cid = getattr(c, "character_id", None)
+        if not cid:
+            continue
+        valid_char_ids.add(cid)
+        cname = getattr(c, "display_name", "") or cid
+        cdesc = (getattr(c, "description", "") or "").strip()
+        line = f"- {cid}: {cname}"
+        if cdesc:
+            line += f" — {cdesc[:40]}"
+        roster_lines.append(line)
+    character_roster = (
+        "\n".join(roster_lines)
+        if roster_lines
+        else "（暂无已知角色，可用 unknown_1/unknown_2 临时标注）"
+    )
+
     # 构建 shot → 台词/画面 的索引
     trans_by_shot = {}
     for t in transcripts:
@@ -151,6 +176,7 @@ def detect_beats(
             shots_info=shots_info,
             beat_offset=beat_offset,
             example_shot_indices=example_indices,
+            character_roster=character_roster,
         )
 
         try:
@@ -173,8 +199,23 @@ def detect_beats(
                     beat_shots = [s for s in seg_shots if s.scene_index in shot_indices]
                     if not beat_shots:
                         continue
+                    # 校验 LLM 返回的角色 ID：有名册时只保留名册内 ID 或 unknown_N，
+                    # 无名册时保留非空字符串（无法校验），避免编造 char_ ID 污染下游。
+                    raw_chars = item.get("characters", []) or []
+                    if valid_char_ids:
+                        beat_chars = [
+                            cid for cid in raw_chars
+                            if isinstance(cid, str)
+                            and (cid in valid_char_ids or cid.startswith("unknown_"))
+                        ]
+                    else:
+                        beat_chars = [
+                            cid for cid in raw_chars
+                            if isinstance(cid, str) and cid.strip()
+                        ]
                     b = Beat(
-                        beat_index=item.get("beat_index", beat_offset + len(beats)),
+                        # beat_index 用全局自增重编号，忽略 LLM 返回值以保证唯一
+                        beat_index=beat_offset + len(beats),
                         start_time=min(s.start_time for s in beat_shots),
                         end_time=max(s.end_time for s in beat_shots),
                         duration=sum(s.duration for s in beat_shots),
@@ -183,7 +224,7 @@ def detect_beats(
                         description=item.get("description", ""),
                         emotion=item.get("emotion", ""),
                         intensity=float(item.get("intensity", 0.0)),
-                        characters=item.get("characters", []),
+                        characters=beat_chars,
                     )
                     beats.append(b)
         except Exception as e:

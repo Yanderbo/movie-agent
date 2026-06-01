@@ -199,7 +199,10 @@ def run_understand(
         beats = detect_beats(video_id, shots, transcripts, vision_summaries, characters)
         _save_progress(video_id, "beat_detect")
     else:
-        beats = _load_cached("beats", video_id)
+        # 缓存分支同样走幂等的 detect_beats：命中 beats.json 时不调用 LLM，
+        # 但会回填 shot.beat_index，保持与新建分支一致的反向链接。
+        from pipeline.beat_detect import detect_beats
+        beats = detect_beats(video_id, shots, transcripts, vision_summaries, characters)
 
     # ═══ Step 7: Story Scene Detect ═══
     if start_step <= 6:
