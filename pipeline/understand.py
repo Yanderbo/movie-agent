@@ -17,10 +17,9 @@ v4.1 核心变更:
 - Gemini API 调用量从 ~257 次降至 ~30 次（↓87%）
 """
 import json
-from pathlib import Path
 
 import config
-from models.schemas import VideoMeta, Shot, Scene
+from models.schemas import Shot
 from memory.store import load_meta, save_memory, load_memory
 from utils.logger import get_logger
 
@@ -416,7 +415,7 @@ def _load_galleries(video_id: str):
 def _load_cached(data_type: str, video_id: str):
     """加载已缓存的中间结果，反序列化为 Pydantic 模型对象"""
     from models.schemas import (
-        TranscriptSegment, OCRResult, VisionSummary, Character, CharacterDeep,
+        TranscriptSegment, OCRResult, VisionSummary, CharacterDeep,
         Event, Beat, StoryScene, EditSignal, CharacterRelation,
         AudioProsody, MultimodalAlignment, Chapter,
         NarrativeSignal, RecompositionSignal,

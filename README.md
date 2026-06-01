@@ -364,6 +364,9 @@ python main.py understand --video-id xxx --resume
 - v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 映射到 `minute_chunk`，`edit_signal` / `build_memory` / `indexer` 映射到 `final_build`。
 - Step 5 会保存 `MinuteChunk.suggested_beats`，但当前 `beat_detect.py` 主流程仍基于回填后的台词、画面和人物信息重新让 LLM 分组；`suggested_beats` 更像后续优化入口。
 - Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验（仅保留名册内 ID 或 `unknown_N`），避免编造与 face_cluster `char_xxx` 体系不一致的角色 ID；`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）。
+- Step 6/7/8（`beat_detect` / `story_scene_detect` / `chapter_detect`）统一通过 `_finalize_*` 规范化保证每一层都是「完整且不重叠的划分」：LLM 漏分的 shot / beat / story_scene 会被聚合为 `transition` 过渡单元补回，`beat_index` / `story_scene_index` / `chapter_index` 一律由本地计数器按时间重排为连续唯一值（不信任 LLM 返回的索引，避免重复/跳号污染下游按索引做 key 的 MemoryUnit 和信号映射）。因此结果文件中可能出现 `transition` 类型的兜底单元，属于预期行为。
+- Step 7/8 的 `characters` 一律从子层（beat / story_scene）聚合而来，不采信 LLM 返回的角色列表，从而把 Step 6 的角色白名单一致性贯穿到 StoryScene 与 Chapter。
+- Beat / StoryScene / Chapter 的 `duration` 统一为 `end_time - start_time`（墙钟跨度）；Step 7 对 beats 按 40 个一窗分段调用 LLM，避免长视频单次 prompt 过长导致尾部 beat 被截断丢失。
 - Step 5 的 `characters.json.appearance_scenes` 来自 Gemini 回填的可见角色和 Step 4 gallery 出场镜头的合并。调试角色出场异常时，应优先检查 `multimodal_alignments.json.visible_characters` 是否被误标。
 - Step 9 的人物关系分析会读取 `character_profiles.json` 的有效别名、外观变化和关键行为，并根据 `characters.json.appearance_scenes` 计算共现；如果 `character_arcs.json` / `character_relations.json` 已存在，会直接加载缓存，不会自动重算。
 - `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；InsightFace 默认 `FACE_DETECT_DEVICE=auto`，检测到 `CUDAExecutionProvider` 时使用 GPU，`FACE_DETECT_GPU_ID=auto` 会选择显存占用最低的 CUDA 设备，否则回退 CPU。
