@@ -488,6 +488,7 @@ class MemoryUnit(BaseModel):
     end_time: float
     duration: float
     keyframe_path: Optional[str] = None
+    keyframe_paths: list[str] = Field(default_factory=list)
     transcripts: list[TranscriptSegment] = Field(default_factory=list)
     vision: Optional[VisionSummary] = None
     ocr: Optional[OCRResult] = None

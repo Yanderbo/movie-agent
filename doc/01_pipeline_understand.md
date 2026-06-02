@@ -37,6 +37,25 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
 
 ---
 
+## 阶段输入/输出总表
+
+| # | 阶段 | 主要输入 | 主要输出 | 数据如何流向下一步 |
+|---|------|----------|----------|--------------------|
+| 1 | Ingest | 用户传入视频路径、压缩阈值配置 | `original.*`、按需 `compressed.mp4`、`meta.json` | `meta.storage_path` 成为理解链路视频源；`original.*` 保留给 render |
+| 2 | Shot Detect | `meta.storage_path`、镜头切分阈值 | `scenes/scenes.json` | Shot 时间边界成为后续关键帧、角色、ASR/视觉回填、叙事聚合的统一锚点 |
+| 3 | Keyframe | `meta.storage_path`、`scenes/scenes.json` | `scenes/keyframes/*.jpg`、shot keyframe 路径 | 关键帧进入 Step 4 脸谱构建；不随 MinuteChunk 视频片段直接送入 Gemini |
+| 4 | Face Cluster | keyframes、shots、人脸检测/聚类配置 | `characters/face_clusters.json`、`characters/char_XXX_gallery/` | 角色脸谱作为 Step 5 的身份先验；InsightFace 不可用时输出空脸谱 |
+| 5 | MinuteChunk Understand | `meta.storage_path`、shots、face galleries、前序 `character_profiles.json` | `minute_chunks.json`、`transcripts.json`、`vision.json`、`ocr.json`、`audio_prosody.json`、`multimodal_alignments.json`、`characters.json`、`speaker_map.json`、可选 `character_identity_links.json` | 下游以回填后的 shot 级多模态散文件为基础；正式角色名册已过滤低证据临时角色 |
+| 6 | Beat Detect | shots、`transcripts.json`、`vision.json`、`characters.json` | `beats.json`、回写 `scenes/scenes.json` 的 `beat_index` | Beat 成为 StoryScene、Event、Memory 和信号计算的基础叙事单元；缓存命中也会回填反向链接 |
+| 7 | Story Scene Detect | beats、shots、台词/画面摘要、角色信息 | `story_scenes.json`、回写 `scenes/scenes.json` 的 `story_scene_index` | StoryScene 提供更高层剧情上下文，供 Chapter、Event 和 EditSignal 使用；缓存命中也会回填反向链接 |
+| 8 | Chapter Detect | story_scenes、beats、shots、角色/情绪摘要 | `chapters.json` | Chapter 提供长视频大段落结构，供事件抽取、MemoryUnit 和检索索引使用 |
+| 9 | Event Graph + Character Arc | shots、transcripts、vision、beats、story_scenes、chapters、characters、`character_profiles.json` | `events.json`、`event_graph.json`、`character_arcs.json`、`character_relations.json` | 事件、关系和人物弧线进入 final build，并作为 Director / Reviewer 的叙事证据 |
+| 10 | Final Build | Step 1-9 所有散文件、三类信号配置、embedding 配置 | `edit_signals.json`、`narrative_signals.json`、`recomposition_signals.json`、`memory.json`、`index/` | Search 读取 `memory.json` / `index/`；Director / Reviewer 使用 Memory、事件、角色和信号证据；索引失败会中断 final_build |
+
+边界说明：Step 5 `minute_chunk` 是 understand 主链路中需要视频片段做多模态理解的步骤；Step 6-10 不再打开原视频或压缩视频读取 shot 画面。后续视觉依据来自 `vision.json` / `ocr.json` / `multimodal_alignments.json`，需要引用画面文件时使用 Step 3 产出的 `Shot.keyframe_paths`（兼容字段 `keyframe_path` 仍保留）。
+
+---
+
 ## Step 1: Ingest（入库 + 压缩）
 
 **模块**：`pipeline/ingest.py`
@@ -217,6 +236,7 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 - `multimodal_alignments.json`
 - `characters.json` — 动态更新
 - `speaker_map.json` — 自动生成
+- `character_identity_links.json` — 角色身份合并记录（有合并时生成）
 
 回填时会结合 `local_shot_index` 与全局 `scene_index` 解析 per-shot 结果，防止 LLM 把局部编号和全局编号混用。如果模型漏掉某些 shot，会写入占位 `vision` / `ocr` / `audio` / `multimodal_alignment`，避免散文件断档。`characters.json.appearance_scenes` 由 `multimodal_alignments.json.visible_characters` 和 Step 4 gallery 的出场镜头合并而来，因此角色出场异常时优先检查 `visible_characters` 的误标。
 
@@ -227,7 +247,18 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 - `appearance_change` 会保留到 `appearance_changes` 历史；其中“无”“无明显变化”“无法判断”等占位文本不会覆盖已有 `description`，也不会作为 Step 9 关系分析的有效外观线索
 - `key_action` / `new_names` 中的占位文本会被过滤，避免污染角色别名和关键行为
 
-### 5.6 特殊情况
+### 5.6 临时角色收敛与正式准入
+
+LLM 返回的 `unknown_N` 会先被规范化为带 chunk 作用域的 `char_tmp_chunk_XXXX_unknown_N`，避免不同 chunk 的临时人物互相覆盖。保存正式 `characters.json` 前，`minute_chunk.py` 会基于出现场景、台词数、可见/说话共现、相邻 chunk 名称和 `character_profiles.json` 描述做二次收敛：
+
+- 能匹配到稳定 `char_XXX` 的临时身份，会统一 canonical 到该正式角色。
+- 不能匹配稳定角色但跨 chunk 证据一致的临时身份，会合并为同一个高证据临时角色。
+- 低证据 `char_tmp_chunk_*` 默认不进入正式 `characters.json` / `speaker_map.json`，但仍保留在 `character_profiles.json`、transcript 和 alignment 原始记录中，方便排查。
+- 临时角色进入正式名册的最低证据是：至少 2 个 chunk，或至少 8 个出场 shot，或至少 6 条台词。
+
+缓存命中时也会执行同一收敛逻辑，并重写 `characters.json`、`speaker_map.json`、`character_profiles.json` 和 `character_identity_links.json` 等派生产物，避免旧缓存继续污染下游。
+
+### 5.7 特殊情况
 | 情况 | 处理 |
 |------|------|
 | 无人脸片段 | ASR标注 "unknown_1" 等临时编号，视觉只分析场景 |
@@ -242,9 +273,18 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 
 利用 Step 5 回填后的 `transcripts.json`、`vision.json` 和 `characters.json` 进行分组：将连续 shots 按 30 个一段送入 LLM，聚合为叙事节拍 Beat，输出 `beats.json` 并回填 `shot.beat_index`。
 
+**输入 / 输出**：
+
+| 项 | 内容 |
+|----|------|
+| 输入 | `scenes/scenes.json`、`transcripts.json`、`vision.json`、正式 `characters.json` |
+| 输出 | `beats.json`、回写后的 `scenes/scenes.json` (`shot.beat_index`) |
+| 缓存 | `beats.json` 已存在时不调用 LLM，但仍执行 `_backfill_beat_to_shots()` |
+| 降级 | LLM 解析失败时 `_fallback_beats()` 按每 4 个 shot 一组生成默认 beat，再进入 `_finalize_beats()` |
+
 关键约束（v4.1.1 修复）：
 
-- **角色名册注入与校验**：`characters` 列表会被转成"已知角色名册"写入 prompt（`char_id: 名字 — 描述`）。LLM 在 `beat.characters` 中只能引用名册内的 ID，画面里出现但不在名册的人用 `unknown_N` 临时编号。回填时按白名单过滤，丢弃编造的 `char_` ID；当名册为空时退化为保留非空字符串（无法校验）。这避免了 beat 角色 ID 与 Step 4 face_cluster 的 `char_xxx` 体系错配。
+- **角色名册注入与校验**：`characters` 列表会被转成"已知角色名册"写入 prompt（`char_id: 名字 — 描述`）。LLM 在 `beat.characters` 中只能引用名册内的 ID，画面里出现但不在名册的人可以在描述中写成 `unknown_N`，但不能写入 `Beat.characters`。回填时按白名单过滤，丢弃编造的 `char_` ID；当名册为空时返回空角色列表。这避免了 beat 角色 ID 与 Step 4 face_cluster 的 `char_xxx` 体系错配。
 - **全覆盖 + 不重叠划分（`_finalize_beats`）**：分段 LLM 结果汇总后统一规范化——跨 beat 去重 shot（保留先出现者）、过滤越界/幻觉 shot 索引、把 LLM 漏分的 shot 按相邻关系聚合为 `transition` beat。保证每个 shot 恰好归属一个 beat，杜绝 `beat_index=None` 的孤儿镜头脱离叙事层级。
 - **beat_index 全局唯一且按时间连续**：规范化阶段按时间统一排序并重排 `beat_index` 为 `0..N-1`，忽略 LLM 返回值，防止跨段重复索引破坏 `shot → beat` 反向链接和下游 story_scene 关联。
 - **duration 采用墙钟跨度**：`beat.duration = end_time - start_time`（与 StoryScene / Chapter 统一），不再用子 shot 时长求和，避免漏分/非连续时口径漂移。
@@ -260,6 +300,15 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 **模块**：`pipeline/story_scene_detect.py`
 
 将连续 Beat 聚合为故事场景 StoryScene，输出 `story_scenes.json` 并回填 `shot.story_scene_index`。
+
+**输入 / 输出**：
+
+| 项 | 内容 |
+|----|------|
+| 输入 | `beats.json`、`scenes/scenes.json` |
+| 输出 | `story_scenes.json`、回写后的 `scenes/scenes.json` (`shot.story_scene_index`) |
+| 缓存 | `story_scenes.json` 已存在时不调用 LLM，但仍执行 `_backfill_scene_to_shots()` |
+| 降级 | LLM 解析失败时 `_fallback_story_scenes()` 按每 3 个 beat 一组生成默认 StoryScene |
 
 关键约束（v4.1.1 修复，与 Beat 对齐）：
 
@@ -278,6 +327,15 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 
 将连续 StoryScene 聚合为 Chapter（长视频大段落）。短视频（`< 600s` 或 StoryScene `≤ 3`）整体作为一个 Chapter；否则走 LLM 分组。
 
+**输入 / 输出**：
+
+| 项 | 内容 |
+|----|------|
+| 输入 | `story_scenes.json`、`beats.json`、`scenes/scenes.json`、`meta.duration` |
+| 输出 | `chapters.json` |
+| 缓存 | `chapters.json` 已存在时直接加载 |
+| 降级 | LLM 解析失败时 `_fallback_chapters()` 按每 3 个 StoryScene 一组生成默认 Chapter |
+
 关键约束（v4.1.1 修复，与 Beat / StoryScene 对齐）：
 
 - **chapter_index 本地自增**：不再信任 LLM 返回的 `chapter_index`；最终由 `_finalize_chapters` 统一重排为 `0..N-1`，避免索引碰撞破坏 `memory_builder` 按 `chapter_index` 做 key 的 chapter 单元。
@@ -293,7 +351,21 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 **模块**：`pipeline/event.py` + `pipeline/character_arc.py`
 
 合并为一步执行：先抽取事件和事件关系图，再分析人物弧线和人物关系。
-人物弧线/关系分析会读取 Step 5 的 `character_profiles.json`，补充有效别名、外观变化和关键行为；同时根据 `characters.json.appearance_scenes` 计算人物共现，作为关系推断证据。`character_arcs.json` 与 `character_relations.json` 已存在时会直接加载缓存，如需用新的关系逻辑重算，需要删除这两个文件或从 `event_and_arc` 前置步骤重新跑。
+
+**输入 / 输出**：
+
+| 项 | 内容 |
+|----|------|
+| 输入 | shots、`transcripts.json`、`vision.json`、`beats.json`、`story_scenes.json`、`chapters.json`、`characters.json`、`character_profiles.json` |
+| 输出 | `events.json`、`event_graph.json`、`character_arcs.json`、`character_relations.json`；并更新 `characters.json` 的弧线、台词数、重要性和 `key_event_indices` |
+| 事件缓存 | `events.json` + `event_graph.json` 同时存在时直接加载；只有 `events.json` 时会加载事件并补建图谱 |
+| 弧线缓存 | `character_arcs.json` + `character_relations.json` 同时存在时直接加载并回填到 characters |
+
+事件抽取按 30 分钟分段执行，但不再只看每段开头材料。Prompt 会优先输入 StoryScene / Beat 层级摘要，并对台词与画面做时间均匀采样；同时显式传入 `segment_start` / `segment_end`，要求 LLM 输出全片绝对时间。解析后会把事件时间归一化并 clamp 到当前段范围，避免后续分段的事件错误落到 0 秒附近。
+
+事件关系图不再只取 `events[:30]`，而是保留全部高重要事件，再按时间均匀补齐到固定上限。人物弧线的事件输入也改为开头/中段/结尾均匀采样，并优先保留高重要、多人物事件，减少“只看影片开头”的人物弧线偏差。
+
+人物弧线/关系分析会读取 Step 5 的 `character_profiles.json`，补充有效别名、外观变化和关键行为；同时根据 `characters.json.appearance_scenes` 计算人物共现，作为关系推断证据。`events.json`、`event_graph.json`、`character_arcs.json` 与 `character_relations.json` 已存在时会直接加载缓存，如需用新的事件/关系逻辑重算，需要删除对应文件或从 `event_and_arc` 前置步骤重新跑。
 
 ---
 
@@ -306,9 +378,40 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 2. 构建四层 VideoMemory（Shot / Beat / StoryScene / Chapter）
 3. 构建检索索引
 
+EditSignal 会覆盖全部 beat 和 story_scene；shot 级信号只覆盖代表性关键镜头，默认受 `EDIT_SIGNAL_MAX_SHOTS=240` 限制。候选来自 beat 首尾 shot、重要事件首尾/中点 shot、story_scene 首尾 shot；超过上限时按事件重要度、beat intensity 和时间覆盖裁剪。未计算 shot 信号的 MemoryUnit 保持 `edit_signal=None`，不影响 Memory 和索引构建。
+
+**输入 / 输出**：
+
+| 子步骤 | 输入 | 输出 / 行为 |
+|--------|------|-------------|
+| 10a 信号计算 | beats、story_scenes、代表性 shots、events、characters、transcripts、vision | `edit_signals.json`、`narrative_signals.json`、`recomposition_signals.json` |
+| 10b Memory 构建 | Step 1-9 散文件 + 三类信号 | `memory.json`，包含 `memory_units`、`beat_memory_units`、`scene_memory_units`、`chapter_memory_units`；同时把 `meta.status` 置为 `ready` |
+| 10c 索引构建 | `memory.json` | `index/search_index.json`、可选 `faiss.index` / `id_map.json`、`character_index.json`、`event_index.json`、`relation_index.json`、`emotion_index.json`、`edit_signal_index.json`、`audio_index.json`、`chapter_index.json` |
+
+信号缓存有升级路径：如果 `edit_signals.json` 已存在，会直接加载 EditSignal；若 `narrative_signals.json` 或 `recomposition_signals.json` 缺失，会只补算缺失类型。RecompositionSignal 只面向重要 beat 计算（`intensity >= 0.5` 或指定剧情类型），没有候选时回退到前 10 个 beat。角色业务身份判定会跳过低证据 `char_tmp_`，并在 LLM 失败时按出镜时长做默认主配角分配。
+
+**信号日志与排查**：
+
+| 日志片段 | 含义 |
+|----------|------|
+| `EditSignal start` | Step 10a 输入规模，包括 shots / beats / story_scenes / events / transcripts / vision_summaries 和 `max_shots` |
+| `EditSignal cache loaded` / `EditSignal cache is partial` | 三类信号缓存命中情况；部分缓存会只补算缺失类型 |
+| `NarrativeSignal cache empty ... recomputing` / `RecompositionSignal cache empty ... recomputing` | 对空数组缓存的自愈：当仍有可计算单元时，不把空文件当作有效完成结果 |
+| `shot级剪辑信号选择` | shot 级代表镜头选择摘要：总 shot、候选数、选中数、跳过数、上限、高重要事件数、候选来源 |
+| `EditSignal batch start/done` | beat / story_scene / shot 的每批 LLM 调用进度、unit 范围、prompt 字符数、解析数、产出数和耗时 |
+| `NarrativeSignal batch start/done` | 叙事信号每批 LLM 调用进度和耗时 |
+| `RecompositionSignal compute start` | 二创信号目标 beat 数量和来源：`important` 或 `fallback_first_10` |
+| `EditSignal complete` | Step 10a 三类信号全部结束；如果之后仍慢，通常进入 Memory 构建或索引构建 |
+
+排查 Step 10 慢时，先看 `EditSignal complete` 是否出现。若未出现，慢点在 10a 信号 LLM batch；若已出现但 Step 10 未结束，重点检查 10b Memory 构建和 10c embedding / indexer。Step 10a 不读取 shot 视频或关键帧图片，它只消费 Step 5 的文本化多模态摘要和层级结构。
+
+索引层是 final_build 的硬要求：embedding API 或 FAISS 不可用会跳过对应向量层，但 `build_search_index()` 自身抛错时 `understand.py` 会中断并抛出 `RuntimeError`，不会标记 `final_build` 完成。
+
 ---
 
-## 数据流总览
+## 产物目录数据流
+
+前面的总表展示每步输入/输出的语义关系；这里补充最终落盘目录视角，便于排查某一步是否已经产出完整散文件。
 
 ```
 video.mp4
@@ -328,7 +431,8 @@ video.mp4
    │       ├── audio_prosody.json
    │       ├── multimodal_alignments.json
    │       ├── characters.json
-   │       └── speaker_map.json
+   │       ├── speaker_map.json
+   │       └── character_identity_links.json
    │
    ├─[6]─→ beats.json
    ├─[7]─→ story_scenes.json
@@ -402,14 +506,17 @@ Step 6/7 完成后会回写 `scenes/scenes.json`，持久化 `beat_index` / `sto
 
 ## 当前实现注意事项
 
-- `face_cluster.py` 在 InsightFace 未安装时会跳过，返回空脸谱；此时 MinuteChunk prompt 会用 `unknown_1` 等临时标注，`_normalize_character_id()` 会统一将其转为 chunk 作用域的 `char_tmp_chunk_XXXX_unknown_X`，避免不同 chunk 的临时人物互相覆盖，并在 speaker、characters_present、character_updates 三个渠道保持一致。
+- `face_cluster.py` 在 InsightFace 未安装时会跳过，返回空脸谱；此时 MinuteChunk prompt 会用 `unknown_1` 等临时标注，`_normalize_character_id()` 会统一将其转为 chunk 作用域的 `char_tmp_chunk_XXXX_unknown_X`，避免不同 chunk 的临时人物互相覆盖，并在 speaker、characters_present、character_updates 三个渠道保持一致。正式写入 `characters.json` 前还会做证据阈值和 canonicalization，低证据临时角色不会进入下游正式名册。
 - `face_cluster.py` 会优先读取 `characters/face_clusters.json` 缓存。修改人脸聚类阈值后，如需重新生成角色脸谱，需要删除该缓存及对应 gallery 目录，或从 face cluster 前置步骤重新跑。
 - 人脸聚类参数以 `config.py` / `.env` 为准；修改阈值后需要清理旧 `face_clusters.json` 才会重新生成脸谱。
-- `minute_chunk.py` 的已有产物检查包含 9 个文件（含 `characters.json`, `speaker_map.json`, `multimodal_alignments.json`, `character_profiles.json`）。
+- `minute_chunk.py` 的已有产物检查包含 9 个文件（含 `characters.json`, `speaker_map.json`, `multimodal_alignments.json`, `character_profiles.json`）；缓存命中时仍会对角色身份做收敛，并重写正式角色与 speaker 映射派生产物。
 - Step 6/7 无论是新计算还是缓存加载，都会通过 `_backfill_beat_to_shots()` / `_backfill_scene_to_shots()` 回填 shot 的反向链接并持久化到 `scenes/scenes.json`。
 - Step 6/7/8 都通过 `_finalize_*` 规范化保证层级是「完整且不重叠的划分」：LLM 漏分的 shot/beat/story_scene 会被聚合成 `transition` 单元补回，索引按时间重排为连续唯一值。因此 `beats.json` / `story_scenes.json` / `chapters.json` 中可能出现 `beat_type="transition"` 或 `plot_function="transition"` 或 `chapter_type="transition"` 的兜底单元，属于预期行为。
 - Step 7/8 的 `characters` 一律从子层（beat / story_scene）聚合，不采信 LLM 返回的角色列表，以保持与 Step 4 face_cluster 的 `char_xxx` 体系一致。
 - Beat / StoryScene / Chapter 的 `duration` 统一为 `end_time - start_time`（墙钟跨度），不是子单元时长求和。
 - `utils.group_consecutive()` 是 Step 6/7/8 共用的「相邻分组」工具，用于把未覆盖的单元按序号连续性聚合为过渡单元。
+- Step 9 的事件、事件关系和人物弧线 prompt 会使用时间均匀采样与层级摘要；已有事件/关系/弧线产物仍按缓存优先读取，如需验证新采样逻辑，需要删除对应 JSON 或从 `event_and_arc` 前置步骤重跑。
+- Step 10 的 shot 级 EditSignal 是代表镜头抽样，不再默认覆盖全部 shot；可通过 `EDIT_SIGNAL_MAX_SHOTS` 调整上限。日志中的 `source_candidates` 可用于判断候选主要来自 beat 边界、story_scene 边界还是高重要事件。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和检索索引需要 `final_build` 完成后才具备。
 - Prompt 的镜头边界同时给出 `local_shot_index` 和全局 `scene_index`，并要求 `per_shot` 覆盖每个 local shot；回填时会处理两者冲突，并按整体局部/全局索引模式推断作为防御。
+- Step 6-10 不重新读取 shot 原视频；最终 `MemoryUnit` 会保留 `keyframe_path` 和 `keyframe_paths`，供后续检索、选材或展示引用关键帧。

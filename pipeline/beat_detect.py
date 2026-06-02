@@ -35,7 +35,7 @@ BEAT_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析
 {shots_info}
 
 === 已知角色名册 ===
-（characters 字段只能填写以下角色 ID；画面中出现但不在名册内的人，用 "unknown_1"/"unknown_2" 等临时编号区分，不要编造新的 char_ ID）
+（characters 字段只能填写以下角色 ID；画面中出现但不在名册内的人，不要写入 characters，可在 description 中描述，不要编造新的 char_ ID）
 {character_roster}
 
 请将这些镜头分组为若干 Beat，输出 JSON 数组。每个 Beat 包含：
@@ -52,7 +52,7 @@ BEAT_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析
 2. 当场景/话题/情绪发生明显转换时，开启新 Beat
 3. 每个 Beat 通常包含 2-8 个镜头，但不强制
 4. 所有镜头都必须被分配到某个 Beat
-5. characters 字段只能填写"已知角色名册"中的 ID；无法对应名册的人用 "unknown_N" 临时编号，不要编造新的 char_ ID
+5. characters 字段只能填写"已知角色名册"中的 ID；无法对应名册的人不要写入 characters，只在 description 中描述，不要编造新的 char_ ID
 
 只输出 JSON：
 ```json
@@ -127,7 +127,7 @@ def detect_beats(
     character_roster = (
         "\n".join(roster_lines)
         if roster_lines
-        else "（暂无已知角色，可用 unknown_1/unknown_2 临时标注）"
+        else "（暂无已知角色，characters 字段请留空）"
     )
 
     # 构建 shot → 台词/画面 的索引
@@ -201,20 +201,17 @@ def detect_beats(
                     beat_shots = [s for s in seg_shots if s.scene_index in mapped]
                     if not beat_shots:
                         continue
-                    # 校验 LLM 返回的角色 ID：有名册时只保留名册内 ID 或 unknown_N，
-                    # 无名册时保留非空字符串（无法校验），避免编造 char_ ID 污染下游。
+                    # 校验 LLM 返回的角色 ID：只保留正式名册内 ID。
+                    # unknown_N 只允许出现在描述里，不写入 Beat.characters 污染下游。
                     raw_chars = item.get("characters", []) or []
                     if valid_char_ids:
                         beat_chars = [
                             cid for cid in raw_chars
                             if isinstance(cid, str)
-                            and (cid in valid_char_ids or cid.startswith("unknown_"))
+                            and cid in valid_char_ids
                         ]
                     else:
-                        beat_chars = [
-                            cid for cid in raw_chars
-                            if isinstance(cid, str) and cid.strip()
-                        ]
+                        beat_chars = []
                     b = Beat(
                         # beat_index 临时编号，最终由 _finalize_beats 按时间统一重排
                         beat_index=beat_offset + len(beats),

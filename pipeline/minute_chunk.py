@@ -169,7 +169,10 @@ def run_minute_chunk_understand(
     # 检查是否已完成（通过回填产物判断）
     if _all_outputs_exist(video_dir):
         logger.info("分钟级融合理解结果已存在，直接加载")
-        return _load_all_outputs(video_dir)
+        outputs = _load_all_outputs(video_dir)
+        return _converge_cached_outputs(
+            video_dir, outputs, galleries=galleries, shots=shots,
+        )
 
     logger.info(f"开始分钟级融合理解: {len(shots)} 个镜头")
 
@@ -318,26 +321,25 @@ def run_minute_chunk_understand(
     all_audio.sort(key=lambda a: a.scene_index)
     all_alignments.sort(key=lambda a: a.scene_index)
 
-    # 应用已确认的角色合并（canonicalization）
+    # 应用已确认的角色合并（canonicalization），并收敛 chunk 级临时角色。
     identity_links = _apply_confirmed_merges(
         profiles, all_transcripts, all_alignments
     )
+    temp_links, formal_character_ids = _converge_temporary_characters(
+        profiles, all_transcripts, all_alignments
+    )
+    identity_links.extend(temp_links)
     if identity_links:
-        links_path = video_dir / "character_identity_links.json"
-        links_path.write_text(
-            json.dumps(identity_links, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        logger.info(f"已保存 {len(identity_links)} 条角色身份合并到 character_identity_links.json")
+        _save_identity_links(video_dir, identity_links)
 
     # 生成 speaker_map（从角色标注直接派生）
-    speaker_map = _build_speaker_map(all_transcripts)
+    speaker_map = _build_speaker_map(all_transcripts, formal_character_ids)
 
     # 保存所有产物
     _save_all_outputs(
         video_dir, all_transcripts, all_ocr, all_vision,
         all_audio, all_alignments, profiles, speaker_map, processed_chunks,
-        galleries=galleries, shots=shots,
+        galleries=galleries, shots=shots, formal_character_ids=formal_character_ids,
     )
 
     logger.info(
@@ -1077,6 +1079,9 @@ def _process_merge_suggestions(profiles, result, chunk_index):
 
 _MERGE_CONFIDENCE_THRESHOLD = 0.85
 _MERGE_MIN_CHUNK_REPORTS = 2
+_TEMP_FORMAL_MIN_CHUNKS = 2
+_TEMP_FORMAL_MIN_SCENES = 8
+_TEMP_FORMAL_MIN_DIALOGUES = 6
 
 
 def _apply_confirmed_merges(profiles, transcripts, alignments):
@@ -1197,11 +1202,275 @@ def _apply_confirmed_merges(profiles, transcripts, alignments):
 
     return identity_links
 
-def _build_speaker_map(transcripts) -> dict:
+
+def _converge_temporary_characters(profiles, transcripts, alignments):
+    """收敛 chunk 级临时角色，并给正式 characters.json 计算准入集合。
+
+    低证据 char_tmp_* 仍保留在原始 transcript/alignment/profile 产物中，
+    但不进入正式角色表和 speaker_map，避免污染下游角色名册。
+    """
+    evidence = _collect_character_evidence(profiles, transcripts, alignments)
+    stable_ids = {
+        cid for cid, p in profiles.items()
+        if not _is_temp_character_id(cid) and not p.merged_into
+    }
+    temp_ids = [
+        cid for cid, p in profiles.items()
+        if _is_temp_character_id(cid) and not p.merged_into
+    ]
+
+    mapping = {}
+    link_details = []
+    accepted_temp_primaries = set()
+
+    stable_by_signature = defaultdict(list)
+    for cid in stable_ids:
+        sig = _profile_identity_signature(profiles.get(cid))
+        if sig:
+            stable_by_signature[sig].append(cid)
+
+    for cid in temp_ids:
+        sig = _profile_identity_signature(profiles.get(cid))
+        if not sig:
+            continue
+        candidates = stable_by_signature.get(sig, [])
+        if candidates:
+            target = sorted(candidates)[0]
+            mapping[cid] = target
+            link_details.append({
+                "primary": target,
+                "duplicate": cid,
+                "reason": "临时角色与稳定角色存在一致的名称/描述线索",
+                "confidence": 0.7,
+                "source": "temporary_character_convergence",
+            })
+
+    unresolved = [cid for cid in temp_ids if cid not in mapping]
+    groups = defaultdict(list)
+    for cid in unresolved:
+        sig = _profile_identity_signature(profiles.get(cid))
+        if sig:
+            groups[sig].append(cid)
+
+    for group in groups.values():
+        chunk_ids = {
+            chunk for cid in group
+            for chunk in evidence.get(cid, {}).get("chunks", set())
+        }
+        if len(group) < 2 or len(chunk_ids) < 2:
+            continue
+        primary = max(
+            group,
+            key=lambda cid: (
+                len(evidence.get(cid, {}).get("scenes", set())),
+                evidence.get(cid, {}).get("dialogues", 0),
+                cid,
+            ),
+        )
+        accepted_temp_primaries.add(primary)
+        for cid in group:
+            if cid == primary:
+                continue
+            mapping[cid] = primary
+            link_details.append({
+                "primary": primary,
+                "duplicate": cid,
+                "reason": "跨 chunk 临时角色存在一致的名称/描述线索",
+                "confidence": 0.65,
+                "source": "temporary_character_convergence",
+            })
+
+    if mapping:
+        _apply_character_mapping(mapping, profiles, transcripts, alignments)
+        evidence = _collect_character_evidence(profiles, transcripts, alignments)
+
+    formal_ids = set()
+    for cid, p in profiles.items():
+        if p.merged_into:
+            continue
+        if (
+            cid in accepted_temp_primaries
+            or not _is_temp_character_id(cid)
+            or _temp_character_has_formal_evidence(cid, evidence.get(cid, {}))
+        ):
+            formal_ids.add(cid)
+
+    skipped = [
+        cid for cid, p in profiles.items()
+        if _is_temp_character_id(cid) and not p.merged_into and cid not in formal_ids
+    ]
+    if skipped:
+        logger.info(
+            f"低证据临时角色不写入正式角色表: {len(skipped)} 个 "
+            f"(示例: {skipped[:8]})"
+        )
+
+    return link_details, formal_ids
+
+
+def _save_identity_links(video_dir, identity_links):
+    if not identity_links:
+        return
+
+    links_path = video_dir / "character_identity_links.json"
+    existing = []
+    if links_path.exists():
+        try:
+            data = json.loads(links_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                existing = [item for item in data if isinstance(item, dict)]
+        except Exception:
+            existing = []
+
+    merged = {}
+    for item in existing + identity_links:
+        key = (
+            item.get("primary", ""),
+            item.get("duplicate", ""),
+            item.get("source", ""),
+            item.get("reason", ""),
+        )
+        if key[0] and key[1]:
+            merged[key] = item
+
+    links_path.write_text(
+        json.dumps(list(merged.values()), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info(f"已保存 {len(merged)} 条角色身份合并到 character_identity_links.json")
+
+
+def _collect_character_evidence(profiles, transcripts, alignments):
+    evidence = defaultdict(lambda: {
+        "scenes": set(),
+        "chunks": set(),
+        "dialogues": 0,
+        "visible": 0,
+        "speaking": 0,
+    })
+
+    def add_chunk(cid, chunk_idx):
+        if chunk_idx is not None:
+            evidence[cid]["chunks"].add(chunk_idx)
+
+    for t in transcripts:
+        cid = t.character_id
+        if not cid:
+            continue
+        evidence[cid]["dialogues"] += 1
+        if t.scene_index >= 0:
+            evidence[cid]["scenes"].add(t.scene_index)
+        add_chunk(cid, _temp_character_chunk_index(cid))
+
+    for al in alignments:
+        for cid in al.visible_characters:
+            evidence[cid]["visible"] += 1
+            evidence[cid]["scenes"].add(al.scene_index)
+            add_chunk(cid, _temp_character_chunk_index(cid))
+        for cid in al.speaking_characters:
+            evidence[cid]["speaking"] += 1
+            evidence[cid]["scenes"].add(al.scene_index)
+            add_chunk(cid, _temp_character_chunk_index(cid))
+
+    for cid, profile in profiles.items():
+        for item in profile.appearance_changes + profile.key_actions:
+            if isinstance(item, dict):
+                add_chunk(cid, item.get("chunk_idx"))
+
+    return evidence
+
+
+def _apply_character_mapping(mapping, profiles, transcripts, alignments):
+    def resolve(cid):
+        seen = set()
+        while cid in mapping and cid not in seen:
+            seen.add(cid)
+            cid = mapping[cid]
+        return cid
+
+    resolved = {
+        cid: resolve(target)
+        for cid, target in mapping.items()
+        if cid != resolve(target)
+    }
+    if not resolved:
+        return
+
+    for t in transcripts:
+        if t.character_id in resolved:
+            t.character_id = resolved[t.character_id]
+        if t.speaker in resolved:
+            t.speaker = resolved[t.speaker]
+
+    for al in alignments:
+        al.visible_characters = list(dict.fromkeys(
+            resolved.get(c, c) for c in al.visible_characters
+        ))
+        al.speaking_characters = list(dict.fromkeys(
+            resolved.get(c, c) for c in al.speaking_characters
+        ))
+
+    for dup, primary in resolved.items():
+        if dup in profiles:
+            profiles[dup].merged_into = primary
+
+
+def _is_temp_character_id(cid: str) -> bool:
+    return str(cid or "").startswith("char_tmp_")
+
+
+def _temp_character_chunk_index(cid: str):
+    parts = str(cid or "").split("_")
+    if len(parts) >= 4 and parts[0] == "char" and parts[1] == "tmp" and parts[2] == "chunk":
+        try:
+            return int(parts[3])
+        except ValueError:
+            return None
+    return None
+
+
+def _profile_identity_signature(profile) -> str:
+    if not profile:
+        return ""
+
+    candidates = []
+    for name in getattr(profile, "names", []) or []:
+        text = _safe_text(name)
+        if text and not text.startswith("unknown_") and not _is_placeholder_text(text):
+            candidates.append(text)
+
+    desc = _safe_text(getattr(profile, "description", ""))
+    if desc and not desc.startswith("临时标注人物") and not _is_placeholder_text(desc):
+        candidates.append(desc)
+
+    for item in (getattr(profile, "appearance_changes", []) or [])[-2:]:
+        if isinstance(item, dict):
+            text = _safe_text(item.get("description", ""))
+            if text and not _is_placeholder_text(text):
+                candidates.append(text)
+
+    if not candidates:
+        return ""
+
+    text = " ".join(candidates).lower()
+    return "".join(ch for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")[:80]
+
+
+def _temp_character_has_formal_evidence(cid: str, evidence: dict) -> bool:
+    return (
+        len(evidence.get("chunks", set())) >= _TEMP_FORMAL_MIN_CHUNKS
+        or len(evidence.get("scenes", set())) >= _TEMP_FORMAL_MIN_SCENES
+        or evidence.get("dialogues", 0) >= _TEMP_FORMAL_MIN_DIALOGUES
+    )
+
+
+def _build_speaker_map(transcripts, formal_character_ids: set[str] | None = None) -> dict:
     """从角色标注直接生成 speaker_map"""
     speaker_map = {}
     for t in transcripts:
         if t.speaker and t.character_id:
+            if formal_character_ids is not None and t.character_id not in formal_character_ids:
+                continue
             speaker_key = t.speaker
             if str(speaker_key).startswith("unknown_"):
                 speaker_key = t.character_id
@@ -1272,10 +1541,48 @@ def _load_all_outputs(video_dir):
     }
 
 
+def _converge_cached_outputs(video_dir, outputs, galleries=None, shots=None):
+    """缓存命中时也执行临时角色收敛，并回写派生产物。"""
+    profiles = outputs.get("character_profiles") or {}
+    transcripts = outputs.get("transcripts") or []
+    alignments = outputs.get("alignments") or []
+
+    if not profiles:
+        return outputs
+
+    temp_links, formal_character_ids = _converge_temporary_characters(
+        profiles, transcripts, alignments
+    )
+    if temp_links:
+        _save_identity_links(video_dir, temp_links)
+
+    speaker_map = _build_speaker_map(transcripts, formal_character_ids)
+    _save_all_outputs(
+        video_dir,
+        transcripts,
+        outputs.get("ocr_results") or [],
+        outputs.get("vision_summaries") or [],
+        outputs.get("audio_prosodies") or [],
+        alignments,
+        profiles,
+        speaker_map,
+        outputs.get("chunks") or [],
+        galleries=galleries,
+        shots=shots,
+        formal_character_ids=formal_character_ids,
+    )
+
+    outputs["character_profiles"] = profiles
+    outputs["transcripts"] = transcripts
+    outputs["alignments"] = alignments
+    outputs["speaker_map"] = speaker_map
+    return outputs
+
+
 def _save_all_outputs(
     video_dir, transcripts, ocr_results, vision_summaries,
     audio_prosodies, alignments, profiles, speaker_map, chunks,
-    galleries=None, shots=None,
+    galleries=None, shots=None, formal_character_ids=None,
 ):
     """保存所有产物"""
     def _save(filename, data_list):
@@ -1339,6 +1646,8 @@ def _save_all_outputs(
         if p.merged_into:
             continue
         resolved_cid = resolve_character_id(cid)
+        if formal_character_ids is not None and resolved_cid not in formal_character_ids:
+            continue
         appearance = sorted(char_scenes.get(resolved_cid, []))
         spans = [scene_time[i] for i in appearance if i in scene_time]
         chars.append(CharacterDeep(

@@ -84,6 +84,9 @@ FACE_DETECT_DEVICE = os.getenv("FACE_DETECT_DEVICE", "auto").lower()    # 人脸
 FACE_KEEP_PASSERBY_GALLERY = os.getenv("FACE_KEEP_PASSERBY_GALLERY", "false").lower() in ("1", "true", "yes", "on") # 是否也保存路人脸谱
 FACE_DETECT_GPU_ID = os.getenv("FACE_DETECT_GPU_ID", "auto").lower()    # auto 或指定 CUDA device id
 
+# ─── 剪辑信号参数 ─────────────────────────────────────────────
+EDIT_SIGNAL_MAX_SHOTS = int(os.getenv("EDIT_SIGNAL_MAX_SHOTS", "240"))  # shot 级剪辑信号最多计算的代表镜头数
+
 # ─── 日志配置 ─────────────────────────────────────────────────
 LOG_DIR = Path(os.getenv("LOG_DIR", str(PROJECT_ROOT / "logs")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

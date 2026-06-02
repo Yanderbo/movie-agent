@@ -98,7 +98,7 @@ Step 4 `face_cluster.py` 的主要产物，用于在 Step 5 中作为 Gemini 角
 
 ### CharacterProfile（动态角色档案）v4.1
 
-Step 5 `minute_chunk.py` 在每个 chunk 处理后逐步更新的角色档案。
+Step 5 `minute_chunk.py` 在每个 chunk 处理后逐步更新的角色档案。低证据 `char_tmp_chunk_*` 可能只保留在该中间档案和原始 transcript / alignment 中，不一定进入正式 `characters.json` / `VideoMemory.characters`。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -252,6 +252,8 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | `beat_indices` | list[int] | **v2** 关联的 Beat |
 | `story_scene_indices` | list[int] | **v2** 关联的 StoryScene |
 
+事件抽取按 30 分钟分段，但输入使用 StoryScene / Beat 摘要和时间均匀采样的台词、画面；解析后会把事件时间 clamp 到当前分段范围。
+
 ### EventEdge（事件关系边）v3 增强
 
 | 字段 | 类型 | 说明 |
@@ -311,6 +313,8 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 |------|------|------|
 | `scene_index` | int | 镜头编号 |
 | `start_time` / `end_time` | float | 时间范围 |
+| `keyframe_path` | str? | 单帧关键帧路径（兼容旧代码） |
+| `keyframe_paths` | list[str] | 多帧关键帧路径，来自 Step 3 |
 | `transcripts` | list[TranscriptSegment] | 该 shot 内的台词 |
 | `vision` | VisionSummary? | 画面摘要 |
 | `ocr` | OCRResult? | OCR 文字 |
@@ -324,6 +328,8 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | `chapter_index` | int? | **v3** 所属 Chapter |
 | `audio_prosody` | AudioProsody? | **v3** 音频韵律信息 |
 | `alignment` | MultimodalAlignment? | **v3** 多模态对齐信息 |
+
+Step 10 默认只为代表性关键 shot 计算 EditSignal；未命中的 shot 保持 `edit_signal=None` 属于预期行为。Step 6-10 不重新读取 shot 原视频，后续若需要画面文件应使用 `keyframe_paths`。
 
 ### ChapterMemoryUnit — Chapter 级记忆单元 🆕
 
@@ -353,7 +359,7 @@ v2 从 `Scene` 重命名为 `Shot`，通过 `Scene = Shot` 别名保持向后兼
 | Memory 层 | `memory_units`, `beat_memory_units`, `scene_memory_units`, `chapter_memory_units` 🆕 |
 | 兼容层 | `scenes`（= shots）|
 
-说明：`MinuteChunk`、`CharacterGallery` 和 `CharacterProfile` 是 v4.1 的中间/辅助模型，当前不会直接挂到 `VideoMemory` 顶层；它们分别持久化在 `minute_chunks.json`、`characters/face_clusters.json` 和 `character_profiles.json` 中。
+说明：`MinuteChunk`、`CharacterGallery`、`CharacterProfile` 和 `character_identity_links.json` 是 v4.1 的中间/辅助产物，当前不会直接挂到 `VideoMemory` 顶层；它们分别持久化在 `minute_chunks.json`、`characters/face_clusters.json`、`character_profiles.json` 和 `character_identity_links.json` 中。
 
 ## 向后兼容性
 
@@ -384,6 +390,7 @@ EventNode = Event   # 旧代码 import EventNode 可正常工作
 | `VideoMemory.chapters` | `[]` | v3 |
 | `VideoMemory.narrative_signals` / `recomposition_signals` | `[]` | v3 |
 | `VideoMemory.chapter_memory_units` | `[]` | v3 |
+| `MemoryUnit.keyframe_paths` | `[]` | v4.1 |
 | `MemoryUnit.chapter_index` | `None` | v3 |
 | `MemoryUnit.audio_prosody` / `alignment` | `None` | v3 |
 | `EditClip.edit_signal_ref` | `None` | v2 |

@@ -32,6 +32,20 @@ def load_memory(video_id) -> VideoMemory:
         调用 _assemble_memory() 从散文件组装
 ```
 
+### Step 10 `index/` 目录
+
+| 文件 | 来源 | 说明 |
+|------|------|------|
+| `search_index.json` | `_build_text_index()` | 文本索引，包含 shot 时间、台词、画面、事件、角色、关键词和层级索引 |
+| `faiss.index` / `id_map.json` | `_build_embedding_index()` | 可选向量索引；Embedding API 或 FAISS 不可用时跳过 |
+| `character_index.json` | `_build_character_index()` | `character_id` 到出场 shot / beat / story_scene、出场时长、角色类型的映射 |
+| `event_index.json` | `_build_event_index()` | 按 `event_type` 聚合事件，按重要性排序 |
+| `relation_index.json` | `_build_relation_index()` | 人物关系与共现镜头索引 |
+| `emotion_index.json` | `_build_emotion_index()` | 来自事件和 beat 的情绪索引 |
+| `edit_signal_index.json` | `_build_edit_signal_index()` | 各 EditSignal 维度 top 片段，以及 `suggested_usage` 反向索引 |
+| `audio_index.json` | `_build_audio_index()` | 音乐、音效、静音、语音情绪等音频标签索引 |
+| `chapter_index.json` | `_build_chapter_index()` | Chapter 到 story_scene / beat / shot、主题、角色和情绪走向的映射 |
+
 ### `_assemble_memory()` — 散文件组装
 
 当 `memory.json` 不存在时（如流水线在 Step 10 `final_build` 之前中断），从以下文件逐个加载：
@@ -44,8 +58,8 @@ def load_memory(video_id) -> VideoMemory:
 | `vision.json` | VisionSummary | v4.1 MinuteChunk 回填画面摘要 |
 | `audio_prosody.json` | AudioProsody | v4.1 MinuteChunk 回填音频韵律 |
 | `multimodal_alignments.json` | MultimodalAlignment | v4.1 MinuteChunk 回填多模态对齐 |
-| `characters.json` | CharacterDeep → Character | 先尝试 CharacterDeep |
-| `speaker_map.json` | dict | speaker → character |
+| `characters.json` | CharacterDeep → Character | 先尝试 CharacterDeep；Step 5 已过滤低证据临时角色 |
+| `speaker_map.json` | dict | speaker → character；Step 5 已同步 canonicalization |
 | `beats.json` | Beat | Shot → Beat |
 | `story_scenes.json` | StoryScene | Beat → StoryScene |
 | `chapters.json` | Chapter | StoryScene → Chapter |
@@ -60,7 +74,7 @@ def load_memory(video_id) -> VideoMemory:
 
 - 散文件组装时 **不包含 MemoryUnit / BeatMemoryUnit / SceneMemoryUnit / ChapterMemoryUnit**，这些需要 Step 10 的 `final_build` 构建。
 - 散文件组装时 **不包含 embedding 和索引文件**，这些同样由 Step 10 的 `indexer.py` 构建。
-- `minute_chunks.json`、`character_profiles.json`、`characters/face_clusters.json` 是 v4.1 的中间/辅助产物，当前 `_assemble_memory()` 不会直接挂载到 `VideoMemory` 顶层。
+- `minute_chunks.json`、`character_profiles.json`、`character_identity_links.json`、`characters/face_clusters.json` 是 v4.1 的中间/辅助产物，当前 `_assemble_memory()` 不会直接挂载到 `VideoMemory` 顶层。
 
 ---
 
@@ -127,6 +141,7 @@ os.getenv("KEY", "default")   # 环境变量优先
 | **多帧采样** | `MULTI_KEYFRAME_MAX` | 每 shot 最大采样帧数（默认6） |
 | **MinuteChunk** | `CHUNK_TARGET_DURATION`, `CHUNK_MERGE_THRESHOLD`, `CHUNK_MIN/MAX_DURATION` | v4.1: 分钟级 chunk 参数 |
 | **人脸聚类** | `FACE_GALLERY_MAX/MIN`, `FACE_CLUSTER_*`, `FACE_MIN_*`, `FACE_DETECT_*`, `FACE_REJECT_SIDE_FACE` | v4.1: 人脸检测、过滤、聚类、拆分/合并和脸谱参数 |
+| **剪辑信号** | `EDIT_SIGNAL_MAX_SHOTS` | Step 10 shot 级 EditSignal 代表镜头上限 |
 | **日志** | `LOG_DIR`, `LOG_LEVEL` | 日志存储 |
 | **路径** | `DATA_DIR`, `VIDEOS_DIR`, `EDITPLANS_DIR`, `RENDERS_DIR` | 数据目录 |
 
@@ -164,6 +179,18 @@ os.getenv("KEY", "default")   # 环境变量优先
 | `FACE_DETECT_DEVICE` | `auto` | 人脸检测设备：auto/cuda/gpu/cpu |
 | `FACE_DETECT_GPU_ID` | `auto` | 自动选择或指定 CUDA device id |
 | `FACE_KEEP_PASSERBY_GALLERY` | `false` | 是否保存路人脸谱 |
+| `EDIT_SIGNAL_MAX_SHOTS` | `240` | Step 10 shot 级 EditSignal 最多计算的代表镜头数 |
+
+Step 10a 的剪辑信号日志写入 `logs/EditSignal.log`，常用排查标签：
+
+| 日志标签 | 排查用途 |
+|----------|----------|
+| `EditSignal start` | 确认输入规模和 `EDIT_SIGNAL_MAX_SHOTS` 是否符合预期 |
+| `shot级剪辑信号选择` | 确认 shot 级信号是否被上限裁剪，以及候选来自 beat / story_scene / event 的比例 |
+| `EditSignal batch start/done` | 定位 beat、story_scene 或 shot 哪类 batch 最慢 |
+| `NarrativeSignal batch start/done` | 定位叙事信号计算耗时 |
+| `RecompositionSignal compute start` | 查看二创信号目标 beat 数和筛选来源 |
+| `EditSignal complete` | 标记 10a 结束；之后的耗时通常属于 Memory 或索引构建 |
 
 ### `init_dirs()`
 
@@ -204,6 +231,7 @@ data/
 │       ├── multimodal_alignments.json ← step 5 (回填)
 │       ├── characters.json          ← step 5 (回填)
 │       ├── speaker_map.json         ← step 5 (自动生成)
+│       ├── character_identity_links.json ← step 5 (角色身份合并记录, 可选)
 │       ├── beats.json               ← step 6
 │       ├── story_scenes.json        ← step 7
 │       ├── chapters.json            ← step 8

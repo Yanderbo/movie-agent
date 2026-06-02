@@ -91,6 +91,15 @@
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 顶层阶段输入/输出
+
+| 阶段 | 主要输入 | 主要输出 | 说明 |
+|------|----------|----------|------|
+| Understand | 用户视频、全局配置、LLM / embedding 配置 | `memory.json`、`index/`、events / characters / signals 等散文件 | 10 步理解流水线，详见 [01_pipeline_understand.md](01_pipeline_understand.md) 的阶段输入/输出总表；final_build 索引失败时不会标记完成 |
+| Search | 用户查询、`memory.json`、`index/search_index.json`、向量索引（可选） | `SearchResult[]` | 三层漏斗召回并重排，返回可引用的证据片段 |
+| Edit | 用户剪辑需求、Search 结果、VideoMemory、角色/事件/信号证据 | `EditPlan`、Reviewer 结果 | Director 生成结构化 clips，Reviewer 做规则、Grounding 和 LLM 审核 |
+| Render | `EditPlan`、原始视频 `original.*`、渲染配置 | `output.mp4` | 使用原始视频裁剪、拼接、字幕/BGM 和最终校验 |
+
 ---
 
 ## 关键设计决策
@@ -127,7 +136,7 @@ v4.1 将 v3 的 `asr_windowed`、`vision`、`audio_analysis`、`character_deep`�
 | `characters.json` / `character_profiles.json` | 动态角色档案和下游兼容人物文件 |
 | `speaker_map.json` | 从 speaker 标注直接派生的映射 |
 
-角色出场回填以视觉证据为准：`characters_present` 只表示画面中真实可见且可识别的人物，不能用台词/旁白/剧情提及来补角色。`minute_chunk.py` 在回填时会同时使用 `local_shot_index` 与全局 `scene_index` 做防御，避免局部编号和全局编号混用造成 shot 错位；角色档案会保留 `appearance_changes` 历史，但“无”“无明显变化”“无法判断”等占位文本不会覆盖已有有效描述。
+角色出场回填以视觉证据为准：`characters_present` 只表示画面中真实可见且可识别的人物，不能用台词/旁白/剧情提及来补角色。`minute_chunk.py` 在回填时会同时使用 `local_shot_index` 与全局 `scene_index` 做防御，避免局部编号和全局编号混用造成 shot 错位；角色档案会保留 `appearance_changes` 历史，但“无”“无明显变化”“无法判断”等占位文本不会覆盖已有有效描述。保存正式 `characters.json` 前还会收敛 `char_tmp_chunk_*`：能合并到稳定 `char_XXX` 或跨 chunk 临时身份的会 canonicalize，低证据临时角色只留在 profile / transcript / alignment 原始记录中，不进入下游正式名册。
 
 ### 4. 层层聚合保持不变
 
@@ -139,13 +148,19 @@ Shot → Beat → StoryScene → Chapter → EventGraph
 
 每个层级仍可形成对应的 MemoryUnit，最终服务于检索、选材和 Reviewer Grounding。
 
+EventGraph 在抽取事件时按 30 分钟分段，但输入优先使用 StoryScene / Beat 层级摘要，并对台词、画面和事件关系 prompt 做时间均匀采样，避免长视频只覆盖开头材料。
+
 ### 5. 三类信号驱动剪辑决策
 
 | 信号类型 | 说明 | 服务对象 |
 |----------|------|----------|
-| `EditSignal` | 8 维剪辑信号（hook/剧情/情绪/视觉/独立性/连续性/边界/剧透） | Director Agent 选材 |
+| `EditSignal` | 8 维剪辑信号（hook/剧情/情绪/视觉/独立性/连续性/边界/剧透）；beat / story_scene 全覆盖，shot 级按代表镜头上限计算 | Director Agent 选材 |
 | `NarrativeSignal` | 叙事弧位置/张力/信息密度/叙事功能 | 结构化叙事编排 |
 | `RecompositionSignal` | 梗潜力/情感引用/平台适配/二创格式 | 二次创作/短视频分发 |
+
+Step 10 会把三类信号、四层 MemoryUnit 和九类索引一起收口到 `memory.json` / `index/`。其中 embedding API 或 FAISS 不可用只会跳过向量索引层，文本索引和结构化索引仍会继续构建。
+
+信号计算阶段会输出细粒度可观测日志：缓存命中/部分补算、shot 候选裁剪、每类信号 batch 进度、prompt 字符数、解析数量、产出数量和耗时。`EditSignal complete` 出现前的耗时属于 10a 信号计算；之后仍停留在 Step 10 时，应排查 Memory 构建或 embedding / indexer。
 
 ### 6. 证据驱动的 EditPlan
 
@@ -166,6 +181,7 @@ Director 不允许自造片段，每个 EditClip 必须有 `evidence_refs`。Rev
 | 事件关系推理 LLM 失败 | 返回空边列表，仅保留事件节点 |
 | 人物弧线 LLM 失败 | 跳过弧线，保留基础人物信息 |
 | 剪辑信号 LLM 失败 | 跳过该批次，不阻塞流程 |
+| Embedding API / FAISS 不可用 | 跳过向量索引或 FAISS 文件，保留文本和结构化索引 |
 | LLM 审核失败 | 仅使用规则审核结果 |
 
 ### 8. 断点续跑
@@ -178,7 +194,9 @@ v4.1 通过 `_STEP_ALIASES` 映射旧步骤名：
 |--------|--------|
 | `scene_detect` | `shot_detect` |
 | `keyframe_extract` | `multi_keyframe` |
-| `asr` / `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` | `minute_chunk` |
-| `character_deep` / `character` | `face_cluster` |
-| `event_graph` / `event` / `character_arc` | `event_and_arc` |
-| `edit_signal` / `build_memory` / `indexer` | `final_build` |
+| `asr` / `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` | `multi_keyframe` |
+| `character_deep` / `character` | `multi_keyframe` |
+| `event_graph` / `event` / `character_arc` | `chapter_detect` |
+| `edit_signal` / `build_memory` / `indexer` | `event_and_arc` |
+
+旧步骤会退到合并步骤的前置阶段，而不是直接标记合并步骤完成，避免只完成旧子步骤时跳过必要的新逻辑。

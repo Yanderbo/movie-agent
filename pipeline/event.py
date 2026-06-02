@@ -10,7 +10,6 @@ v2 变更:
 """
 import json
 import time
-from pathlib import Path
 
 import config
 from models.schemas import (
@@ -22,14 +21,24 @@ from utils.logger import get_logger
 
 logger = get_logger("EventGraph")
 
+EVENT_TRANSCRIPT_SAMPLE_LIMIT = 120
+EVENT_VISION_SAMPLE_LIMIT = 90
+EVENT_BEAT_SAMPLE_LIMIT = 80
+EVENT_STORY_SCENE_SAMPLE_LIMIT = 50
+EVENT_EDGE_SAMPLE_LIMIT = 60
+
 EVENT_PROMPT_TEMPLATE = """你是一个专业的视频内容分析师。基于以下视频内容信息，提取关键事件。
 
 视频总时长: {duration:.1f} 秒
+当前分析段: {segment_start:.1f}s - {segment_end:.1f}s
 
-=== 台词（部分） ===
+=== 叙事层级摘要（优先参考） ===
+{hierarchy_text}
+
+=== 台词（按时间均匀采样） ===
 {transcripts_text}
 
-=== 画面摘要（部分） ===
+=== 画面摘要（按时间均匀采样） ===
 {vision_text}
 
 === 已识别人物 ===
@@ -39,7 +48,7 @@ EVENT_PROMPT_TEMPLATE = """你是一个专业的视频内容分析师。基于�
 
 要求：
 1. 事件按时间顺序排列
-2. 每个事件覆盖一段连续时间
+2. 每个事件覆盖一段连续时间，start_time/end_time 必须使用全片绝对时间，并落在当前分析段内
 3. 事件类型包括：开场、对话、冲突、转折、高潮、结局、日常、回忆、独白、追逐、浪漫、搞笑、悲伤、悬疑
 4. importance 用 1-10 评分，高潮和转折事件分数更高
 5. 标注涉及的人物 ID
@@ -162,9 +171,12 @@ def extract_events(
         segment_duration = 1800  # 30 分钟一段
 
         if duration <= segment_duration:
+            seg_beats = _filter_units_by_time(beats or [], 0, duration)
+            seg_story_scenes = _filter_units_by_time(story_scenes or [], 0, duration)
             evts = _extract_events_segment(
                 client, transcripts, vision_summaries, characters,
-                0, duration, duration, offset=0,
+                0, duration, duration,
+                beats=seg_beats, story_scenes=seg_story_scenes,
             )
             all_events.extend(evts)
         else:
@@ -182,10 +194,15 @@ def extract_events(
                     v for v in vision_summaries
                     if v.timestamp >= seg_start and v.timestamp < seg_end
                 ]
+                seg_beats = _filter_units_by_time(beats or [], seg_start, seg_end)
+                seg_story_scenes = _filter_units_by_time(
+                    story_scenes or [], seg_start, seg_end
+                )
 
                 evts = _extract_events_segment(
                     client, seg_trans, seg_vision, characters,
-                    seg_start, seg_end, duration, offset=0,
+                    seg_start, seg_end, duration,
+                    beats=seg_beats, story_scenes=seg_story_scenes,
                 )
                 all_events.extend(evts)
 
@@ -251,36 +268,22 @@ def _extract_events_segment(
     start: float,
     end: float,
     total_duration: float,
-    offset: float = 0,
+    beats: list[Beat] = None,
+    story_scenes: list[StoryScene] = None,
 ) -> list[Event]:
     """处理一个时间段的事件抽取"""
+    segment_duration = max(0.0, end - start)
 
-    # 构造台词文本
-    trans_lines = []
-    for t in transcripts[:100]:  # 限制长度
-        speaker = f"[{t.speaker}]" if t.speaker else ""
-        trans_lines.append(f"[{t.start_time:.1f}s-{t.end_time:.1f}s] {speaker} {t.text}")
-    transcripts_text = "\n".join(trans_lines) if trans_lines else "（无台词）"
-
-    # 构造画面摘要文本
-    vision_lines = []
-    for v in vision_summaries[:50]:  # 限制长度
-        vision_lines.append(
-            f"[{v.timestamp:.1f}s] [{v.scene_type}] [{v.mood}] {v.description}"
-        )
-    vision_text = "\n".join(vision_lines) if vision_lines else "（无画面摘要）"
-
-    # 构造人物文本
-    char_lines = []
-    for c in characters:
-        char_lines.append(
-            f"- {c.character_id} ({c.display_name}): {c.description}, "
-            f"出场 {len(c.appearance_scenes)} 个镜头"
-        )
-    characters_text = "\n".join(char_lines) if char_lines else "（未识别人物）"
+    hierarchy_text = _build_hierarchy_text(beats or [], story_scenes or [])
+    transcripts_text = _build_transcripts_text(transcripts, EVENT_TRANSCRIPT_SAMPLE_LIMIT)
+    vision_text = _build_vision_text(vision_summaries, EVENT_VISION_SAMPLE_LIMIT)
+    characters_text = _build_characters_text(characters)
 
     prompt = EVENT_PROMPT_TEMPLATE.format(
         duration=total_duration,
+        segment_start=start,
+        segment_end=end,
+        hierarchy_text=hierarchy_text,
         transcripts_text=transcripts_text,
         vision_text=vision_text,
         characters_text=characters_text,
@@ -295,10 +298,15 @@ def _extract_events_segment(
 
         events = []
         for item in parsed:
+            raw_start = _safe_float(item.get("start_time", start), start)
+            raw_end = _safe_float(item.get("end_time", raw_start), raw_start)
+            event_start, event_end = _normalize_event_span(
+                raw_start, raw_end, start, end, segment_duration
+            )
             event = Event(
                 event_index=item.get("event_index", 0),
-                start_time=float(item.get("start_time", 0)),
-                end_time=float(item.get("end_time", 0)),
+                start_time=event_start,
+                end_time=event_end,
                 event_type=item.get("event_type", ""),
                 description=item.get("description", ""),
                 characters=item.get("characters", []),
@@ -316,14 +324,149 @@ def _extract_events_segment(
         return []
 
 
+def _build_transcripts_text(
+    transcripts: list[TranscriptSegment], limit: int,
+) -> str:
+    sampled = _sample_evenly_by_time(
+        sorted(transcripts, key=lambda t: t.start_time),
+        limit,
+        lambda t: t.start_time,
+    )
+    trans_lines = []
+    for t in sampled:
+        speaker = f"[{t.speaker}]" if t.speaker else ""
+        trans_lines.append(f"[{t.start_time:.1f}s-{t.end_time:.1f}s] {speaker} {t.text}")
+    return "\n".join(trans_lines) if trans_lines else "（无台词）"
+
+
+def _build_vision_text(
+    vision_summaries: list[VisionSummary], limit: int,
+) -> str:
+    sampled = _sample_evenly_by_time(
+        sorted(vision_summaries, key=lambda v: v.timestamp),
+        limit,
+        lambda v: v.timestamp,
+    )
+    vision_lines = []
+    for v in sampled:
+        vision_lines.append(
+            f"[{v.timestamp:.1f}s] [{v.scene_type}] [{v.mood}] {v.description}"
+        )
+    return "\n".join(vision_lines) if vision_lines else "（无画面摘要）"
+
+
+def _build_hierarchy_text(
+    beats: list[Beat], story_scenes: list[StoryScene],
+) -> str:
+    lines = []
+    sampled_scenes = _sample_evenly_by_time(
+        sorted(story_scenes, key=lambda ss: ss.start_time),
+        EVENT_STORY_SCENE_SAMPLE_LIMIT,
+        lambda ss: ss.start_time,
+    )
+    if sampled_scenes:
+        lines.append("StoryScene:")
+        for ss in sampled_scenes:
+            chars = ",".join(ss.characters[:5]) if ss.characters else ""
+            lines.append(
+                f"- SS {ss.story_scene_index} [{ss.start_time:.1f}s-{ss.end_time:.1f}s] "
+                f"{ss.location} {ss.plot_function} 人物:{chars} {ss.description}"
+            )
+
+    sampled_beats = _sample_evenly_by_time(
+        sorted(beats, key=lambda b: b.start_time),
+        EVENT_BEAT_SAMPLE_LIMIT,
+        lambda b: b.start_time,
+    )
+    if sampled_beats:
+        lines.append("Beat:")
+        for b in sampled_beats:
+            chars = ",".join(b.characters[:5]) if b.characters else ""
+            lines.append(
+                f"- Beat {b.beat_index} [{b.start_time:.1f}s-{b.end_time:.1f}s] "
+                f"{b.beat_type} 情绪:{b.emotion} 强度:{b.intensity:.2f} "
+                f"人物:{chars} {b.description}"
+            )
+
+    return "\n".join(lines) if lines else "（无叙事层级摘要）"
+
+
+def _build_characters_text(characters: list[Character]) -> str:
+    char_lines = []
+    for c in characters:
+        char_lines.append(
+            f"- {c.character_id} ({c.display_name}): {c.description}, "
+            f"出场 {len(c.appearance_scenes)} 个镜头"
+        )
+    return "\n".join(char_lines) if char_lines else "（未识别人物）"
+
+
+def _filter_units_by_time(units, start: float, end: float):
+    return [
+        u for u in units
+        if getattr(u, "start_time", 0) < end and getattr(u, "end_time", 0) > start
+    ]
+
+
+def _sample_evenly_by_time(items, limit: int, time_key):
+    if not items or limit <= 0:
+        return []
+    ordered = sorted(items, key=time_key)
+    if len(ordered) <= limit:
+        return ordered
+    if limit == 1:
+        return [ordered[0]]
+    step = (len(ordered) - 1) / (limit - 1)
+    indices = []
+    seen = set()
+    for i in range(limit):
+        idx = round(i * step)
+        if idx not in seen:
+            indices.append(idx)
+            seen.add(idx)
+    return [ordered[i] for i in indices]
+
+
+def _safe_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_event_span(
+    raw_start: float, raw_end: float,
+    segment_start: float, segment_end: float, segment_duration: float,
+) -> tuple[float, float]:
+    if raw_end < raw_start:
+        raw_end = raw_start
+
+    looks_relative = (
+        segment_start > 0
+        and 0 <= raw_start <= segment_duration + 5
+        and 0 <= raw_end <= segment_duration + 5
+    )
+    if looks_relative:
+        raw_start += segment_start
+        raw_end += segment_start
+
+    event_start = min(max(raw_start, segment_start), segment_end)
+    event_end = min(max(raw_end, segment_start), segment_end)
+    if event_end <= event_start:
+        event_end = min(segment_end, event_start + 1.0)
+    return round(event_start, 3), round(event_end, 3)
+
+
 def _extract_event_edges(client, events: list[Event]) -> list[EventEdge]:
     """使用 LLM 推断事件间关系"""
     if len(events) < 2:
         return []
 
+    selected_events = _select_events_for_edge_prompt(events, EVENT_EDGE_SAMPLE_LIMIT)
+
     # 构造事件摘要
     event_lines = []
-    for e in events[:30]:  # 限制数量
+    for e in selected_events:
         event_lines.append(
             f"Event {e.event_index} [{e.start_time:.0f}s-{e.end_time:.0f}s] "
             f"[{e.event_type}] [重要性:{e.importance}] {e.description}"
@@ -363,3 +506,31 @@ def _extract_event_edges(client, events: list[Event]) -> list[EventEdge]:
     except Exception as e:
         logger.warning(f"事件关系推理失败: {e}")
         return []
+
+
+def _select_events_for_edge_prompt(events: list[Event], limit: int) -> list[Event]:
+    ordered = sorted(events, key=lambda e: e.start_time)
+    selected = []
+    seen = set()
+
+    def add(event):
+        if event.event_index in seen or len(selected) >= limit:
+            return
+        selected.append(event)
+        seen.add(event.event_index)
+
+    for event in _sample_evenly_by_time(ordered, min(20, limit), lambda e: e.start_time):
+        add(event)
+
+    priority = sorted(
+        ordered,
+        key=lambda e: (-getattr(e, "importance", 0), e.start_time),
+    )
+    for event in priority:
+        if getattr(event, "importance", 0) >= 7 or len(event.characters) >= 2:
+            add(event)
+
+    for event in _sample_evenly_by_time(ordered, limit, lambda e: e.start_time):
+        add(event)
+
+    return sorted(selected, key=lambda e: e.start_time)

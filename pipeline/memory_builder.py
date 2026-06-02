@@ -191,6 +191,9 @@ def build_memory_units(
         signal = signal_by_shot.get(si)
         audio = audio_by_scene.get(si)
         align = align_by_scene.get(si)
+        shot_keyframe_paths = list(
+            shot.keyframe_paths or ([shot.keyframe_path] if shot.keyframe_path else [])
+        )
 
         # 音频信息补充到 combined_text
         if audio:
@@ -210,6 +213,7 @@ def build_memory_units(
             end_time=shot.end_time,
             duration=shot.duration,
             keyframe_path=shot.keyframe_path,
+            keyframe_paths=shot_keyframe_paths,
             transcripts=scene_trans,
             vision=scene_vision,
             ocr=scene_ocr,
@@ -477,9 +481,23 @@ def assign_character_roles(
             if e.importance >= 7:
                 char_important_event_count[cid] += 1
 
+    role_candidates = [
+        c for c in characters
+        if not _is_low_evidence_temp_character(c, char_transcript_count)
+    ]
+    skipped_temp = len(characters) - len(role_candidates)
+    if skipped_temp:
+        logger.info(f"角色判定跳过低证据临时角色: {skipped_temp} 个")
+        role_candidate_ids = {c.character_id for c in role_candidates}
+        for c in characters:
+            if c.character_id not in role_candidate_ids and not c.role:
+                c.role = "minor"
+    if not role_candidates:
+        return characters
+
     # 构造 prompt
     char_lines = []
-    for c in characters:
+    for c in role_candidates:
         screen_pct = (c.total_screen_time / video_duration * 100) if video_duration > 0 else 0
         importance = ""
         if hasattr(c, "importance_score"):
@@ -502,7 +520,7 @@ def assign_character_roles(
         parsed = client.parse_json(response)
         if parsed and isinstance(parsed, dict):
             valid_roles = {"male_lead", "female_lead", "villain", "supporting", "minor"}
-            for c in characters:
+            for c in role_candidates:
                 role = parsed.get(c.character_id)
                 if role and role in valid_roles:
                     c.role = role
@@ -511,12 +529,22 @@ def assign_character_roles(
             logger.info(f"角色判定完成: {parsed}")
         else:
             logger.warning("角色判定 LLM 结果解析失败，使用默认角色")
-            _fallback_role_assignment(characters)
+            _fallback_role_assignment(role_candidates)
     except Exception as e:
         logger.warning(f"角色判定 LLM 调用失败: {e}，使用默认角色")
-        _fallback_role_assignment(characters)
+        _fallback_role_assignment(role_candidates)
 
     return characters
+
+
+def _is_low_evidence_temp_character(character: Character, transcript_counts) -> bool:
+    cid = getattr(character, "character_id", "")
+    if not str(cid).startswith("char_tmp_"):
+        return False
+    return (
+        len(getattr(character, "appearance_scenes", []) or []) < 8
+        and transcript_counts.get(cid, 0) < 6
+    )
 
 
 def _fallback_role_assignment(characters: list[Character]):

@@ -13,7 +13,7 @@
 | **角色脸谱优先** | Step 4 使用 InsightFace + DBSCAN 先构建 `CharacterGallery`，供后续 Gemini 识别角色身份 |
 | **MinuteChunk 融合理解** | Step 5 将连续 shot 拼接为约 2-3 分钟 chunk，一次性完成 ASR、Vision、Audio、角色标注和对齐 |
 | **多层叙事理解** | Shot → Beat → StoryScene → Chapter → EventGraph，从镜头到长视频章节全覆盖 |
-| **三类剪辑信号** | EditSignal 8 维剪辑信号 + NarrativeSignal 叙事信号 + RecompositionSignal 二创信号 |
+| **三类剪辑信号** | EditSignal 8 维剪辑信号 + NarrativeSignal 叙事信号 + RecompositionSignal 二创信号，shot 级信号按代表镜头上限计算 |
 | **多层 VideoMemory** | Shot / Beat / StoryScene / Chapter 四层 MemoryUnit，融合音频与多模态对齐结果 |
 | **九维检索索引** | 文本 + Embedding + 角色 + 事件 + 关系 + 情绪 + 剪辑信号 + 音频 + 章节 |
 | **证据驱动剪辑** | EditClip 强制引用 `evidence_refs`，可携带 EditSignal、Beat、StoryScene 等层级引用 |
@@ -76,6 +76,21 @@ Video Memory (JSON)
 | 9 | `event_and_arc` | `event.py` + `character_arc.py` | `events.json` + `event_graph.json` + `character_arcs.json` + `character_relations.json` | 事件图谱与人物弧线合并执行 |
 | 10 | `final_build` | `edit_signal.py` + `memory_builder.py` + `indexer.py` | 三类信号 + `memory.json` + `index/` | 计算剪辑信号、构建 VideoMemory 和检索索引 |
 
+### 阶段输入/输出数据流
+
+| # | 步骤 | 主要输入 | 主要输出 | 下游消费 |
+|---|------|----------|----------|----------|
+| 1 | `ingest` | 用户视频路径、压缩配置 | `original.*`、按需 `compressed.mp4`、`meta.json` | Step 2-5 使用 `meta.storage_path`；渲染使用 `original.*` |
+| 2 | `shot_detect` | `meta.storage_path` | `scenes/scenes.json` | Step 3-10 的时间轴锚点 |
+| 3 | `multi_keyframe` | `meta.storage_path`、`scenes/scenes.json` | `scenes/keyframes/`、shot keyframe 路径 | Step 4 脸谱构建；后续 RAG / 索引可引用 |
+| 4 | `face_cluster` | keyframes、shots、人脸聚类配置 | `characters/face_clusters.json`、`char_XXX_gallery/` | Step 5 角色身份先验 |
+| 5 | `minute_chunk` | `meta.storage_path`、shots、角色脸谱、前序角色档案 | `minute_chunks.json`、`transcripts.json`、`vision.json`、`ocr.json`、`audio_prosody.json`、`multimodal_alignments.json`、`characters.json`、`speaker_map.json`、可选 `character_identity_links.json` | Step 6-10 的多模态基础数据 |
+| 6 | `beat_detect` | shots、transcripts、vision、characters | `beats.json`、回写 `shot.beat_index` | Step 7、Step 9、Step 10；缓存命中也会回填 |
+| 7 | `story_scene_detect` | beats、shots、多模态摘要 | `story_scenes.json`、回写 `shot.story_scene_index` | Step 8、Step 9、Step 10；缓存命中也会回填 |
+| 8 | `chapter_detect` | story_scenes、beats、shots | `chapters.json` | Step 9、Step 10 |
+| 9 | `event_and_arc` | shots、transcripts、vision、beats、story_scenes、chapters、characters、character_profiles | `events.json`、`event_graph.json`、`character_arcs.json`、`character_relations.json`，并更新 `characters.json` 的弧线/重要性字段 | Step 10、Director / Reviewer |
+| 10 | `final_build` | Step 1-9 全量散文件 | `edit_signals.json`、`narrative_signals.json`、`recomposition_signals.json`、`memory.json`、`index/` | Search、Director、Reviewer；索引失败会中断该步 |
+
 ### v3 → v4.1 步骤对比
 
 | v3 (17步) | v4.1 (10步) | 说明 |
@@ -128,7 +143,8 @@ video.mp4
    │       ├── audio_prosody.json
    │       ├── multimodal_alignments.json
    │       ├── characters.json
-   │       └── speaker_map.json
+   │       ├── speaker_map.json
+   │       └── character_identity_links.json
    │
    ├─[6]─→ beats.json
    ├─[7]─→ story_scenes.json
@@ -154,13 +170,17 @@ video.mp4
 
 角色回填采用保守策略：`characters_present` 只代表画面中真实可见且有足够视觉证据识别的人物；仅在台词、旁白或剧情中被提到的人物不会写入 `visible_characters`。回填时会同时检查 `local_shot_index` 和全局 `scene_index`，降低 LLM 把局部编号/全局编号混用导致的 shot 错位风险；如果模型漏掉某些 shot，会写入占位 `vision` / `ocr` / `audio` / `multimodal_alignment`，避免散文件断档。角色档案会保留 `appearance_changes` 历史，但“无”“无明显变化”“无法判断”等占位文本不会覆盖已有有效描述。
 
+保存 `characters.json` 前会对 `char_tmp_chunk_*` 做临时角色收敛：优先按出现场景、台词、可见/说话共现和档案描述合并到稳定 `char_XXX`，其次合并跨 chunk 临时身份；低证据临时角色不进入正式 `characters.json` / `speaker_map.json`，但仍保留在 `character_profiles.json` 和原始 transcript / alignment 记录中，便于排查。
+
 ---
 
 ## 三类剪辑信号
 
 ### EditSignal（剪辑信号）
 
-为 beat / story_scene / 重要 shot 计算 8 个面向剪辑决策的信号：
+为全部 beat / story_scene 和代表性重要 shot 计算 8 个面向剪辑决策的信号。shot 级信号默认最多计算 `EDIT_SIGNAL_MAX_SHOTS=240` 个候选镜头；未被选中的 shot 在 MemoryUnit 中保持 `edit_signal=None`，不影响索引构建。
+
+Step 10 会为信号计算输出可观测日志：入口规模、缓存命中/部分补算、shot 候选来源、每类信号的 batch 进度、prompt 字符数、解析数量、产出数量和耗时。若 `edit_signals.json` 已存在但 `narrative_signals.json` / `recomposition_signals.json` 缺失或为空，且当前仍有可计算单元，会自动补算对应类型。
 
 | 信号 | 含义 | 用途举例 |
 |------|------|---------|
@@ -201,7 +221,7 @@ Layer 3: LLM Reranker
 SearchResult top-k
 ```
 
-`pipeline/indexer.py` 会在 Step 10 产出文本、向量、角色、事件、关系、情绪、剪辑信号、音频、章节等索引；当前 `memory/search.py` 主链路主要消费文本索引、向量索引和 VideoMemory 中的台词/画面/事件数据。
+`pipeline/indexer.py` 会在 Step 10 产出文本、向量、角色、事件、关系、情绪、剪辑信号、音频、章节等索引：`search_index.json`、可选 `faiss.index` / `id_map.json`、`character_index.json`、`event_index.json`、`relation_index.json`、`emotion_index.json`、`edit_signal_index.json`、`audio_index.json`、`chapter_index.json`。当前 `memory/search.py` 主链路主要消费文本索引、向量索引和 VideoMemory 中的台词/画面/事件数据。
 
 ---
 
@@ -214,6 +234,8 @@ SearchResult top-k
   "scene_index": 5,
   "start_time": 120.0,
   "end_time": 135.5,
+  "keyframe_path": "scenes/keyframes/shot_0005_00.jpg",
+  "keyframe_paths": ["scenes/keyframes/shot_0005_00.jpg", "scenes/keyframes/shot_0005_01.jpg"],
   "beat_index": 3,
   "story_scene_index": 1,
   "chapter_index": 0,
@@ -354,6 +376,7 @@ python main.py understand --video-id xxx --resume
 | `FACE_PASSERBY_MIN` | `3` | 低于此出场次数视为路人 |
 | `FACE_DETECT_DEVICE` | `auto` | InsightFace 推理设备：`auto` 优先 CUDA，`cuda` 指定 GPU，`cpu` 强制 CPU |
 | `FACE_DETECT_GPU_ID` | `auto` | InsightFace 使用的 CUDA 设备；`auto` 选择显存占用最低的 GPU，也可指定 `0`-`7` |
+| `EDIT_SIGNAL_MAX_SHOTS` | `240` | Step 10 shot 级 EditSignal 最多计算的代表镜头数 |
 | `DATA_DIR` | `./data` | 数据存储根目录 |
 
 ---
@@ -361,17 +384,22 @@ python main.py understand --video-id xxx --resume
 ## 当前实现注意事项
 
 - `understand --resume --video-id xxx` 依赖 `progress.json` 判断断点；如果进度文件缺失，当前代码不会自动从散文件推断完成步骤。
-- v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 映射到 `minute_chunk`，`edit_signal` / `build_memory` / `indexer` 映射到 `final_build`。
+- v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新链路的前置步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 退到 `multi_keyframe`，`event_graph` / `character_arc` 退到 `chapter_detect`，`edit_signal` / `build_memory` / `indexer` 退到 `event_and_arc`，确保合并步骤完整重跑。
 - Step 5 会保存 `MinuteChunk.suggested_beats`，但当前 `beat_detect.py` 主流程仍基于回填后的台词、画面和人物信息重新让 LLM 分组；`suggested_beats` 更像后续优化入口。
-- Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验（仅保留名册内 ID 或 `unknown_N`），避免编造与 face_cluster `char_xxx` 体系不一致的角色 ID；`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）。
+- Step 5 会在保存正式 `characters.json` 前收敛 `char_tmp_chunk_*`：能合并到稳定角色或跨 chunk 临时角色的会统一 canonical ID；低证据临时角色只留在原始档案、台词和对齐记录中，不污染正式名册。缓存命中时也会执行同一收敛逻辑并重写派生产物。
+- Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验：只保留正式名册内 ID，`unknown_N` 只能作为局部文字描述，不写入 `Beat.characters`；名册为空时返回空角色列表。`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）。
 - Step 6/7/8（`beat_detect` / `story_scene_detect` / `chapter_detect`）统一通过 `_finalize_*` 规范化保证每一层都是「完整且不重叠的划分」：LLM 漏分的 shot / beat / story_scene 会被聚合为 `transition` 过渡单元补回，`beat_index` / `story_scene_index` / `chapter_index` 一律由本地计数器按时间重排为连续唯一值（不信任 LLM 返回的索引，避免重复/跳号污染下游按索引做 key 的 MemoryUnit 和信号映射）。因此结果文件中可能出现 `transition` 类型的兜底单元，属于预期行为。
 - Step 7/8 的 `characters` 一律从子层（beat / story_scene）聚合而来，不采信 LLM 返回的角色列表，从而把 Step 6 的角色白名单一致性贯穿到 StoryScene 与 Chapter。
 - Beat / StoryScene / Chapter 的 `duration` 统一为 `end_time - start_time`（墙钟跨度）；Step 7 对 beats 按 40 个一窗分段调用 LLM，避免长视频单次 prompt 过长导致尾部 beat 被截断丢失。
 - Step 5 的 `characters.json.appearance_scenes` 来自 Gemini 回填的可见角色和 Step 4 gallery 出场镜头的合并。调试角色出场异常时，应优先检查 `multimodal_alignments.json.visible_characters` 是否被误标。
-- Step 9 的人物关系分析会读取 `character_profiles.json` 的有效别名、外观变化和关键行为，并根据 `characters.json.appearance_scenes` 计算共现；如果 `character_arcs.json` / `character_relations.json` 已存在，会直接加载缓存，不会自动重算。
+- Step 9 的事件抽取按 30 分钟分段执行，但 prompt 优先使用 StoryScene / Beat 层级摘要，并对台词与画面做时间均匀采样；事件时间会按分段绝对时间归一化并 clamp 到当前段，避免长片后半段事件落回 0 秒附近。事件关系和人物弧线也会保留高重要事件并做全片均匀覆盖，而不是只看开头事件。
+- Step 9 的人物关系分析会读取 `character_profiles.json` 的有效别名、外观变化和关键行为，并根据 `characters.json.appearance_scenes` 计算共现；如果 `events.json` / `event_graph.json` / `character_arcs.json` / `character_relations.json` 已存在，会直接加载缓存，不会自动重算。
 - `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；InsightFace 默认 `FACE_DETECT_DEVICE=auto`，检测到 `CUDAExecutionProvider` 时使用 GPU，`FACE_DETECT_GPU_ID=auto` 会选择显存占用最低的 CUDA 设备，否则回退 CPU。
 - Step 4 的人脸聚类是传统视觉模型的身份先验：会保守拆分混簇、合并高相似碎簇，并过滤小脸/侧脸，但仍可能把同一个人物拆成多个 gallery。跨 gallery 的语义归并留给后续大模型理解阶段基于剧情、台词和外观证据处理，当前不在 `face_cluster` 中实现。
+- Step 10 的 EditSignal 会覆盖全部 beat / story_scene，但 shot 级只覆盖代表性关键镜头，默认受 `EDIT_SIGNAL_MAX_SHOTS=240` 限制，并在日志中输出总 shot、候选 shot、最终 shot、跳过数量、候选来源、batch 进度和耗时。
+- Step 10 会构建四层 MemoryUnit 并把 `meta.status` 置为 `ready`；`edit_signals.json` 已存在时仍会补算缺失的 `narrative_signals.json` / `recomposition_signals.json`。Embedding API 或 FAISS 不可用只跳过向量层，但索引构建整体失败会阻止 `final_build` 标记完成。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和索引要等 `final_build` 完成后才会出现在 `memory.json` / `index/`。
+- Step 6-10 不重新读取 shot 原视频；如需引用画面，使用 Step 3 写入的 `Shot.keyframe_paths`。Step 10 会把 `keyframe_path` / `keyframe_paths` 一并写入 shot 级 MemoryUnit。
 
 ---
 

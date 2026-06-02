@@ -233,23 +233,57 @@ def _build_cooccurrence_info(characters: list[CharacterDeep], limit=40) -> str:
 
 
 def _select_events_for_prompt(events: list[Event], limit=60) -> list[Event]:
+    if not events or limit <= 0:
+        return []
+
+    ordered = sorted(events, key=lambda e: e.start_time)
     selected = []
     seen = set()
 
     def add(event):
-        if event.event_index in seen:
+        if event.event_index in seen or len(selected) >= limit:
             return
         selected.append(event)
         seen.add(event.event_index)
 
-    for event in events[:20]:
+    # 先保留全片时间轴覆盖，再用高重要/多人物事件补强，避免只看开头。
+    timeline_slots = min(max(12, limit // 3), limit, len(ordered))
+    for event in _sample_events_evenly(ordered, timeline_slots):
         add(event)
-    for event in events:
+
+    priority = sorted(
+        ordered,
+        key=lambda e: (-getattr(e, "importance", 0), -len(e.characters), e.start_time),
+    )
+    for event in priority:
         if getattr(event, "importance", 0) >= 7 or len(event.characters) >= 2:
             add(event)
 
+    for event in _sample_events_evenly(ordered, limit):
+        add(event)
+
     selected.sort(key=lambda e: e.start_time)
-    return selected[:limit]
+    return selected
+
+
+def _sample_events_evenly(events: list[Event], limit: int) -> list[Event]:
+    if not events or limit <= 0:
+        return []
+    if len(events) <= limit:
+        return list(events)
+    if limit == 1:
+        return [events[0]]
+
+    step = (len(events) - 1) / (limit - 1)
+    sampled = []
+    seen = set()
+    for i in range(limit):
+        idx = round(i * step)
+        if idx in seen:
+            continue
+        sampled.append(events[idx])
+        seen.add(idx)
+    return sampled
 
 
 def analyze_character_arcs(
