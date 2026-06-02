@@ -219,6 +219,8 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 
 说明：Step 3 的关键帧不作为 MinuteChunk Gemini 输入；关键帧主要用于 Step 4 脸谱构建，以及后续多模态 RAG / 索引使用。
 
+调用容错：`minute_chunk.py` 会先用通用增强 JSON 解析器处理 Gemini 响应，支持代码围栏未闭合或 JSON 后带说明文字的情况。解析失败时，会用相同调用再重试一次；只有两次都失败时才跳过该 chunk，并由后续占位逻辑补齐未覆盖 shot。
+
 ### 5.3 Gemini 一次性输出
 - **A. ASR 转录** — 逐句，已用角色ID标注说话人
 - **B. 逐 shot 画面分析** — description/objects/mood/camera/OCR
@@ -498,6 +500,8 @@ video.mp4
 
 恢复逻辑将旧子步骤映射到合并步骤的**前置步骤**，而非合并步骤本身，避免部分完成被误判为全部完成。
 当所有步骤标记完成时，还会验证关键产物（`memory.json` 与 `index/search_index.json`）是否存在。
+
+调试时可使用 `python main.py understand --video movie.mp4 --until-step 5` 或 `--until-step minute_chunk`，流水线会在指定步骤完成并写入 `progress.json` 后停止。该限制不会标记后续步骤完成；下一次使用 `--resume` 会从第一个未完成步骤继续执行。
 
 Step 6/7 完成后会回写 `scenes/scenes.json`，持久化 `beat_index` / `story_scene_index` 反向链接。
 `_load_shots()` 加载时还会从 `beats.json` / `story_scenes.json` 防御性重建这些链接。

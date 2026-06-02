@@ -69,6 +69,7 @@ def run_understand(
     video_path: str = None,
     video_id: str = None,
     resume: bool = False,
+    until_step: int | str = None,
 ) -> str:
     """
     运行视频理解全流程（v4.1）。
@@ -77,11 +78,19 @@ def run_understand(
         video_path: 视频文件路径（新视频）
         video_id: 视频 ID（用于 resume）
         resume: 是否从断点继续
+        until_step: 调试限制。完成指定步骤后停止；可传 1-10 或 STEPS 中的步骤名。
 
     Returns:
         video_id
     """
     config.init_dirs()
+    total_steps = len(STEPS)
+    until_step_index = _resolve_until_step(until_step)
+    if until_step_index is not None:
+        logger.info(
+            f"调试限制: 将在步骤 {until_step_index + 1}/{total_steps} "
+            f"{STEPS[until_step_index]} 完成后停止"
+        )
 
     # 确定从哪一步开始
     start_step = 0
@@ -97,6 +106,12 @@ def run_understand(
                 start_step = i
                 break
         else:
+            if until_step_index is not None and until_step_index < len(STEPS) - 1:
+                logger.info(
+                    f"调试限制已满足: 已完成到步骤 {until_step_index + 1}/{total_steps} "
+                    f"{STEPS[until_step_index]}"
+                )
+                return video_id
             # 验证关键产物是否存在
             video_dir = config.VIDEOS_DIR / video_id
             critical_paths = [
@@ -113,11 +128,16 @@ def run_understand(
             else:
                 logger.info(f"视频 {video_id} 所有步骤已完成")
                 return video_id
+        if until_step_index is not None and start_step > until_step_index:
+            logger.info(
+                f"调试限制已满足: 下一步为 {start_step + 1}/{total_steps} "
+                f"{STEPS[start_step]}，已超过限制步骤 "
+                f"{until_step_index + 1}/{total_steps} {STEPS[until_step_index]}"
+            )
+            return video_id
         logger.info(f"从步骤 {STEPS[start_step]} 继续 (已完成: {completed})")
     elif not video_path:
         raise ValueError("必须提供 --video 或 --video-id + --resume")
-
-    total_steps = len(STEPS)
 
     # ═══ Step 1: Ingest（入库 + 压缩）═══
     if start_step <= 0:
@@ -128,6 +148,9 @@ def run_understand(
         meta = ingest_video(video_path, video_id)
         video_id = meta.video_id
         _save_progress(video_id, "ingest")
+        if _should_stop_after(0, until_step_index):
+            _log_until_step_stop(video_id, 0, total_steps)
+            return video_id
 
     if meta is None:
         meta = load_meta(video_id)
@@ -140,6 +163,9 @@ def run_understand(
         from pipeline.scene_detect import detect_scenes
         shots = detect_scenes(meta.storage_path, video_id)
         _save_progress(video_id, "shot_detect")
+        if _should_stop_after(1, until_step_index):
+            _log_until_step_stop(video_id, 1, total_steps)
+            return video_id
     else:
         shots = _load_shots(video_id)
 
@@ -151,6 +177,9 @@ def run_understand(
         from pipeline.keyframe import extract_multi_keyframes
         shots = extract_multi_keyframes(meta.storage_path, video_id, shots)
         _save_progress(video_id, "multi_keyframe")
+        if _should_stop_after(2, until_step_index):
+            _log_until_step_stop(video_id, 2, total_steps)
+            return video_id
 
     # ═══ Step 4: Face Cluster（人脸聚类 + 角色脸谱）═══
     if start_step <= 3:
@@ -160,6 +189,9 @@ def run_understand(
         from pipeline.face_cluster import cluster_faces
         galleries = cluster_faces(video_id, shots)
         _save_progress(video_id, "face_cluster")
+        if _should_stop_after(3, until_step_index):
+            _log_until_step_stop(video_id, 3, total_steps)
+            return video_id
     else:
         galleries = _load_galleries(video_id)
 
@@ -180,6 +212,9 @@ def run_understand(
         characters = _load_cached("characters", video_id)
         speaker_map = chunk_outputs["speaker_map"]
         _save_progress(video_id, "minute_chunk")
+        if _should_stop_after(4, until_step_index):
+            _log_until_step_stop(video_id, 4, total_steps)
+            return video_id
     else:
         transcripts = _load_cached("transcripts", video_id)
         ocr_results = _load_cached("ocr", video_id)
@@ -197,6 +232,9 @@ def run_understand(
         from pipeline.beat_detect import detect_beats
         beats = detect_beats(video_id, shots, transcripts, vision_summaries, characters)
         _save_progress(video_id, "beat_detect")
+        if _should_stop_after(5, until_step_index):
+            _log_until_step_stop(video_id, 5, total_steps)
+            return video_id
     else:
         # 缓存分支同样走幂等的 detect_beats：命中 beats.json 时不调用 LLM，
         # 但会回填 shot.beat_index，保持与新建分支一致的反向链接。
@@ -211,6 +249,9 @@ def run_understand(
         from pipeline.story_scene_detect import detect_story_scenes
         story_scenes = detect_story_scenes(video_id, shots, beats)
         _save_progress(video_id, "story_scene_detect")
+        if _should_stop_after(6, until_step_index):
+            _log_until_step_stop(video_id, 6, total_steps)
+            return video_id
     else:
         story_scenes = _load_cached("story_scenes", video_id)
 
@@ -224,6 +265,9 @@ def run_understand(
             video_id, story_scenes, beats, shots, meta.duration,
         )
         _save_progress(video_id, "chapter_detect")
+        if _should_stop_after(7, until_step_index):
+            _log_until_step_stop(video_id, 7, total_steps)
+            return video_id
     else:
         chapters = _load_cached("chapters", video_id)
 
@@ -245,6 +289,9 @@ def run_understand(
             video_id, characters, events, beats, transcripts, meta.duration
         )
         _save_progress(video_id, "event_and_arc")
+        if _should_stop_after(8, until_step_index):
+            _log_until_step_stop(video_id, 8, total_steps)
+            return video_id
     else:
         events = _load_cached("events", video_id)
         event_graph = _load_event_graph(video_id)
@@ -354,6 +401,52 @@ def run_understand(
 
 
 # ─── 进度管理 ──────────────────────────────────────────────
+
+def _resolve_until_step(until_step) -> int | None:
+    """将调试停止步骤解析为 0-based STEPS 索引。"""
+    if until_step is None:
+        return None
+
+    if isinstance(until_step, str):
+        raw = until_step.strip()
+        if not raw:
+            return None
+        if raw in STEPS:
+            return STEPS.index(raw)
+        try:
+            value = int(raw)
+        except ValueError as e:
+            raise ValueError(
+                "--until-step 必须是 1-10 或步骤名: "
+                + ", ".join(STEPS)
+            ) from e
+    else:
+        value = int(until_step)
+
+    if value < 1 or value > len(STEPS):
+        raise ValueError(
+            f"--until-step 必须在 1-{len(STEPS)} 之间，或使用步骤名: "
+            + ", ".join(STEPS)
+        )
+    return value - 1
+
+
+def _should_stop_after(step_index: int, until_step_index: int | None) -> bool:
+    return (
+        until_step_index is not None
+        and step_index >= until_step_index
+        and step_index < len(STEPS) - 1
+    )
+
+
+def _log_until_step_stop(video_id: str, step_index: int, total_steps: int):
+    logger.info("=" * 50)
+    logger.info(
+        f"调试限制触发: 已完成步骤 {step_index + 1}/{total_steps} "
+        f"{STEPS[step_index]}，停止 understand。video_id={video_id}"
+    )
+    logger.info("=" * 50)
+
 
 def _load_progress(video_id: str) -> dict:
     """加载处理进度"""

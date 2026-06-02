@@ -96,6 +96,7 @@ def load_memory(video_id) -> VideoMemory:
 ```bash
 # 理解视频（10步 v4.1）
 python main.py understand --video movie.mp4
+python main.py understand --video movie.mp4 --until-step 5  # 调试：完成 Step 5 后停止
 python main.py understand --video-id xxx --resume   # 断点续跑（兼容旧进度）
 
 # 搜索

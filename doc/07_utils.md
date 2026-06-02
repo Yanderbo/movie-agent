@@ -54,9 +54,11 @@ def get_llm_client() -> LLMClient
 ### `parse_json()` 的处理
 
 1. 尝试直接 `json.loads(response)`
-2. 失败则用正则提取 ` ```json ... ``` ` 代码块
-3. 再失败则查找第一个 `{` 或 `[` 到最后一个 `}` 或 `]` 的子串
-4. 仍然失败返回 `None`
+2. 失败则提取 markdown 代码块，支持 ` ```json ... ``` `、普通代码块以及缺少结束围栏的响应
+3. 再失败则从响应中第一个 `{` 或 `[` 起用 `JSONDecoder.raw_decode()` 解析，可忽略 JSON 后面的说明文字
+4. 只接受顶层 `dict` / `list`，仍然失败返回 `None`
+
+调用方可传入 `log_failure=False` 暂缓失败日志，适用于外层会立即重试的场景；默认仍会在最终解析失败时记录错误。
 
 ### Embedding API
 

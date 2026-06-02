@@ -172,7 +172,7 @@ Director 不允许自造片段，每个 EditClip 必须有 `evidence_refs`。Rev
 |------|----------|
 | 视频不需要压缩 | 直接使用原始视频作为 `storage_path` |
 | InsightFace 未安装 | `face_cluster` 返回空脸谱，MinuteChunk 自行识别角色 |
-| MinuteChunk 单个 chunk 解析失败 | 跳过该 chunk，后续为未覆盖 shot 补空 Vision/OCR/Audio |
+| MinuteChunk 单个 chunk 解析失败 | 先尝试增强 JSON 解析；解析仍失败时用相同调用重试一次，仍失败则跳过该 chunk，后续为未覆盖 shot 补空 Vision/OCR/Audio |
 | FAISS 不可用 | 跳过 Embedding 检索层 |
 | Embedding API 不可用 | 跳过向量索引 |
 | Beat 检测 LLM 失败 | 每 4 个 shot 一组默认分组 |

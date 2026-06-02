@@ -28,6 +28,7 @@ def cmd_understand(args):
         video_path=args.video,
         video_id=args.video_id,
         resume=args.resume,
+        until_step=args.until_step,
     )
 
 
@@ -134,6 +135,11 @@ def main():
     p_understand.add_argument("--video", type=str, help="视频文件路径")
     p_understand.add_argument("--video-id", type=str, help="视频 ID（用于 resume）")
     p_understand.add_argument("--resume", action="store_true", help="从断点继续")
+    p_understand.add_argument(
+        "--until-step",
+        type=str,
+        help="调试用：完成指定 understand 步骤后停止，可填 1-10 或步骤名",
+    )
     p_understand.set_defaults(func=cmd_understand)
 
     # ─── search ───

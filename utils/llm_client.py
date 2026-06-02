@@ -367,31 +367,63 @@ class LLMClient:
     # ─── JSON 解析 ────────────────────────────────────────────
 
     @staticmethod
-    def parse_json(content: str) -> dict | list | None:
+    def parse_json(content: str, log_failure: bool = True) -> dict | list | None:
         """从 LLM 响应中解析 JSON，支持 markdown 代码块包裹"""
         if not content:
             return None
 
-        patterns = [
-            r'```json\s*([\s\S]*?)\s*```',
-            r'```\s*([\s\S]*?)\s*```',
-            r'(\[[\s\S]*\])',
-            r'(\{[\s\S]*\})',
-        ]
+        text = content.strip().lstrip("\ufeff")
+        candidates = [text]
 
-        for pattern in patterns:
-            match = re.search(pattern, content)
-            if match:
-                try:
-                    return json.loads(match.group(1).strip())
-                except json.JSONDecodeError:
-                    continue
+        for match in re.finditer(
+            r'```(?:json)?\s*([\s\S]*?)(?:```|$)',
+            text,
+            flags=re.IGNORECASE,
+        ):
+            block = match.group(1).strip()
+            if block:
+                candidates.append(block)
+
+        start = LLMClient._first_json_start(text)
+        if start is not None:
+            candidates.append(text[start:])
+
+        seen = set()
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            parsed = LLMClient._try_parse_json_candidate(candidate)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+
+        if log_failure:
+            logger.error(f"无法解析 JSON: {content[:200]}...")
+        return None
+
+    @staticmethod
+    def _try_parse_json_candidate(candidate: str) -> dict | list | None:
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, (dict, list)) else None
+        except json.JSONDecodeError:
+            pass
+
+        start = LLMClient._first_json_start(candidate)
+        if start is None:
+            return None
 
         try:
-            return json.loads(content.strip())
+            parsed, _ = json.JSONDecoder().raw_decode(candidate[start:])
         except json.JSONDecodeError:
-            logger.error(f"无法解析 JSON: {content[:200]}...")
             return None
+        return parsed if isinstance(parsed, (dict, list)) else None
+
+    @staticmethod
+    def _first_json_start(text: str) -> int | None:
+        starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+        return min(starts) if starts else None
 
 
 # ─── 全局单例 ─────────────────────────────────────────────────

@@ -557,19 +557,46 @@ def _build_prompt(chunk, chunk_shots, profiles, gallery_records):
 
 def _call_gemini_structured(client, content_parts) -> dict | None:
     """使用结构化 content（text-media 交错）调用 Gemini"""
-    try:
-        response = client.chat_with_labeled_media(
-            content_parts=content_parts,
-            temperature=0.2,
-        )
-        parsed = client.parse_json(response)
-        if parsed and isinstance(parsed, dict):
+    for attempt_no in range(1, 3):
+        try:
+            response = client.chat_with_labeled_media(
+                content_parts=content_parts,
+                temperature=0.2,
+            )
+        except Exception as e:
+            logger.error(f"Gemini 调用失败: {e}")
+            return None
+
+        parsed = client.parse_json(response, log_failure=(attempt_no == 2))
+        if _is_valid_chunk_result(parsed):
+            if attempt_no > 1:
+                logger.info("Gemini 响应解析重试成功")
             return parsed
-        logger.warning("Gemini 响应解析失败")
-        return None
-    except Exception as e:
-        logger.error(f"Gemini 调用失败: {e}")
-        return None
+
+        if attempt_no == 1:
+            logger.warning(
+                f"Gemini 响应解析失败 (1/2, chars={len(response or '')})，重试一次"
+            )
+            continue
+
+        logger.warning(
+            f"Gemini 响应解析失败 (2/2, chars={len(response or '')})"
+        )
+
+    return None
+
+
+def _is_valid_chunk_result(parsed) -> bool:
+    """确认解析结果像 MinuteChunk 顶层结果，而不是截断文本里的子对象。"""
+    if not isinstance(parsed, dict):
+        return False
+    expected_keys = {
+        "transcripts",
+        "per_shot",
+        "character_updates",
+        "cross_shot",
+    }
+    return any(key in parsed for key in expected_keys)
 
 
 def _normalize_character_id(raw_id: str, profiles: dict, chunk_index: int = -1) -> str | None:

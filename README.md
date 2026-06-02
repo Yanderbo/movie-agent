@@ -340,6 +340,7 @@ python main.py auto --video movie.mp4 --prompt "制作一个3分钟的精彩片�
 
 # 分步执行
 python main.py understand --video movie.mp4              # 理解视频（10步 v4.1）
+python main.py understand --video movie.mp4 --until-step 5  # 调试：跑到 Step 5 后停止
 python main.py search --video-id xxx --query "打斗场面"  # 搜索
 python main.py edit --video-id xxx --prompt "爱情线剪辑" # 生成 EditPlan
 python main.py render --plan-id plan_xxx                 # 渲染成片
@@ -386,6 +387,7 @@ python main.py understand --video-id xxx --resume
 - `understand --resume --video-id xxx` 依赖 `progress.json` 判断断点；如果进度文件缺失，当前代码不会自动从散文件推断完成步骤。
 - v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新链路的前置步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 退到 `multi_keyframe`，`event_graph` / `character_arc` 退到 `chapter_detect`，`edit_signal` / `build_memory` / `indexer` 退到 `event_and_arc`，确保合并步骤完整重跑。
 - Step 5 会保存 `MinuteChunk.suggested_beats`，但当前 `beat_detect.py` 主流程仍基于回填后的台词、画面和人物信息重新让 LLM 分组；`suggested_beats` 更像后续优化入口。
+- Step 5 的 Gemini 响应会先经过增强 JSON 解析，支持未闭合代码围栏和 JSON 后附带说明文字；解析失败时会用相同调用再重试一次。两次都失败后才跳过该 chunk，并为未覆盖 shot 写入占位分析。
 - Step 5 会在保存正式 `characters.json` 前收敛 `char_tmp_chunk_*`：能合并到稳定角色或跨 chunk 临时角色的会统一 canonical ID；低证据临时角色只留在原始档案、台词和对齐记录中，不污染正式名册。缓存命中时也会执行同一收敛逻辑并重写派生产物。
 - Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验：只保留正式名册内 ID，`unknown_N` 只能作为局部文字描述，不写入 `Beat.characters`；名册为空时返回空角色列表。`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）。
 - Step 6/7/8（`beat_detect` / `story_scene_detect` / `chapter_detect`）统一通过 `_finalize_*` 规范化保证每一层都是「完整且不重叠的划分」：LLM 漏分的 shot / beat / story_scene 会被聚合为 `transition` 过渡单元补回，`beat_index` / `story_scene_index` / `chapter_index` 一律由本地计数器按时间重排为连续唯一值（不信任 LLM 返回的索引，避免重复/跳号污染下游按索引做 key 的 MemoryUnit 和信号映射）。因此结果文件中可能出现 `transition` 类型的兜底单元，属于预期行为。
