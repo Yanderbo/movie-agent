@@ -84,8 +84,8 @@ Video Memory (JSON)
 | 2 | `shot_detect` | `meta.storage_path` | `scenes/scenes.json` | Step 3-10 的时间轴锚点 |
 | 3 | `multi_keyframe` | `meta.storage_path`、`scenes/scenes.json` | `scenes/keyframes/`、shot keyframe 路径 | Step 4 脸谱构建；后续 RAG / 索引可引用 |
 | 4 | `face_cluster` | keyframes、shots、人脸聚类配置 | `characters/face_clusters.json`、`char_XXX_gallery/` | Step 5 角色身份先验 |
-| 5 | `minute_chunk` | `meta.storage_path`、shots、角色脸谱、前序角色档案 | `minute_chunks.json`、`transcripts.json`、`vision.json`、`ocr.json`、`audio_prosody.json`、`multimodal_alignments.json`、`characters.json`、`speaker_map.json`、可选 `character_identity_links.json` | Step 6-10 的多模态基础数据 |
-| 6 | `beat_detect` | shots、transcripts、vision、characters | `beats.json`、回写 `shot.beat_index` | Step 7、Step 9、Step 10；缓存命中也会回填 |
+| 5 | `minute_chunk` | `meta.storage_path`、shots、角色脸谱、前序角色档案 | `minute_chunks.json`、`transcripts.json`、`vision.json`、`ocr.json`、`audio_prosody.json`、`multimodal_alignments.json`、`characters.json`、`speaker_map.json`、可选 `character_identity_links.json` | Step 6-10 的多模态基础数据；`suggested_beats` 作为 Step 6 软先验 |
+| 6 | `beat_detect` | shots、transcripts、vision、characters、`minute_chunks.suggested_beats` | `beats.json`、回写 `shot.beat_index` | Step 7、Step 9、Step 10；缓存命中也会回填 |
 | 7 | `story_scene_detect` | beats、shots、多模态摘要 | `story_scenes.json`、回写 `shot.story_scene_index` | Step 8、Step 9、Step 10；缓存命中也会回填 |
 | 8 | `chapter_detect` | story_scenes、beats、shots | `chapters.json` | Step 9、Step 10 |
 | 9 | `event_and_arc` | shots、transcripts、vision、beats、story_scenes、chapters、characters、character_profiles | `events.json`、`event_graph.json`、`character_arcs.json`、`character_relations.json`，并更新 `characters.json` 的弧线/重要性字段 | Step 10、Director / Reviewer |
@@ -386,10 +386,10 @@ python main.py understand --video-id xxx --resume
 
 - `understand --resume --video-id xxx` 依赖 `progress.json` 判断断点；如果进度文件缺失，当前代码不会自动从散文件推断完成步骤。
 - v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新链路的前置步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 退到 `multi_keyframe`，`event_graph` / `character_arc` 退到 `chapter_detect`，`edit_signal` / `build_memory` / `indexer` 退到 `event_and_arc`，确保合并步骤完整重跑。
-- Step 5 会保存 `MinuteChunk.suggested_beats`，但当前 `beat_detect.py` 主流程仍基于回填后的台词、画面和人物信息重新让 LLM 分组；`suggested_beats` 更像后续优化入口。
+- Step 6 会消费 Step 5 保存的 `MinuteChunk.suggested_beats` 作为软先验：先在本地把 chunk 内相对 index 转成全局 `scene_index`，再按约 30 个候选 Beat 分批送入 LLM。普通 chunk 内 prior 边界基本可信；相邻 chunk 的“前一 chunk 最后 1 个 prior + 后一 chunk 第 1 个 prior”会融合成 `Boundary Fused Prior`，在 prompt 中单独标注为重点判断区域。
 - Step 5 的 Gemini 响应会先经过增强 JSON 解析，支持未闭合代码围栏和 JSON 后附带说明文字；解析失败时会用相同调用再重试一次。两次都失败后才跳过该 chunk，并为未覆盖 shot 写入占位分析。
 - Step 5 会在保存正式 `characters.json` 前收敛 `char_tmp_chunk_*`：能合并到稳定角色或跨 chunk 临时角色的会统一 canonical ID；低证据临时角色只留在原始档案、台词和对齐记录中，不污染正式名册。缓存命中时也会执行同一收敛逻辑并重写派生产物。
-- Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验：只保留正式名册内 ID，`unknown_N` 只能作为局部文字描述，不写入 `Beat.characters`；名册为空时返回空角色列表。`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）。
+- Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验：只保留正式名册内 ID，`unknown_N` 只能作为局部文字描述，不写入 `Beat.characters`；名册为空时返回空角色列表。`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）；若缺少可用 Step 5 先验，则回退到按 30 个 shot 分段检测。
 - Step 6/7/8（`beat_detect` / `story_scene_detect` / `chapter_detect`）统一通过 `_finalize_*` 规范化保证每一层都是「完整且不重叠的划分」：LLM 漏分的 shot / beat / story_scene 会被聚合为 `transition` 过渡单元补回，`beat_index` / `story_scene_index` / `chapter_index` 一律由本地计数器按时间重排为连续唯一值（不信任 LLM 返回的索引，避免重复/跳号污染下游按索引做 key 的 MemoryUnit 和信号映射）。因此结果文件中可能出现 `transition` 类型的兜底单元，属于预期行为。
 - Step 7/8 的 `characters` 一律从子层（beat / story_scene）聚合而来，不采信 LLM 返回的角色列表，从而把 Step 6 的角色白名单一致性贯穿到 StoryScene 与 Chapter。
 - Beat / StoryScene / Chapter 的 `duration` 统一为 `end_time - start_time`（墙钟跨度）；Step 7 对 beats 按 40 个一窗分段调用 LLM，避免长视频单次 prompt 过长导致尾部 beat 被截断丢失。

@@ -45,8 +45,8 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
 | 2 | Shot Detect | `meta.storage_path`、镜头切分阈值 | `scenes/scenes.json` | Shot 时间边界成为后续关键帧、角色、ASR/视觉回填、叙事聚合的统一锚点 |
 | 3 | Keyframe | `meta.storage_path`、`scenes/scenes.json` | `scenes/keyframes/*.jpg`、shot keyframe 路径 | 关键帧进入 Step 4 脸谱构建；不随 MinuteChunk 视频片段直接送入 Gemini |
 | 4 | Face Cluster | keyframes、shots、人脸检测/聚类配置 | `characters/face_clusters.json`、`characters/char_XXX_gallery/` | 角色脸谱作为 Step 5 的身份先验；InsightFace 不可用时输出空脸谱 |
-| 5 | MinuteChunk Understand | `meta.storage_path`、shots、face galleries、前序 `character_profiles.json` | `minute_chunks.json`、`transcripts.json`、`vision.json`、`ocr.json`、`audio_prosody.json`、`multimodal_alignments.json`、`characters.json`、`speaker_map.json`、可选 `character_identity_links.json` | 下游以回填后的 shot 级多模态散文件为基础；正式角色名册已过滤低证据临时角色 |
-| 6 | Beat Detect | shots、`transcripts.json`、`vision.json`、`characters.json` | `beats.json`、回写 `scenes/scenes.json` 的 `beat_index` | Beat 成为 StoryScene、Event、Memory 和信号计算的基础叙事单元；缓存命中也会回填反向链接 |
+| 5 | MinuteChunk Understand | `meta.storage_path`、shots、face galleries、前序 `character_profiles.json` | `minute_chunks.json`、`transcripts.json`、`vision.json`、`ocr.json`、`audio_prosody.json`、`multimodal_alignments.json`、`characters.json`、`speaker_map.json`、可选 `character_identity_links.json` | 下游以回填后的 shot 级多模态散文件为基础；`suggested_beats` 会作为 Step 6 软先验；正式角色名册已过滤低证据临时角色 |
+| 6 | Beat Detect | shots、`transcripts.json`、`vision.json`、`characters.json`、`minute_chunks.json` 中的 `suggested_beats` | `beats.json`、回写 `scenes/scenes.json` 的 `beat_index` | Beat 成为 StoryScene、Event、Memory 和信号计算的基础叙事单元；缓存命中也会回填反向链接 |
 | 7 | Story Scene Detect | beats、shots、台词/画面摘要、角色信息 | `story_scenes.json`、回写 `scenes/scenes.json` 的 `story_scene_index` | StoryScene 提供更高层剧情上下文，供 Chapter、Event 和 EditSignal 使用；缓存命中也会回填反向链接 |
 | 8 | Chapter Detect | story_scenes、beats、shots、角色/情绪摘要 | `chapters.json` | Chapter 提供长视频大段落结构，供事件抽取、MemoryUnit 和检索索引使用 |
 | 9 | Event Graph + Character Arc | shots、transcripts、vision、beats、story_scenes、chapters、characters、`character_profiles.json` | `events.json`、`event_graph.json`、`character_arcs.json`、`character_relations.json` | 事件、关系和人物弧线进入 final build，并作为 Director / Reviewer 的叙事证据 |
@@ -273,27 +273,28 @@ LLM 返回的 `unknown_N` 会先被规范化为带 chunk 作用域的 `char_tmp_
 
 **模块**：`pipeline/beat_detect.py`
 
-利用 Step 5 回填后的 `transcripts.json`、`vision.json` 和 `characters.json` 进行分组：将连续 shots 按 30 个一段送入 LLM，聚合为叙事节拍 Beat，输出 `beats.json` 并回填 `shot.beat_index`。
+利用 Step 5 回填后的 `transcripts.json`、`vision.json`、`characters.json` 和 `minute_chunks.json` 中的 `suggested_beats` 进行分组。`suggested_beats` 先在本地从 chunk 内相对 index 转换为全局 `scene_index`，再按约 30 个候选 Beat 一批送入 LLM，聚合为叙事节拍 Beat，输出 `beats.json` 并回填 `shot.beat_index`。如果没有可用先验，则回退到旧的 30 个 shot 一段的检测方式。
 
 **输入 / 输出**：
 
 | 项 | 内容 |
 |----|------|
-| 输入 | `scenes/scenes.json`、`transcripts.json`、`vision.json`、正式 `characters.json` |
+| 输入 | `scenes/scenes.json`、`transcripts.json`、`vision.json`、正式 `characters.json`、`minute_chunks.json` |
 | 输出 | `beats.json`、回写后的 `scenes/scenes.json` (`shot.beat_index`) |
 | 缓存 | `beats.json` 已存在时不调用 LLM，但仍执行 `_backfill_beat_to_shots()` |
-| 降级 | LLM 解析失败时 `_fallback_beats()` 按每 4 个 shot 一组生成默认 beat，再进入 `_finalize_beats()` |
+| 降级 | 有 Step 5 先验时按转换后的 prior 兜底（边界融合失败时保守保留原 tail/head prior）；无先验时 `_fallback_beats()` 按每 4 个 shot 一组生成默认 beat；之后都进入 `_finalize_beats()` |
 
 关键约束（v4.1.1 修复）：
 
 - **角色名册注入与校验**：`characters` 列表会被转成"已知角色名册"写入 prompt（`char_id: 名字 — 描述`）。LLM 在 `beat.characters` 中只能引用名册内的 ID，画面里出现但不在名册的人可以在描述中写成 `unknown_N`，但不能写入 `Beat.characters`。回填时按白名单过滤，丢弃编造的 `char_` ID；当名册为空时返回空角色列表。这避免了 beat 角色 ID 与 Step 4 face_cluster 的 `char_xxx` 体系错配。
+- **Step 5 先验转换**：`MinuteChunk.suggested_beats` 内的数字是 chunk 内相对 index，进入 prompt 前必须通过 `chunk.shot_indices[local_index]` 转为全局 `scene_index`；越界、非整数、空组和重复 shot 会被本地过滤。LLM 只看到绝对 shot index。
+- **chunk 边界融合提示**：普通 Prior Beat 来自单个 chunk 内部，边界基本可信；只有相邻 chunk 的“前一 chunk 最后 1 个 prior + 后一 chunk 第 1 个 prior”会融合为 `Boundary Fused Prior`，并在 prompt 中单独标注为重点判断区域，允许 LLM 合并、拆分或微调。
+- **先验批次大小**：有先验时按约 30 个 prior Beat 候选一批调用 LLM，而不是一次性传全片；无先验时保持按 30 个 shot 分段。
 - **全覆盖 + 不重叠划分（`_finalize_beats`）**：分段 LLM 结果汇总后统一规范化——跨 beat 去重 shot（保留先出现者）、过滤越界/幻觉 shot 索引、把 LLM 漏分的 shot 按相邻关系聚合为 `transition` beat。保证每个 shot 恰好归属一个 beat，杜绝 `beat_index=None` 的孤儿镜头脱离叙事层级。
 - **beat_index 全局唯一且按时间连续**：规范化阶段按时间统一排序并重排 `beat_index` 为 `0..N-1`，忽略 LLM 返回值，防止跨段重复索引破坏 `shot → beat` 反向链接和下游 story_scene 关联。
 - **duration 采用墙钟跨度**：`beat.duration = end_time - start_time`（与 StoryScene / Chapter 统一），不再用子 shot 时长求和，避免漏分/非连续时口径漂移。
 - **缓存分支幂等**：`understand.py` 的 Step 6 续跑分支同样调用 `detect_beats()`；命中 `beats.json` 时不触发 LLM，但仍会回填 `shot.beat_index`，与新建分支行为一致。
-- LLM 解析失败时回退到"每 4 个 shot 一组"的默认分组（`_fallback_beats`），同样进入 `_finalize_beats` 规范化。
-
-说明：MinuteChunk 原始结果中会保存 `suggested_beats`，但当前 `detect_beats()` 主入口尚未直接读取 `minute_chunks.json`，因此 `suggested_beats` 更像后续优化入口；现阶段 Beat 仍由 `beat_detect.py` 基于回填后的台词、画面和人物信息重新让 LLM 判断。
+- LLM 解析失败时优先使用 Step 5 先验兜底；没有可用先验时回退到"每 4 个 shot 一组"的默认分组（`_fallback_beats`），同样进入 `_finalize_beats` 规范化。
 
 ---
 

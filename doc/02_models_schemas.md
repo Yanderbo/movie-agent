@@ -129,9 +129,9 @@ Step 5 的核心中间模型。它不是最终检索单元，而是用于承载 
 | `per_shot_audio` | list[dict] | 逐 shot 音频特征 |
 | `character_updates` | list[dict] | 角色动态更新 |
 | `cross_shot_analysis` | dict | 跨 shot 叙事连续性、情绪弧线等 |
-| `suggested_beats` | list[list[int]] | Gemini 建议的 beat 分组 |
+| `suggested_beats` | list[list[int]] | Gemini 建议的 beat 分组；数字是 chunk 内相对 shot index |
 
-注意：Step 3 的 `Shot.keyframe_paths` 不会作为 MinuteChunk Gemini 输入；MinuteChunk 使用视频片段、角色脸谱和动态角色档案。逐 shot 回填依赖 `local_shot_index` 与全局 `scene_index` 的双锚点解析。
+注意：Step 3 的 `Shot.keyframe_paths` 不会作为 MinuteChunk Gemini 输入；MinuteChunk 使用视频片段、角色脸谱和动态角色档案。逐 shot 回填依赖 `local_shot_index` 与全局 `scene_index` 的双锚点解析。Step 6 `beat_detect.py` 消费 `suggested_beats` 时必须先用 `chunk.shot_indices[local_index]` 转成全局 `scene_index`，普通 chunk 内 prior 作为稳定软先验，相邻 chunk 的 tail/head prior 会融合为边界候选单独提示 LLM 重判。
 
 ### Shot（镜头）
 

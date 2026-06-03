@@ -211,6 +211,7 @@ def run_understand(
         alignments = chunk_outputs["alignments"]
         characters = _load_cached("characters", video_id)
         speaker_map = chunk_outputs["speaker_map"]
+        minute_chunks = chunk_outputs.get("chunks", [])
         _save_progress(video_id, "minute_chunk")
         if _should_stop_after(4, until_step_index):
             _log_until_step_stop(video_id, 4, total_steps)
@@ -223,6 +224,7 @@ def run_understand(
         alignments = _load_cached("multimodal_alignments", video_id)
         characters = _load_cached("characters", video_id)
         speaker_map = _load_speaker_map(video_id)
+        minute_chunks = _load_cached("minute_chunks", video_id)
 
     # ═══ Step 6: Beat Detect ═══
     if start_step <= 5:
@@ -230,7 +232,10 @@ def run_understand(
         logger.info(f"步骤 6/{total_steps}: 剧情节拍检测")
         logger.info("=" * 50)
         from pipeline.beat_detect import detect_beats
-        beats = detect_beats(video_id, shots, transcripts, vision_summaries, characters)
+        beats = detect_beats(
+            video_id, shots, transcripts, vision_summaries,
+            characters, minute_chunks,
+        )
         _save_progress(video_id, "beat_detect")
         if _should_stop_after(5, until_step_index):
             _log_until_step_stop(video_id, 5, total_steps)
@@ -239,7 +244,10 @@ def run_understand(
         # 缓存分支同样走幂等的 detect_beats：命中 beats.json 时不调用 LLM，
         # 但会回填 shot.beat_index，保持与新建分支一致的反向链接。
         from pipeline.beat_detect import detect_beats
-        beats = detect_beats(video_id, shots, transcripts, vision_summaries, characters)
+        beats = detect_beats(
+            video_id, shots, transcripts, vision_summaries,
+            characters, minute_chunks,
+        )
 
     # ═══ Step 7: Story Scene Detect ═══
     if start_step <= 6:
@@ -511,7 +519,7 @@ def _load_cached(data_type: str, video_id: str):
         TranscriptSegment, OCRResult, VisionSummary, CharacterDeep,
         Event, Beat, StoryScene, EditSignal, CharacterRelation,
         AudioProsody, MultimodalAlignment, Chapter,
-        NarrativeSignal, RecompositionSignal,
+        NarrativeSignal, RecompositionSignal, MinuteChunk,
     )
     model_map = {
         "transcripts": TranscriptSegment,
@@ -528,6 +536,7 @@ def _load_cached(data_type: str, video_id: str):
         "chapters": Chapter,
         "narrative_signals": NarrativeSignal,
         "recomposition_signals": RecompositionSignal,
+        "minute_chunks": MinuteChunk,
     }
     file_map = {
         "transcripts": "transcripts.json",
@@ -544,6 +553,7 @@ def _load_cached(data_type: str, video_id: str):
         "chapters": "chapters.json",
         "narrative_signals": "narrative_signals.json",
         "recomposition_signals": "recomposition_signals.json",
+        "minute_chunks": "minute_chunks.json",
     }
     video_dir = config.VIDEOS_DIR / video_id
     filename = file_map.get(data_type)
