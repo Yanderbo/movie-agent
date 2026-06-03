@@ -78,12 +78,13 @@ beat 级片段优先与对应 Beat 的时间范围对比，并要求 `evidence_r
 
 例如：clip 说包含 `char_002`，但来源 beat 与其所有 shot 都没有该人物，则报错。
 
-#### 4. 高重要性事件覆盖率
+#### 4. 高重要性事件代表性覆盖
 
 - 收集 `importance >= 7` 的事件
 - 通过 `event.scene_indices` 找到事件覆盖的 scene
 - beat 级片段用 `beat.shot_indices` 展开覆盖 scene，再检查 EditPlan 是否覆盖这些 scene
-- 未覆盖的事件报告为 issue
+- 预告片 / 高光剪辑只要求至少覆盖到代表性高重要事件
+- `recap` / `narrative` 风格会要求更高覆盖率，但不会列出全片所有未覆盖事件
 
 ### LLM 审核
 
@@ -97,7 +98,9 @@ beat 级片段优先与对应 Beat 的时间范围对比，并要求 `evidence_r
       "source_unit_type": "beat",
       "source_scene_index": 5,
       "source_beat_index": 3,
-      "duration": 14.5,
+      "source_duration": 14.5,
+      "timeline_duration": 10.0,
+      "duration": 10.0,
       "narrative_role": "hook",
       "evidence_refs": ["search_result#scene_5"],
       "has_transcript": true,

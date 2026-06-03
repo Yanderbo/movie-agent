@@ -190,6 +190,10 @@ def _build_director_prompt(
         platform=platform,
         aspect_ratio=aspect_ratio,
         character_perspective_line=char_perspective_line,
+        tempo_guidance=_format_tempo_guidance(
+            _infer_intent(user_prompt, style, platform),
+            target_duration,
+        ),
         video_duration=memory.meta.duration,
         width=memory.meta.width,
         height=memory.meta.height,
@@ -313,7 +317,10 @@ def _score_candidate(
         spoiler_penalty = 0.1 * spoiler
 
     event_boost = min(event_importance / 10, 1.0) * 0.08
-    duration_penalty = 0.08 if candidate.duration > 45 else 0.0
+    if task == "trailer":
+        duration_penalty = min(max(candidate.duration - 12.0, 0.0) / 40.0, 0.18)
+    else:
+        duration_penalty = 0.08 if candidate.duration > 45 else 0.0
     score = (
         0.3 * min(candidate.semantic_score, 1.0)
         + 0.45 * edit_fit
@@ -335,6 +342,8 @@ def _score_candidate(
         reasons.append("recomposition")
     if event_importance >= 7:
         reasons.append("event")
+    if candidate.duration <= 8:
+        reasons.append("short")
     return round(max(score, 0.0), 3), reasons or ["signal"]
 
 
@@ -351,6 +360,7 @@ def _parse_editplan(
     candidates: list[DirectorCandidate],
 ) -> EditPlan:
     candidate_by_id = {c.candidate_id: c for c in candidates}
+    intent = _infer_intent(user_prompt, style, platform)
     clips = []
     timeline_pos = 0.0
     skipped = 0
@@ -378,7 +388,7 @@ def _parse_editplan(
             skipped += 1
             continue
 
-        speed = _clamp_speed(item.get("speed", 1.0))
+        speed = _clip_speed(item.get("speed", 1.0), candidate, intent)
         source_start = round(candidate.start_time, 3)
         source_end = round(candidate.end_time, 3)
         timeline_duration = (source_end - source_start) / speed
@@ -412,6 +422,8 @@ def _parse_editplan(
         )
         clips.append(clip)
         timeline_pos += timeline_duration
+
+    _rebalance_narrative_roles(clips)
 
     if skipped:
         logger.warning(f"跳过了 {skipped} 个无效候选")
@@ -462,6 +474,22 @@ def _format_characters(memory: VideoMemory) -> str:
     return "\n".join(lines) if lines else "（未识别人物）"
 
 
+def _format_tempo_guidance(intent: dict[str, Any], target_duration: float) -> str:
+    task = intent["task_type"]
+    if task == "trailer":
+        target_clips = "8-12" if target_duration <= 90 else "10-16"
+        return (
+            f"- 预告片节奏: 优先选择 {target_clips} 个 beat，单个片段目标 3-12 秒。\n"
+            "- 长 beat 可以设置 speed=1.15-1.5 压缩节奏，避免少数长片段占据大部分时长。\n"
+            "- 叙事角色不要连续 3 个相同；整体按章节从早到晚推进，高潮后不要再回到早期铺垫章节作为收尾。"
+        )
+    if task == "recap":
+        return "- 解说/复盘节奏: 可以使用更长的剧情 beat，优先保证事件因果和信息完整。"
+    if task == "remix":
+        return "- 二创节奏: 优先选择独立性强、情绪或梗点清晰的 beat，允许非线性重组。"
+    return "- 高光节奏: 在短促 hook、情绪峰值和剧情关键点之间保持变化。"
+
+
 def _format_candidates(candidates: list[DirectorCandidate]) -> str:
     lines = []
     for i, c in enumerate(candidates):
@@ -500,6 +528,7 @@ def _format_candidates(candidates: list[DirectorCandidate]) -> str:
                 f"    signals: {signal_text or 'none'}",
                 f"    narrative: {narrative_text or 'none'}",
                 f"    recomposition: {recomposition_text or 'none'}",
+                f"    reasons: {', '.join(c.score_reasons)}",
                 f"    evidence: {', '.join(c.evidence_refs[:5])}",
             ])
         )
@@ -638,6 +667,34 @@ def _infer_intent(user_prompt: str, style: str, platform: str) -> dict[str, Any]
 
 def _clamp_speed(value: Any) -> float:
     return _clamp_float(value, 0.25, 4.0, 1.0)
+
+
+def _clip_speed(value: Any, candidate: DirectorCandidate, intent: dict[str, Any]) -> float:
+    speed = _clamp_speed(value)
+    if intent["task_type"] == "trailer" and candidate.duration > 12.0:
+        speed = min(max(speed, candidate.duration / 12.0), 1.5)
+    return round(speed, 3)
+
+
+def _rebalance_narrative_roles(clips: list[EditClip]) -> None:
+    if not clips:
+        return
+    if len(clips) >= 3:
+        clips[0].narrative_role = "hook"
+        if clips[-1].narrative_role not in ("resolution", "outro"):
+            clips[-1].narrative_role = "resolution"
+    for index in range(2, len(clips)):
+        if (
+            clips[index - 2].narrative_role
+            == clips[index - 1].narrative_role
+            == clips[index].narrative_role
+        ):
+            if clips[index].narrative_role == "climax":
+                clips[index].narrative_role = "rising_action"
+            else:
+                clips[index].narrative_role = (
+                    "climax" if index >= len(clips) // 2 else "hook"
+                )
 
 
 def _clamp_float(value: Any, minimum: float, maximum: float, default: float) -> float:

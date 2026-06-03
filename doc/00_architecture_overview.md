@@ -167,7 +167,7 @@ Step 10 会把三类信号、四层 MemoryUnit 和九类索引一起收口到 `m
 
 ### 6. 证据驱动的 EditPlan
 
-Director 不允许自造片段，每个 beat 级 EditClip 必须有 `evidence_refs`，并引用真实存在的 `candidate_id` / `beat:{index}`。Reviewer 会检查 beat 时间边界、角色、事件覆盖、叙事结构和目标时长。
+Director 不允许自造片段，每个 beat 级 EditClip 必须有 `evidence_refs`，并引用真实存在的 `candidate_id` / `beat:{index}`。Reviewer 会检查 beat 时间边界、角色、代表性事件覆盖、叙事结构和目标时长。
 
 ### 7. 容错与降级
 

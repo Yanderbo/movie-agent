@@ -5,7 +5,7 @@ Reviewer Agent（重构版）
 
 核心改动：
 - 新增 Grounding 校验：evidence_refs 非空、时间精度、角色一致性
-- 新增事件覆盖率检查：高重要性事件是否被 EditPlan 覆盖
+- 新增事件代表性覆盖检查：高重要性事件是否至少被 EditPlan 部分覆盖
 """
 import json
 
@@ -190,7 +190,7 @@ def _grounding_check(plan: EditPlan, memory: VideoMemory) -> list[str]:
     1. evidence_refs 非空
     2. source_start/end 与 MemoryUnit 的 time_range 偏差不超过 ±0.5s
     3. clip 中声称的 characters 必须在对应 scene 的 MemoryUnit.characters 中
-    4. 高重要性事件（importance ≥ 7）是否被 EditPlan 覆盖
+    4. 高重要性事件（importance ≥ 7）是否至少有代表性覆盖
     """
     issues = []
 
@@ -272,11 +272,11 @@ def _grounding_check(plan: EditPlan, memory: VideoMemory) -> list[str]:
                     "但来源单元中未出现该人物"
                 )
 
-    # ── 检查 4: 高重要性事件覆盖率 ──
+    # ── 检查 4: 高重要性事件代表性覆盖 ──
     important_events = [e for e in memory.events if e.importance >= 7]
     if important_events:
         covered_scenes = _covered_scene_indices(plan, beat_by_index)
-        uncovered_events = []
+        covered_events = []
         for event in important_events:
             # 检查事件的 scene_indices 是否有任何一个被 EditPlan 覆盖
             event_scenes = set(event.scene_indices) if event.scene_indices else set()
@@ -285,14 +285,20 @@ def _grounding_check(plan: EditPlan, memory: VideoMemory) -> list[str]:
                 for s in memory.scenes:
                     if event.start_time < s.end_time and event.end_time > s.start_time:
                         event_scenes.add(s.scene_index)
-            if not event_scenes & covered_scenes:
-                uncovered_events.append(event)
+            if event_scenes & covered_scenes:
+                covered_events.append(event)
 
-        if uncovered_events:
-            uncovered_descs = [f"{e.description[:30]}(重要性:{e.importance})" for e in uncovered_events[:3]]
+        if not covered_events:
             issues.append(
-                f"[Grounding] {len(uncovered_events)} 个高重要性事件未被 EditPlan 覆盖: "
-                f"{'; '.join(uncovered_descs)}"
+                "[Grounding] EditPlan 未覆盖任何高重要性事件，可能缺少剧情支点"
+            )
+        elif (
+            plan.style in ("recap", "narrative")
+            and len(covered_events) < min(3, len(important_events))
+        ):
+            issues.append(
+                f"[Grounding] 高重要性事件覆盖偏少: "
+                f"{len(covered_events)}/{len(important_events)}"
             )
 
     return issues
@@ -328,7 +334,9 @@ def _llm_review(plan: EditPlan, memory: VideoMemory, user_prompt: str) -> dict |
                 "source_story_scene_index": c.source_story_scene_index,
                 "source_start": c.source_start,
                 "source_end": c.source_end,
-                "duration": round(c.source_end - c.source_start, 1),
+                "source_duration": round(c.source_end - c.source_start, 1),
+                "timeline_duration": round(c.timeline_end - c.timeline_start, 1),
+                "duration": round(c.timeline_end - c.timeline_start, 1),
                 "narrative_role": c.narrative_role,
                 "selection_reason": c.selection_reason[:50],
                 "audio_volume": c.audio_volume,

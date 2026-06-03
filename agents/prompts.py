@@ -25,6 +25,9 @@ DIRECTOR_PROMPT_TEMPLATE = """请根据以下信息，生成一个结构化的�
 - 画幅比: {aspect_ratio}
 {character_perspective_line}
 
+=== 剪辑节奏策略 ===
+{tempo_guidance}
+
 === 视频基本信息 ===
 - 总时长: {video_duration:.1f} 秒
 - 分辨率: {width}x{height}
@@ -51,7 +54,7 @@ DIRECTOR_PROMPT_TEMPLATE = """请根据以下信息，生成一个结构化的�
 2. **片段选择**: 必须从上述候选片段中选择，candidate_id 必须存在于候选列表中
 3. **时间范围**: 不要自造 source_start/source_end；系统会使用候选 beat 的真实时间范围
 4. **时长控制**: 所有片段总时长应在目标时长的 ±15% 范围内
-5. **节奏控制**: 交替使用不同节奏的片段，避免连续堆叠同类型镜头
+5. **节奏控制**: 交替使用不同节奏的片段，避免连续堆叠同类型镜头；预告片不要让单个长 beat 占据过多时长
 6. **叙事角色**: 每个片段标注叙事作用（hook/rising_action/climax/resolution/outro）
 7. **证据引用**: 每个片段必须包含 evidence_refs，说明选择该片段的依据来源
 8. **连贯性**: 确保片段之间的逻辑连贯和视觉连贯

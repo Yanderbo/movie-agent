@@ -399,7 +399,7 @@ python main.py understand --video-id xxx --resume
 - `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；InsightFace 默认 `FACE_DETECT_DEVICE=auto`，检测到 `CUDAExecutionProvider` 时使用 GPU，`FACE_DETECT_GPU_ID=auto` 会选择显存占用最低的 CUDA 设备，否则回退 CPU。
 - Step 4 的人脸聚类是传统视觉模型的身份先验：会保守拆分混簇、合并高相似碎簇，并过滤小脸/侧脸，但仍可能把同一个人物拆成多个 gallery。跨 gallery 的语义归并留给后续大模型理解阶段基于剧情、台词和外观证据处理，当前不在 `face_cluster` 中实现。
 - Step 10 的 EditSignal 会覆盖全部 beat / story_scene，但 shot 级只覆盖代表性关键镜头，默认受 `EDIT_SIGNAL_MAX_SHOTS=240` 限制，并在日志中输出总 shot、候选 shot、最终 shot、跳过数量、候选来源、batch 进度和耗时。
-- Director 阶段默认输出 beat 级 `EditClip`：`source_unit_type="beat"`，`source_beat_index` 指向真实 Beat，`source_scene_index` 仅作为兼容字段保存该 beat 的首个 shot。Reviewer 和渲染校验会按 Beat 时间边界做 grounding。
+- Director 阶段默认输出 beat 级 `EditClip`：`source_unit_type="beat"`，`source_beat_index` 指向真实 Beat，`source_scene_index` 仅作为兼容字段保存该 beat 的首个 shot。Reviewer 和渲染校验会按 Beat 时间边界做 grounding；预告片会对长 beat 使用节奏提示和有限变速，而不是回退到 shot 级切碎。
 - Step 10 会构建四层 MemoryUnit 并把 `meta.status` 置为 `ready`；`edit_signals.json` 已存在时仍会补算缺失的 `narrative_signals.json` / `recomposition_signals.json`。Embedding API 或 FAISS 不可用只跳过向量层，但索引构建整体失败会阻止 `final_build` 标记完成。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和索引要等 `final_build` 完成后才会出现在 `memory.json` / `index/`。
 - Step 6-10 不重新读取 shot 原视频；如需引用画面，使用 Step 3 写入的 `Shot.keyframe_paths`。Step 10 会把 `keyframe_path` / `keyframe_paths` 一并写入 shot 级 MemoryUnit。

@@ -66,6 +66,8 @@ DirectorCandidate(
 - `remix` 偏重 `recomposition_signals`、`hook_score` 和情绪引用价值。
 - `highlight` 使用 hook、剧情、情绪、视觉和边界的均衡分。
 
+预告片会额外轻惩罚过长 beat，并在 prompt 中提示 3-12 秒的片段节奏、章节顺序和角色变化。解析阶段仍保持 beat 完整边界，但会对超过 12 秒的预告片 beat 自动设置最高 1.5x 的变速，避免少数长 beat 吃掉大部分时间线。
+
 最终只把排序后的有限候选写入 prompt，避免 LLM 在 1000+ shot 中自由发散。
 
 ## Prompt 契约
@@ -129,6 +131,6 @@ Reviewer 会检查：
 - clip 时间是否在 beat 边界内
 - `evidence_refs` 是否引用了 `beat:{index}`
 - 角色是否出现在 beat 或 beat 内 shot 的 MemoryUnit 中
-- 高重要事件是否被方案覆盖
+- 高重要事件是否至少有代表性覆盖
 
 审核未通过时，Director 会把反馈追加到 prompt 并重试，仍要求只从已有 `candidate_id` 中选择。
