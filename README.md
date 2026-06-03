@@ -16,7 +16,7 @@
 | **三类剪辑信号** | EditSignal 8 维剪辑信号 + NarrativeSignal 叙事信号 + RecompositionSignal 二创信号，shot 级信号按代表镜头上限计算 |
 | **多层 VideoMemory** | Shot / Beat / StoryScene / Chapter 四层 MemoryUnit，融合音频与多模态对齐结果 |
 | **九维检索索引** | 文本 + Embedding + 角色 + 事件 + 关系 + 情绪 + 剪辑信号 + 音频 + 章节 |
-| **证据驱动剪辑** | EditClip 强制引用 `evidence_refs`，可携带 EditSignal、Beat、StoryScene 等层级引用 |
+| **证据驱动剪辑** | Director 以 Beat 为最终剪辑单元，EditClip 强制引用 `evidence_refs`，可携带 EditSignal、Beat、StoryScene 等层级引用 |
 | **审核闭环** | Reviewer 进行规则校验、Grounding 校验和 LLM 审核 |
 | **断点续跑** | 每步结果持久化为 JSON，`--resume` 根据 `progress.json` 继续执行，并映射旧步骤名 |
 
@@ -39,7 +39,7 @@
    ▼
 Video Memory (JSON)
    │
-用户需求 ──→ [Director Agent] ──多维检索──→ 候选片段 + 证据引用
+用户需求 ──→ [Director Agent] ──多维检索+信号召回──→ Beat 候选 + 证据引用
                   │
                   ▼
             [Reviewer Agent]
@@ -399,6 +399,7 @@ python main.py understand --video-id xxx --resume
 - `face_cluster.py` 在 InsightFace 未安装时会跳过脸谱构建，由 MinuteChunk 让 Gemini 自行识别人物；InsightFace 默认 `FACE_DETECT_DEVICE=auto`，检测到 `CUDAExecutionProvider` 时使用 GPU，`FACE_DETECT_GPU_ID=auto` 会选择显存占用最低的 CUDA 设备，否则回退 CPU。
 - Step 4 的人脸聚类是传统视觉模型的身份先验：会保守拆分混簇、合并高相似碎簇，并过滤小脸/侧脸，但仍可能把同一个人物拆成多个 gallery。跨 gallery 的语义归并留给后续大模型理解阶段基于剧情、台词和外观证据处理，当前不在 `face_cluster` 中实现。
 - Step 10 的 EditSignal 会覆盖全部 beat / story_scene，但 shot 级只覆盖代表性关键镜头，默认受 `EDIT_SIGNAL_MAX_SHOTS=240` 限制，并在日志中输出总 shot、候选 shot、最终 shot、跳过数量、候选来源、batch 进度和耗时。
+- Director 阶段默认输出 beat 级 `EditClip`：`source_unit_type="beat"`，`source_beat_index` 指向真实 Beat，`source_scene_index` 仅作为兼容字段保存该 beat 的首个 shot。Reviewer 和渲染校验会按 Beat 时间边界做 grounding。
 - Step 10 会构建四层 MemoryUnit 并把 `meta.status` 置为 `ready`；`edit_signals.json` 已存在时仍会补算缺失的 `narrative_signals.json` / `recomposition_signals.json`。Embedding API 或 FAISS 不可用只跳过向量层，但索引构建整体失败会阻止 `final_build` 标记完成。
 - Step 10 之前只有散文件；完整四层 MemoryUnit、embedding 和索引要等 `final_build` 完成后才会出现在 `memory.json` / `index/`。
 - Step 6-10 不重新读取 shot 原视频；如需引用画面，使用 Step 3 写入的 `Shot.keyframe_paths`。Step 10 会把 `keyframe_path` / `keyframe_paths` 一并写入 shot 级 MemoryUnit。

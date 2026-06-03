@@ -393,6 +393,7 @@ EventNode = Event   # 旧代码 import EventNode 可正常工作
 | `MemoryUnit.keyframe_paths` | `[]` | v4.1 |
 | `MemoryUnit.chapter_index` | `None` | v3 |
 | `MemoryUnit.audio_prosody` / `alignment` | `None` | v3 |
+| `EditClip.source_unit_type` | `"shot"` | v4.1 |
 | `EditClip.edit_signal_ref` | `None` | v2 |
 | `VideoMeta.compressed_path` | `""` | v4.1 |
 | `VideoMeta.is_compressed` | `False` | v4.1 |

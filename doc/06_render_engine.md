@@ -118,9 +118,9 @@ filter_complex = "[1:a]volume={bgm_vol},afade=in:...,afade=out:...[bgm];
 
 `validate_plan()` 在渲染前做最后一道防线：
 - 检查源视频文件是否存在
-- 校验每个 clip 的 `source_scene_index` 是否在合法范围
+- 校验每个 clip 的兼容 `source_scene_index` 是否在合法范围
 - 校验 `source_start < source_end`
-- 校验时间范围是否在源场景内
+- beat 级 clip 校验时间范围是否在源 Beat 内；旧 shot 级 clip 仍校验是否在源场景内
 - 返回错误列表，非空则拒绝渲染
 
 ## 临时文件处理

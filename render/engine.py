@@ -82,9 +82,15 @@ def _render_pipeline(
 
     for clip in plan.clips:
         clip_output = str(clips_dir / f"clip_{clip.clip_index:03d}.mp4")
+        source_unit_type = getattr(clip, "source_unit_type", "shot")
+        source_unit_index = (
+            clip.source_beat_index
+            if source_unit_type == "beat"
+            else clip.source_scene_index
+        )
         logger.info(
             f"  裁剪片段 {clip.clip_index}: "
-            f"scene={clip.source_scene_index}, "
+            f"{source_unit_type}={source_unit_index}, "
             f"{clip.source_start:.1f}s-{clip.source_end:.1f}s "
             f"({clip.source_end - clip.source_start:.1f}s)"
         )

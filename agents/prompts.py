@@ -9,8 +9,8 @@ DIRECTOR_SYSTEM_PROMPT = """你是一个专业的视频剪辑导演 AI。
 你不会执行实际的视频编辑操作，只负责创意规划和结构设计。
 
 核心原则：
-- 每个片段必须引用候选列表中已存在的 scene_index 和时间范围
-- 不得凭空捏造不存在的片段或时间戳
+- 每个片段必须引用候选列表中已存在的 candidate_id
+- 不得凭空捏造不存在的 beat、scene 或时间戳
 - 每个片段必须附带 evidence_refs 说明证据来源"""
 
 DIRECTOR_PROMPT_TEMPLATE = """请根据以下信息，生成一个结构化的视频剪辑方案。
@@ -33,9 +33,12 @@ DIRECTOR_PROMPT_TEMPLATE = """请根据以下信息，生成一个结构化的�
 === 已识别人物 ===
 {characters_info}
 
-=== 候选片段（按相关性排序） ===
-以下是通过检索系统筛选出的候选片段。你必须从中选择片段来构建方案，
-不得使用列表之外的 scene_index 或时间范围。
+=== 全片故事地图 ===
+{story_map_info}
+
+=== Beat 候选片段（按导演分数排序） ===
+以下候选已经由系统根据检索命中、叙事层级、剪辑信号和二创信号筛选。
+你必须从中选择 candidate_id 来构建方案，不得使用列表之外的 beat 或时间范围。
 
 {candidates_info}
 
@@ -45,8 +48,8 @@ DIRECTOR_PROMPT_TEMPLATE = """请根据以下信息，生成一个结构化的�
 请生成剪辑方案，遵循以下规则：
 
 1. **叙事结构**: 遵循 {narrative_structure} 结构
-2. **片段选择**: 必须从上述候选片段中选择，source_scene_index 必须存在于候选列表中
-3. **时间范围**: source_start 和 source_end 必须在对应场景的时间范围内
+2. **片段选择**: 必须从上述候选片段中选择，candidate_id 必须存在于候选列表中
+3. **时间范围**: 不要自造 source_start/source_end；系统会使用候选 beat 的真实时间范围
 4. **时长控制**: 所有片段总时长应在目标时长的 ±15% 范围内
 5. **节奏控制**: 交替使用不同节奏的片段，避免连续堆叠同类型镜头
 6. **叙事角色**: 每个片段标注叙事作用（hook/rising_action/climax/resolution/outro）
@@ -59,12 +62,10 @@ DIRECTOR_PROMPT_TEMPLATE = """请根据以下信息，生成一个结构化的�
 {{
   "title": "剪辑方案标题",
   "narrative_structure": "{narrative_structure}",
-  "clips": [
+  "plan_items": [
     {{
       "clip_index": 0,
-      "source_scene_index": 5,
-      "source_start": 120.5,
-      "source_end": 135.0,
+      "candidate_id": "beat:183",
       "narrative_role": "hook",
       "selection_reason": "选择理由",
       "characters": ["char_000"],
@@ -74,9 +75,7 @@ DIRECTOR_PROMPT_TEMPLATE = """请根据以下信息，生成一个结构化的�
       "transition_out": "cut",
       "speed": 1.0,
       "audio_volume": 1.0,
-      "evidence_refs": ["search_result#3", "event#5"],
-      "matched_transcript": "该片段对应的台词原文（可选）",
-      "matched_vision": "该片段对应的画面描述（可选）"
+      "evidence_refs": ["beat:183", "story_scene:38", "edit_signal:beat:183"]
     }}
   ]
 }}
@@ -107,8 +106,8 @@ REVIEWER_PROMPT_TEMPLATE = """请审核以下视频剪辑方案的质量。
 
 1. **时长偏差**: 所有片段总时长是否在目标时长 ±15% 范围内
 2. **片段数量**: 是否在 3-20 个之间
-3. **场景引用**: source_scene_index 是否在合法范围 (0 ~ {max_scene_index})
-4. **时间合法性**: source_start < source_end，且在源场景时间范围内
+3. **来源引用**: beat 级片段的 source_beat_index 和兼容 source_scene_index 是否合法
+4. **时间合法性**: source_start < source_end，且在源 beat 时间范围内
 5. **证据完整性**: 每个片段是否都有非空的 evidence_refs
 6. **叙事完整性**: 是否包含 hook 和至少一个 climax/resolution
 7. **节奏多样性**: 是否避免了连续堆叠同类型片段

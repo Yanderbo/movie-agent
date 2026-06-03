@@ -10,7 +10,7 @@
 | [01_pipeline_understand.md](01_pipeline_understand.md) | `understand.py` + v4.1 understand 子模块 | 理解流水线 10 步详解、MinuteChunk、叙事层级、数据流、断点续跑 |
 | [02_models_schemas.md](02_models_schemas.md) | `schemas.py` | 所有 Pydantic 数据模型定义（含 v4.1 新增：VideoMeta 压缩字段、CharacterGallery、CharacterProfile、MinuteChunk） |
 | [03_search_engine.md](03_search_engine.md) | `search.py` | 三层漏斗检索详解（Embedding + 关键词 + LLM Reranker） |
-| [04_director_agent.md](04_director_agent.md) | `director.py` + `prompts.py` | Director Agent 短视频/长视频规划、证据填充、Prompt 设计 |
+| [04_director_agent.md](04_director_agent.md) | `director.py` + `prompts.py` | Director Agent beat 级候选规划、证据填充、Prompt 设计 |
 | [05_reviewer_agent.md](05_reviewer_agent.md) | `reviewer.py` | Reviewer Agent 三层校验（规则 + Grounding + LLM）、评分逻辑 |
 | [06_render_engine.md](06_render_engine.md) | `engine.py` + `validator.py` + `ffmpeg_ops.py` | 渲染 5 步流水线、FFmpeg 操作封装 |
 | [07_utils.md](07_utils.md) | `llm_client.py` + `ffmpeg_utils.py` + `logger.py` | LLM 客户端、FFmpeg 工具、日志系统 |
@@ -62,9 +62,9 @@
 │                         EDIT 阶段                                        │
 │                                                                          │
 │  Director Agent                                                          │
-│    ├─ 构造候选信息 Prompt（含多模态融合文本 + 证据来源 + EditSignal）      │
-│    ├─ LLM 生成 clips JSON                                                │
-│    ├─ 解析 + 白名单校验 + 证据自动填充                                    │
+│    ├─ 构造 beat 候选 Prompt（含章节/场景上下文 + 三类信号 + 证据）         │
+│    ├─ LLM 选择 candidate_id 序列                                          │
+│    ├─ 解析为 beat 级 EditClip + 证据自动填充                              │
 │    └─ Reviewer Agent 审核                                                │
 │         ├─ 规则校验                                                      │
 │         ├─ Grounding 校验                                                │
@@ -97,7 +97,7 @@
 |------|----------|----------|------|
 | Understand | 用户视频、全局配置、LLM / embedding 配置 | `memory.json`、`index/`、events / characters / signals 等散文件 | 10 步理解流水线，详见 [01_pipeline_understand.md](01_pipeline_understand.md) 的阶段输入/输出总表；final_build 索引失败时不会标记完成 |
 | Search | 用户查询、`memory.json`、`index/search_index.json`、向量索引（可选） | `SearchResult[]` | 三层漏斗召回并重排，返回可引用的证据片段 |
-| Edit | 用户剪辑需求、Search 结果、VideoMemory、角色/事件/信号证据 | `EditPlan`、Reviewer 结果 | Director 生成结构化 clips，Reviewer 做规则、Grounding 和 LLM 审核 |
+| Edit | 用户剪辑需求、Search 结果、VideoMemory、角色/事件/信号证据 | `EditPlan`、Reviewer 结果 | Director 生成 beat 级结构化 clips，Reviewer 做规则、Grounding 和 LLM 审核 |
 | Render | `EditPlan`、原始视频 `original.*`、渲染配置 | `output.mp4` | 使用原始视频裁剪、拼接、字幕/BGM 和最终校验 |
 
 ---
@@ -167,7 +167,7 @@ Step 10 会把三类信号、四层 MemoryUnit 和九类索引一起收口到 `m
 
 ### 6. 证据驱动的 EditPlan
 
-Director 不允许自造片段，每个 EditClip 必须有 `evidence_refs`。Reviewer 会检查时间、角色、事件覆盖、叙事结构和目标时长。
+Director 不允许自造片段，每个 beat 级 EditClip 必须有 `evidence_refs`，并引用真实存在的 `candidate_id` / `beat:{index}`。Reviewer 会检查 beat 时间边界、角色、事件覆盖、叙事结构和目标时长。
 
 ### 7. 容错与降级
 

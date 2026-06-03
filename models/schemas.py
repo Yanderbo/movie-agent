@@ -632,6 +632,7 @@ class AudioStrategy(BaseModel):
 class EditClip(BaseModel):
     """EditPlan 中的单个片段"""
     clip_index: int
+    source_unit_type: str = "shot"     # shot / beat；v4.1 Director 默认输出 beat
     source_scene_index: int
     source_start: float               # 源视频起始时间(秒)
     source_end: float                 # 源视频结束时间(秒)

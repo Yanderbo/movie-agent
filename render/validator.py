@@ -38,11 +38,15 @@ def validate_plan(plan: EditPlan, memory: VideoMemory) -> list[str]:
 
     video_duration = memory.meta.duration
 
+    beat_by_index = {b.beat_index: b for b in memory.beats}
+
     # 3. 片段校验
     max_scene = max((s.scene_index for s in memory.scenes), default=-1)
     seen_indices = set()
 
     for clip in plan.clips:
+        source_unit_type = getattr(clip, "source_unit_type", "shot") or "shot"
+
         # clip_index 唯一性
         if clip.clip_index in seen_indices:
             errors.append(f"片段 clip_index={clip.clip_index} 重复")
@@ -56,7 +60,7 @@ def validate_plan(plan: EditPlan, memory: VideoMemory) -> list[str]:
             )
             continue
 
-        # 找到对应 scene
+        # 找到兼容 scene。beat 级片段中它代表 beat 的首个 shot。
         scene = next(
             (s for s in memory.scenes if s.scene_index == clip.source_scene_index),
             None,
@@ -100,17 +104,42 @@ def validate_plan(plan: EditPlan, memory: VideoMemory) -> list[str]:
                 f"与 source/speed 不一致 (预期 {expected_timeline:.1f}s)"
             )
 
-        if clip.source_start < scene.start_time - 1.0:
-            errors.append(
-                f"片段 {clip.clip_index}: source_start ({clip.source_start:.1f}) "
-                f"远早于场景起始 ({scene.start_time:.1f})"
-            )
+        if source_unit_type == "beat":
+            beat_index = clip.source_beat_index
+            if beat_index is None:
+                errors.append(f"片段 {clip.clip_index}: beat 级片段缺少 source_beat_index")
+            else:
+                beat = beat_by_index.get(beat_index)
+                if not beat:
+                    errors.append(f"片段 {clip.clip_index}: 找不到 beat {beat_index}")
+                else:
+                    if clip.source_scene_index not in beat.shot_indices:
+                        errors.append(
+                            f"片段 {clip.clip_index}: source_scene_index={clip.source_scene_index} "
+                            f"不属于 beat {beat_index}"
+                        )
+                    if clip.source_start < beat.start_time - 1.0:
+                        errors.append(
+                            f"片段 {clip.clip_index}: source_start ({clip.source_start:.1f}) "
+                            f"远早于 beat 起始 ({beat.start_time:.1f})"
+                        )
+                    if clip.source_end > beat.end_time + 1.0:
+                        errors.append(
+                            f"片段 {clip.clip_index}: source_end ({clip.source_end:.1f}) "
+                            f"远晚于 beat 结束 ({beat.end_time:.1f})"
+                        )
+        else:
+            if clip.source_start < scene.start_time - 1.0:
+                errors.append(
+                    f"片段 {clip.clip_index}: source_start ({clip.source_start:.1f}) "
+                    f"远早于场景起始 ({scene.start_time:.1f})"
+                )
 
-        if clip.source_end > scene.end_time + 1.0:
-            errors.append(
-                f"片段 {clip.clip_index}: source_end ({clip.source_end:.1f}) "
-                f"远晚于场景结束 ({scene.end_time:.1f})"
-            )
+            if clip.source_end > scene.end_time + 1.0:
+                errors.append(
+                    f"片段 {clip.clip_index}: source_end ({clip.source_end:.1f}) "
+                    f"远晚于场景结束 ({scene.end_time:.1f})"
+                )
 
         # 速度
         if clip.speed <= 0:

@@ -56,20 +56,52 @@ def review_plan(
                 f"(偏差 {deviation:.0%})"
             )
 
-    # 3. 场景引用合法性
+    # 3. 来源引用合法性
     max_scene = max((s.scene_index for s in memory.scenes), default=-1)
+    beat_by_index = {b.beat_index: b for b in memory.beats}
     for clip in plan.clips:
         if clip.source_scene_index < 0 or clip.source_scene_index > max_scene:
             issues.append(
                 f"片段 {clip.clip_index} 引用了无效场景: {clip.source_scene_index}"
             )
         else:
-            # 检查时间范围
             scene = next(
                 (s for s in memory.scenes if s.scene_index == clip.source_scene_index),
                 None,
             )
-            if scene:
+            if scene is None:
+                issues.append(
+                    f"片段 {clip.clip_index} 引用了无效场景: {clip.source_scene_index}"
+                )
+                continue
+            if clip.source_start >= clip.source_end:
+                issues.append(
+                    f"片段 {clip.clip_index} 时间范围非法: "
+                    f"{clip.source_start:.1f} >= {clip.source_end:.1f}"
+                )
+                continue
+            if getattr(clip, "source_unit_type", "shot") == "beat":
+                beat = beat_by_index.get(clip.source_beat_index)
+                if not beat:
+                    issues.append(
+                        f"片段 {clip.clip_index} 引用了无效 beat: {clip.source_beat_index}"
+                    )
+                else:
+                    if clip.source_scene_index not in beat.shot_indices:
+                        issues.append(
+                            f"片段 {clip.clip_index} 的兼容 scene 不属于 beat {beat.beat_index}"
+                        )
+                    if clip.source_start < beat.start_time - 0.5:
+                        issues.append(
+                            f"片段 {clip.clip_index} source_start ({clip.source_start:.1f}) "
+                            f"早于 beat 起始 ({beat.start_time:.1f})"
+                        )
+                    if clip.source_end > beat.end_time + 0.5:
+                        issues.append(
+                            f"片段 {clip.clip_index} source_end ({clip.source_end:.1f}) "
+                            f"晚于 beat 结束 ({beat.end_time:.1f})"
+                        )
+            elif scene:
                 if clip.source_start < scene.start_time - 0.5:
                     issues.append(
                         f"片段 {clip.clip_index} source_start ({clip.source_start:.1f}) "
@@ -101,7 +133,14 @@ def review_plan(
     # ═══ 如果规则校验有严重问题，直接返回不通过 ═══
     critical_issues = [
         i for i in issues
-        if "无效场景" in i or "片段数量过少" in i
+        if (
+            "无效场景" in i
+            or "无效 beat" in i
+            or "时间范围非法" in i
+            or "片段数量过少" in i
+            or "缺少有效的 evidence_refs" in i
+            or "unchecked" in i
+        )
     ]
     if critical_issues:
         return ReviewResult(
@@ -155,10 +194,11 @@ def _grounding_check(plan: EditPlan, memory: VideoMemory) -> list[str]:
     """
     issues = []
 
-    # 构建 MemoryUnit 快速索引
+    # 构建 MemoryUnit / Beat 快速索引
     mu_by_scene = {}
     for mu in memory.memory_units:
         mu_by_scene[mu.scene_index] = mu
+    beat_by_index = {b.beat_index: b for b in memory.beats}
 
     # ── 检查 1: evidence_refs 非空 ──
     no_evidence_count = 0
@@ -173,44 +213,69 @@ def _grounding_check(plan: EditPlan, memory: VideoMemory) -> list[str]:
             f"{no_evidence_count}/{len(plan.clips)} 个片段缺少有效的 evidence_refs"
         )
 
-    # ── 检查 2: 时间精度（与 MemoryUnit 的 time_range 对比）──
+    # ── 检查 2: 时间精度（beat 级优先与 Beat 边界对比）──
     for clip in plan.clips:
-        mu = mu_by_scene.get(clip.source_scene_index)
-        if not mu:
-            continue
-
-        # source_start 不应早于 MemoryUnit 的 start_time 超过 0.5s
-        if clip.source_start < mu.start_time - 0.5:
-            issues.append(
-                f"[Grounding] 片段 {clip.clip_index}: source_start ({clip.source_start:.1f}s) "
-                f"早于 MemoryUnit 起始 ({mu.start_time:.1f}s) 超过 0.5s"
-            )
-
-        # source_end 不应晚于 MemoryUnit 的 end_time 超过 0.5s
-        if clip.source_end > mu.end_time + 0.5:
-            issues.append(
-                f"[Grounding] 片段 {clip.clip_index}: source_end ({clip.source_end:.1f}s) "
-                f"晚于 MemoryUnit 结束 ({mu.end_time:.1f}s) 超过 0.5s"
-            )
+        if getattr(clip, "source_unit_type", "shot") == "beat":
+            beat = beat_by_index.get(clip.source_beat_index)
+            if not beat:
+                continue
+            if f"beat:{beat.beat_index}" not in clip.evidence_refs:
+                issues.append(
+                    f"[Grounding] 片段 {clip.clip_index}: evidence_refs 未引用 beat:{beat.beat_index}"
+                )
+            if clip.source_start < beat.start_time - 0.5:
+                issues.append(
+                    f"[Grounding] 片段 {clip.clip_index}: source_start ({clip.source_start:.1f}s) "
+                    f"早于 Beat 起始 ({beat.start_time:.1f}s) 超过 0.5s"
+                )
+            if clip.source_end > beat.end_time + 0.5:
+                issues.append(
+                    f"[Grounding] 片段 {clip.clip_index}: source_end ({clip.source_end:.1f}s) "
+                    f"晚于 Beat 结束 ({beat.end_time:.1f}s) 超过 0.5s"
+                )
+        else:
+            mu = mu_by_scene.get(clip.source_scene_index)
+            if not mu:
+                continue
+            if clip.source_start < mu.start_time - 0.5:
+                issues.append(
+                    f"[Grounding] 片段 {clip.clip_index}: source_start ({clip.source_start:.1f}s) "
+                    f"早于 MemoryUnit 起始 ({mu.start_time:.1f}s) 超过 0.5s"
+                )
+            if clip.source_end > mu.end_time + 0.5:
+                issues.append(
+                    f"[Grounding] 片段 {clip.clip_index}: source_end ({clip.source_end:.1f}s) "
+                    f"晚于 MemoryUnit 结束 ({mu.end_time:.1f}s) 超过 0.5s"
+                )
 
     # ── 检查 3: 角色一致性 ──
     for clip in plan.clips:
         if not clip.characters:
             continue
-        mu = mu_by_scene.get(clip.source_scene_index)
-        if not mu or not mu.characters:
+        if getattr(clip, "source_unit_type", "shot") == "beat":
+            beat = beat_by_index.get(clip.source_beat_index)
+            valid_chars = set(beat.characters if beat else [])
+            if beat:
+                for scene_index in beat.shot_indices:
+                    mu = mu_by_scene.get(scene_index)
+                    if mu:
+                        valid_chars.update(mu.characters)
+        else:
+            mu = mu_by_scene.get(clip.source_scene_index)
+            valid_chars = set(mu.characters if mu else [])
+        if not valid_chars:
             continue
         for char_id in clip.characters:
-            if char_id not in mu.characters:
+            if char_id not in valid_chars:
                 issues.append(
                     f"[Grounding] 片段 {clip.clip_index}: 声称包含人物 {char_id}，"
-                    f"但 MemoryUnit scene_{clip.source_scene_index} 中未出现该人物"
+                    "但来源单元中未出现该人物"
                 )
 
     # ── 检查 4: 高重要性事件覆盖率 ──
     important_events = [e for e in memory.events if e.importance >= 7]
     if important_events:
-        covered_scenes = {clip.source_scene_index for clip in plan.clips}
+        covered_scenes = _covered_scene_indices(plan, beat_by_index)
         uncovered_events = []
         for event in important_events:
             # 检查事件的 scene_indices 是否有任何一个被 EditPlan 覆盖
@@ -233,6 +298,18 @@ def _grounding_check(plan: EditPlan, memory: VideoMemory) -> list[str]:
     return issues
 
 
+def _covered_scene_indices(plan: EditPlan, beat_by_index: dict[int, object]) -> set[int]:
+    covered = set()
+    for clip in plan.clips:
+        if getattr(clip, "source_unit_type", "shot") == "beat":
+            beat = beat_by_index.get(clip.source_beat_index)
+            if beat:
+                covered.update(beat.shot_indices)
+                continue
+        covered.add(clip.source_scene_index)
+    return covered
+
+
 def _llm_review(plan: EditPlan, memory: VideoMemory, user_prompt: str) -> dict | None:
     """使用 LLM 进行审核"""
     client = get_llm_client()
@@ -245,7 +322,10 @@ def _llm_review(plan: EditPlan, memory: VideoMemory, user_prompt: str) -> dict |
         "clips": [
             {
                 "clip_index": c.clip_index,
+                "source_unit_type": getattr(c, "source_unit_type", "shot"),
                 "source_scene_index": c.source_scene_index,
+                "source_beat_index": c.source_beat_index,
+                "source_story_scene_index": c.source_story_scene_index,
                 "source_start": c.source_start,
                 "source_end": c.source_end,
                 "duration": round(c.source_end - c.source_start, 1),

@@ -47,12 +47,12 @@ def review_plan(plan: EditPlan, memory: VideoMemory, user_prompt: str) -> Review
 |------|--------|------|--------|
 | 1 | 片段数量 | 3 ≤ clips ≤ 20 | 🔴 严重（<3时直接拒绝） |
 | 2 | 时长偏差 | 实际时长 vs 目标时长，偏差 ≤ 15% | ⚠️ 一般 |
-| 3 | 场景引用 | `source_scene_index` 在 0 ~ max_scene_index 范围内 | 🔴 严重 |
-| 4 | 时间合法性 | `source_start` ≥ scene.start_time - 0.5s，`source_end` ≤ scene.end_time + 0.5s | ⚠️ 一般 |
+| 3 | 来源引用 | beat 级片段要求 `source_beat_index` 存在；兼容 `source_scene_index` 必须合法 | 🔴 严重 |
+| 4 | 时间合法性 | `source_start < source_end` 为硬约束；beat 级片段必须落在 Beat 边界内；shot 级旧片段仍按 scene 边界检查 | 🔴 / ⚠️ |
 | 5 | 叙事完整 | clips 中包含 `hook` 角色（当 clips ≥ 3 时） | ⚠️ 一般 |
 | 6 | 节奏多样性 | 不允许连续 3 个相同 `narrative_role` | ⚠️ 一般 |
 
-**严重问题（无效场景 / 片段过少）直接返回 `approved=False, score=0.2`，跳过 LLM 审核。**
+**严重问题（无效场景 / 无效 beat / 非法时间范围 / 片段过少 / 缺少有效证据）直接返回 `approved=False, score=0.2`，跳过 LLM 审核。**
 
 ### Grounding 校验（新增）
 
@@ -68,21 +68,21 @@ def review_plan(plan: EditPlan, memory: VideoMemory, user_prompt: str) -> Review
 
 #### 2. 时间精度
 
-将 clip 的 `source_start / source_end` 与对应 MemoryUnit 的时间范围对比：
-- `source_start < mu.start_time - 0.5s` → 问题
-- `source_end > mu.end_time + 0.5s` → 问题
+beat 级片段优先与对应 Beat 的时间范围对比，并要求 `evidence_refs` 包含 `beat:{index}`。旧 shot 级片段仍与对应 MemoryUnit 对比：
+- `source_start < unit.start_time - 0.5s` → 问题
+- `source_end > unit.end_time + 0.5s` → 问题
 
 #### 3. 角色一致性
 
-检查 clip 中声称的 `characters` 是否在对应 MemoryUnit 的 `characters` 中出现。
+检查 clip 中声称的 `characters` 是否在来源 beat 或 beat 内 shot 的 `MemoryUnit.characters` 中出现。
 
-例如：clip 说包含 `char_002`，但 MemoryUnit scene_5 的 characters 是 `[char_000, char_001]`，则报错。
+例如：clip 说包含 `char_002`，但来源 beat 与其所有 shot 都没有该人物，则报错。
 
 #### 4. 高重要性事件覆盖率
 
 - 收集 `importance >= 7` 的事件
 - 通过 `event.scene_indices` 找到事件覆盖的 scene
-- 检查 EditPlan 的 clips 是否覆盖了这些 scene
+- beat 级片段用 `beat.shot_indices` 展开覆盖 scene，再检查 EditPlan 是否覆盖这些 scene
 - 未覆盖的事件报告为 issue
 
 ### LLM 审核
@@ -94,7 +94,9 @@ def review_plan(plan: EditPlan, memory: VideoMemory, user_prompt: str) -> Review
   "clips": [
     {
       "clip_index": 0,
+      "source_unit_type": "beat",
       "source_scene_index": 5,
+      "source_beat_index": 3,
       "duration": 14.5,
       "narrative_role": "hook",
       "evidence_refs": ["search_result#scene_5"],
