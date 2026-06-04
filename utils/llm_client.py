@@ -17,6 +17,8 @@ import config
 
 logger = get_logger("LLMClient")
 
+DEFAULT_RETRY_DELAYS = (5, 10, 20)
+
 
 class LLMClient:
     """
@@ -195,9 +197,11 @@ class LLMClient:
                         continue
 
         except requests.exceptions.Timeout:
+            result["success"] = False
             result["error"] = f"请求超时 ({self.timeout}秒)"
             logger.error(result["error"])
         except Exception as e:
+            result["success"] = False
             result["error"] = str(e)
             logger.error(f"API 请求异常: {e}")
 
@@ -207,17 +211,28 @@ class LLMClient:
     # ─── 重试封装 ─────────────────────────────────────────────
 
     def _request_with_retry(self, messages, max_retries=3, **kwargs) -> dict:
-        """带指数退避重试的请求"""
+        """请求失败后按 5/10/20 秒退避，默认执行 3 次重试。"""
         last_result = None
-        for attempt in range(max_retries):
+        max_retries = max(0, int(max_retries))
+        for attempt in range(max_retries + 1):
             result = self._request(messages, **kwargs)
             if result["success"] and result["content"].strip():
                 return result
+            if result["success"]:
+                result["success"] = False
+                result["error"] = result.get("error") or "空响应"
             last_result = result
-            wait = 2 ** attempt
+            if attempt >= max_retries:
+                logger.warning(
+                    f"请求失败，已完成 {max_retries} 次重试: "
+                    f"{result.get('error') or '空响应'}"
+                )
+                break
+
+            wait = DEFAULT_RETRY_DELAYS[min(attempt, len(DEFAULT_RETRY_DELAYS) - 1)]
             logger.warning(
-                f"请求失败 (尝试 {attempt+1}/{max_retries})，{wait}秒后重试: "
-                f"{result.get('error', '空响应')}"
+                f"请求失败，{wait}秒后进行第 {attempt + 1}/{max_retries} 次重试: "
+                f"{result.get('error') or '空响应'}"
             )
             time.sleep(wait)
         return last_result or {"success": False, "content": "", "error": "全部重试失败"}

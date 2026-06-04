@@ -98,12 +98,13 @@ Step 4 `face_cluster.py` 的主要产物，用于在 Step 5 中作为 Gemini 角
 
 ### CharacterProfile（动态角色档案）v4.1
 
-Step 5 `minute_chunk.py` 在每个 chunk 处理后逐步更新的角色档案。低证据 `char_tmp_chunk_*` 可能只保留在该中间档案和原始 transcript / alignment 中，不一定进入正式 `characters.json` / `VideoMemory.characters`。
+Step 5 `minute_chunk.py` 在每个 chunk 处理后逐步更新的角色档案。无法匹配脸谱的人物只有获得明确姓名、职位、称谓、关系或稳定剧情身份时才会形成临时档案；随后会合并到已有稳定角色或晋升为 `char_inferred_XXXX`。完全匿名人物不会保留为角色档案，收敛后的 `character_profiles.json` 只保留稳定 ID。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `character_id` | str | 角色 ID |
 | `names` | list[str] | 已知称呼，第一个通常作为主名称 |
+| `identity_description` | str | 片中明确提供的姓名、职位、称谓、关系或稳定剧情身份 |
 | `description` | str | 最新外观描述 |
 | `appearance_changes` | list[dict] | 外观变化记录，如 `{chunk_idx, description}` |
 | `key_actions` | list[dict] | 关键行为记录，如 `{chunk_idx, action}` |
@@ -113,7 +114,7 @@ Step 5 `minute_chunk.py` 在每个 chunk 处理后逐步更新的角色档案。
 | `entity_type` | str | human / animal / robot / other |
 | `gallery_ref` | str | 关联的 `CharacterGallery.character_id` |
 
-更新策略：`minute_chunk.py` 会保留 `appearance_changes` 历史，但不会让“无”“无明显变化”“无法判断”等占位文本覆盖已有 `description`；`names` 和 `key_actions` 仍会过滤这类空泛输出。
+更新策略：`identity_description` 与外观 `description` 分开保存，避免后续换装或外观更新覆盖人物身份；`minute_chunk.py` 会保留 `appearance_changes` 历史，但不会让“无”“无明显变化”“无法判断”等占位文本覆盖已有 `description`；`names` 和 `key_actions` 仍会过滤这类空泛输出。
 
 ### MinuteChunk（分钟级理解单元）v4.1
 
@@ -401,6 +402,7 @@ EventNode = Event   # 旧代码 import EventNode 可正常工作
 | `VideoMeta.original_fps` / `compressed_fps` | `0.0` | v4.1 |
 | `CharacterGallery.gallery_paths` / `gallery_timestamps` / `gallery_scene_indices` / `gallery_keyframe_paths` / `appearance_scenes` | `[]` | v4.1 |
 | `CharacterProfile.names` / `appearance_changes` / `key_actions` | `[]` | v4.1 |
+| `CharacterProfile.identity_description` | `""` | v4.1 |
 | `MinuteChunk.raw_transcripts` / `per_shot_vision` / `per_shot_audio` | `[]` | v4.1 |
 | `MinuteChunk.cross_shot_analysis` | `{}` | v4.1 |
 | `MinuteChunk.suggested_beats` | `[]` | v4.1 |

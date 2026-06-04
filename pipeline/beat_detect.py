@@ -22,7 +22,7 @@ from utils.logger import get_logger
 
 logger = get_logger("BeatDetect")
 
-PRIOR_BATCH_SIZE = 30
+BEAT_BATCH_SIZE = 20
 
 BEAT_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析以下镜头序列，将连续镜头按"叙事节拍"（Beat）分组。
 
@@ -146,10 +146,10 @@ def detect_beats(
     if prior_candidates:
         logger.info(
             f"使用 Step 5 suggested_beats 先验检测 Beat: "
-            f"{len(prior_candidates)} 个候选, batch_size={PRIOR_BATCH_SIZE}"
+            f"{len(prior_candidates)} 个候选, batch_size={BEAT_BATCH_SIZE}"
         )
-        for start in range(0, len(prior_candidates), PRIOR_BATCH_SIZE):
-            batch = prior_candidates[start: start + PRIOR_BATCH_SIZE]
+        for start in range(0, len(prior_candidates), BEAT_BATCH_SIZE):
+            batch = prior_candidates[start: start + BEAT_BATCH_SIZE]
             batch_shots = sorted({
                 si: shot_map[si]
                 for candidate in batch
@@ -172,8 +172,8 @@ def detect_beats(
             time.sleep(0.5)
     else:
         logger.info("未发现可用 Step 5 beat 先验，回退到按 shot 分段检测")
-        for start in range(0, len(shots), 30):
-            batch_shots = shots[start: start + 30]
+        for start in range(0, len(shots), BEAT_BATCH_SIZE):
+            batch_shots = shots[start: start + BEAT_BATCH_SIZE]
             logger.info(
                 f"  处理段: shot {batch_shots[0].scene_index}-"
                 f"{batch_shots[-1].scene_index}"

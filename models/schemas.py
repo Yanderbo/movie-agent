@@ -75,10 +75,11 @@ class CharacterProfile(BaseModel):
     动态角色档案（v4.1 — 随 MinuteChunk 处理逐步累积）。
 
     在处理每个 chunk 时，Gemini 会输出角色的新信息，
-    包括名称、外观变化、关键行为等，在此档案中动态更新。
+    包括名称、明确身份描述、外观变化、关键行为等，在此档案中动态更新。
     """
     character_id: str
     names: list[str] = Field(default_factory=list)                # 所有已知称呼，第一个为主名称
+    identity_description: str = ""    # 姓名、职位、称谓、关系等明确身份信息
     description: str = ""             # 最新外观描述
     appearance_changes: list[dict] = Field(default_factory=list)  # [{chunk_idx, description}]
     key_actions: list[dict] = Field(default_factory=list)         # [{chunk_idx, action}]

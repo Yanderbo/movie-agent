@@ -45,7 +45,7 @@ MinuteChunk (~2-3min)  ───Gemini──→  融合理解结果
 | 2 | Shot Detect | `meta.storage_path`、镜头切分阈值 | `scenes/scenes.json` | Shot 时间边界成为后续关键帧、角色、ASR/视觉回填、叙事聚合的统一锚点 |
 | 3 | Keyframe | `meta.storage_path`、`scenes/scenes.json` | `scenes/keyframes/*.jpg`、shot keyframe 路径 | 关键帧进入 Step 4 脸谱构建；不随 MinuteChunk 视频片段直接送入 Gemini |
 | 4 | Face Cluster | keyframes、shots、人脸检测/聚类配置 | `characters/face_clusters.json`、`characters/char_XXX_gallery/` | 角色脸谱作为 Step 5 的身份先验；InsightFace 不可用时输出空脸谱 |
-| 5 | MinuteChunk Understand | `meta.storage_path`、shots、face galleries、前序 `character_profiles.json` | `minute_chunks.json`、`transcripts.json`、`vision.json`、`ocr.json`、`audio_prosody.json`、`multimodal_alignments.json`、`characters.json`、`speaker_map.json`、可选 `character_identity_links.json` | 下游以回填后的 shot 级多模态散文件为基础；`suggested_beats` 会作为 Step 6 软先验；正式角色名册已过滤低证据临时角色 |
+| 5 | MinuteChunk Understand | `meta.storage_path`、shots、face galleries、前序 `character_profiles.json` | `minute_chunks.json`、`transcripts.json`、`vision.json`、`ocr.json`、`audio_prosody.json`、`multimodal_alignments.json`、`characters.json`、`speaker_map.json`、可选 `character_identity_links.json` | 下游以回填后的 shot 级多模态散文件为基础；`suggested_beats` 会作为 Step 6 软先验；明确身份的临时角色已晋升为稳定 ID，纯匿名人物不进入角色名册 |
 | 6 | Beat Detect | shots、`transcripts.json`、`vision.json`、`characters.json`、`minute_chunks.json` 中的 `suggested_beats` | `beats.json`、回写 `scenes/scenes.json` 的 `beat_index` | Beat 成为 StoryScene、Event、Memory 和信号计算的基础叙事单元；缓存命中也会回填反向链接 |
 | 7 | Story Scene Detect | beats、shots、台词/画面摘要、角色信息 | `story_scenes.json`、回写 `scenes/scenes.json` 的 `story_scene_index` | StoryScene 提供更高层剧情上下文，供 Chapter、Event 和 EditSignal 使用；缓存命中也会回填反向链接 |
 | 8 | Chapter Detect | story_scenes、beats、shots、角色/情绪摘要 | `chapters.json` | Chapter 提供长视频大段落结构，供事件抽取、MemoryUnit 和检索索引使用 |
@@ -219,16 +219,16 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 
 说明：Step 3 的关键帧不作为 MinuteChunk Gemini 输入；关键帧主要用于 Step 4 脸谱构建，以及后续多模态 RAG / 索引使用。
 
-调用容错：`minute_chunk.py` 会先用通用增强 JSON 解析器处理 Gemini 响应，支持代码围栏未闭合或 JSON 后带说明文字的情况。解析失败时，会用相同调用再重试一次；只有两次都失败时才跳过该 chunk，并由后续占位逻辑补齐未覆盖 shot。
+调用容错：底层 LLM API 请求异常、流式响应中断或空响应时会依次等待 5、10、20 秒并执行 3 次重试。API 返回内容后，`minute_chunk.py` 会先用通用增强 JSON 解析器处理 Gemini 响应，支持代码围栏未闭合或 JSON 后带说明文字的情况；解析失败时会用相同调用再请求一次，只有两次内容都无法解析时才跳过该 chunk，并由后续占位逻辑补齐未覆盖 shot。
 
 ### 5.3 Gemini 一次性输出
 - **A. ASR 转录** — 逐句，已用角色ID标注说话人
 - **B. 逐 shot 画面分析** — description/objects/mood/camera/OCR
 - **C. 逐 shot 音频特征** — music/sfx/emotion/speech_rate
-- **D. 角色动态更新** — 新称呼/形象变化/关键行为
+- **D. 角色动态更新** — 新称呼、`identity_description`、形象变化、关键行为
 - **E. 跨 shot 分析** — 叙事连续性/情绪弧线/beat 建议
 
-`characters_present` 必须只填写画面中真实可见、且有足够视觉证据识别的人物/实体。仅被台词、旁白、剧情提到，或只是和参考脸谱相似但看不清脸时，不应填入已知角色；无法确定身份时使用 `unknown_1` 等临时编号。
+`characters_present` 必须只填写画面中真实可见、且有足够视觉证据识别的人物/实体。仅被台词、旁白、剧情提到，或只是和参考脸谱相似但看不清脸时，不应填入已知角色。无法匹配已知角色时，只有片中明确提供姓名、职位、称谓、关系或稳定剧情身份的人物才使用 `unknown_1` 等临时内部编号，并在 `character_updates` 补全身份；完全匿名人物不记录为角色，其说话人保留为通用 `unknown`。
 
 ### 5.4 自顶向下回填
 将 chunk 结果按 shot 时间戳拆分回填：
@@ -243,27 +243,29 @@ InsightFace 不可用时跳过，写入空脸谱，由 Step 5 的 Gemini 自行�
 回填时会结合 `local_shot_index` 与全局 `scene_index` 解析 per-shot 结果，防止 LLM 把局部编号和全局编号混用。如果模型漏掉某些 shot，会写入占位 `vision` / `ocr` / `audio` / `multimodal_alignment`，避免散文件断档。`characters.json.appearance_scenes` 由 `multimodal_alignments.json.visible_characters` 和 Step 4 gallery 的出场镜头合并而来，因此角色出场异常时优先检查 `visible_characters` 的误标。
 
 ### 5.5 动态角色档案
-- 每处理完一个 chunk，更新角色档案：新称呼、形象变化、关键行为
+- 每处理完一个 chunk，更新角色档案：新称呼、明确身份描述、形象变化、关键行为
 - 下一个 chunk 的 prompt 中包含最新的角色档案
 - 允许根据剧情发展修改角色名称、增加别名
+- `identity_description` 保存片中明确出现的姓名、职位、称谓、关系或稳定剧情身份；该字段与外观 `description` 分开保存，避免后续外观更新覆盖身份信息
 - `appearance_change` 会保留到 `appearance_changes` 历史；其中“无”“无明显变化”“无法判断”等占位文本不会覆盖已有 `description`，也不会作为 Step 9 关系分析的有效外观线索
 - `key_action` / `new_names` 中的占位文本会被过滤，避免污染角色别名和关键行为
 
 ### 5.6 临时角色收敛与正式准入
 
-LLM 返回的 `unknown_N` 会先被规范化为带 chunk 作用域的 `char_tmp_chunk_XXXX_unknown_N`，避免不同 chunk 的临时人物互相覆盖。保存正式 `characters.json` 前，`minute_chunk.py` 会基于出现场景、台词数、可见/说话共现、相邻 chunk 名称和 `character_profiles.json` 描述做二次收敛：
+LLM 返回的 `unknown_N` 只作为有明确身份线索、但暂时无法匹配脸谱的人物内部关联编号，并会先规范化为带 chunk 作用域的 `char_tmp_chunk_XXXX_unknown_N`。保存正式 `characters.json` 前，`minute_chunk.py` 会基于名称、`identity_description`、出现场景、台词数和可见/说话共现做二次收敛：
 
 - 能匹配到稳定 `char_XXX` 的临时身份，会统一 canonical 到该正式角色。
-- 不能匹配稳定角色但跨 chunk 证据一致的临时身份，会合并为同一个高证据临时角色。
-- 低证据 `char_tmp_chunk_*` 默认不进入正式 `characters.json` / `speaker_map.json`，但仍保留在 `character_profiles.json`、transcript 和 alignment 原始记录中，方便排查。
-- 临时角色进入正式名册的最低证据是：至少 2 个 chunk，或至少 8 个出场 shot，或至少 6 条台词。
+- 不能匹配稳定角色但名称/身份描述一致的跨 chunk 临时身份，会先合并，再晋升为稳定 `char_inferred_XXXX`。
+- 单个 chunk 中只要获得明确姓名、职位、称谓、关系或稳定剧情身份，也会晋升为 `char_inferred_XXXX`，正式人物记录不继续暴露 `unknown_N`。
+- 没有任何身份描述的匿名临时人物不会进入人物档案、角色出场记录或 `speaker_map.json`；其台词文本保留，但 `character_id` 清空、speaker 统一为 `unknown`。
+- 收敛结束后 `character_profiles.json` 只保留稳定 ID；临时 ID 的合并/晋升轨迹记录在 `character_identity_links.json`。
 
 缓存命中时也会执行同一收敛逻辑，并重写 `characters.json`、`speaker_map.json`、`character_profiles.json` 和 `character_identity_links.json` 等派生产物，避免旧缓存继续污染下游。
 
 ### 5.7 特殊情况
 | 情况 | 处理 |
 |------|------|
-| 无人脸片段 | ASR标注 "unknown_1" 等临时编号，视觉只分析场景 |
+| 无人脸片段 | 有明确身份描述时使用 `unknown_N` 做内部关联并补全身份；完全匿名说话人统一为 `unknown`，不创建人物档案 |
 | 非人类角色 | 报告为"非人类实体"，简单记录 |
 | 角色换装 | 脸谱含多时段脸，Gemini参考匹配 |
 
@@ -273,7 +275,7 @@ LLM 返回的 `unknown_N` 会先被规范化为带 chunk 作用域的 `char_tmp_
 
 **模块**：`pipeline/beat_detect.py`
 
-利用 Step 5 回填后的 `transcripts.json`、`vision.json`、`characters.json` 和 `minute_chunks.json` 中的 `suggested_beats` 进行分组。`suggested_beats` 先在本地从 chunk 内相对 index 转换为全局 `scene_index`，再按约 30 个候选 Beat 一批送入 LLM，聚合为叙事节拍 Beat，输出 `beats.json` 并回填 `shot.beat_index`。如果没有可用先验，则回退到旧的 30 个 shot 一段的检测方式。
+利用 Step 5 回填后的 `transcripts.json`、`vision.json`、`characters.json` 和 `minute_chunks.json` 中的 `suggested_beats` 进行分组。`suggested_beats` 先在本地从 chunk 内相对 index 转换为全局 `scene_index`，再按 20 个候选 Beat 一批送入 LLM，聚合为叙事节拍 Beat，输出 `beats.json` 并回填 `shot.beat_index`。如果没有可用先验，则按 20 个 shot 一段检测。
 
 **输入 / 输出**：
 
@@ -289,7 +291,7 @@ LLM 返回的 `unknown_N` 会先被规范化为带 chunk 作用域的 `char_tmp_
 - **角色名册注入与校验**：`characters` 列表会被转成"已知角色名册"写入 prompt（`char_id: 名字 — 描述`）。LLM 在 `beat.characters` 中只能引用名册内的 ID，画面里出现但不在名册的人可以在描述中写成 `unknown_N`，但不能写入 `Beat.characters`。回填时按白名单过滤，丢弃编造的 `char_` ID；当名册为空时返回空角色列表。这避免了 beat 角色 ID 与 Step 4 face_cluster 的 `char_xxx` 体系错配。
 - **Step 5 先验转换**：`MinuteChunk.suggested_beats` 内的数字是 chunk 内相对 index，进入 prompt 前必须通过 `chunk.shot_indices[local_index]` 转为全局 `scene_index`；越界、非整数、空组和重复 shot 会被本地过滤。LLM 只看到绝对 shot index。
 - **chunk 边界融合提示**：普通 Prior Beat 来自单个 chunk 内部，边界基本可信；只有相邻 chunk 的“前一 chunk 最后 1 个 prior + 后一 chunk 第 1 个 prior”会融合为 `Boundary Fused Prior`，并在 prompt 中单独标注为重点判断区域，允许 LLM 合并、拆分或微调。
-- **先验批次大小**：有先验时按约 30 个 prior Beat 候选一批调用 LLM，而不是一次性传全片；无先验时保持按 30 个 shot 分段。
+- **批次大小**：有先验时按 20 个 prior Beat 候选一批调用 LLM，而不是一次性传全片；无先验时按 20 个 shot 分段。
 - **全覆盖 + 不重叠划分（`_finalize_beats`）**：分段 LLM 结果汇总后统一规范化——跨 beat 去重 shot（保留先出现者）、过滤越界/幻觉 shot 索引、把 LLM 漏分的 shot 按相邻关系聚合为 `transition` beat。保证每个 shot 恰好归属一个 beat，杜绝 `beat_index=None` 的孤儿镜头脱离叙事层级。
 - **beat_index 全局唯一且按时间连续**：规范化阶段按时间统一排序并重排 `beat_index` 为 `0..N-1`，忽略 LLM 返回值，防止跨段重复索引破坏 `shot → beat` 反向链接和下游 story_scene 关联。
 - **duration 采用墙钟跨度**：`beat.duration = end_time - start_time`（与 StoryScene / Chapter 统一），不再用子 shot 时长求和，避免漏分/非连续时口径漂移。
@@ -511,7 +513,7 @@ Step 6/7 完成后会回写 `scenes/scenes.json`，持久化 `beat_index` / `sto
 
 ## 当前实现注意事项
 
-- `face_cluster.py` 在 InsightFace 未安装时会跳过，返回空脸谱；此时 MinuteChunk prompt 会用 `unknown_1` 等临时标注，`_normalize_character_id()` 会统一将其转为 chunk 作用域的 `char_tmp_chunk_XXXX_unknown_X`，避免不同 chunk 的临时人物互相覆盖，并在 speaker、characters_present、character_updates 三个渠道保持一致。正式写入 `characters.json` 前还会做证据阈值和 canonicalization，低证据临时角色不会进入下游正式名册。
+- `face_cluster.py` 在 InsightFace 未安装时会跳过，返回空脸谱；此时 MinuteChunk 只为片中具有明确姓名、职位、称谓、关系或稳定剧情身份的人物使用 `unknown_N` 临时内部编号，并在 speaker、characters_present、character_updates 三个渠道保持一致。保存时这类角色会 canonicalize 到已有稳定角色或晋升为 `char_inferred_XXXX`；完全匿名人物不进入人物档案或角色关联。
 - `face_cluster.py` 会优先读取 `characters/face_clusters.json` 缓存。修改人脸聚类阈值后，如需重新生成角色脸谱，需要删除该缓存及对应 gallery 目录，或从 face cluster 前置步骤重新跑。
 - 人脸聚类参数以 `config.py` / `.env` 为准；修改阈值后需要清理旧 `face_clusters.json` 才会重新生成脸谱。
 - `minute_chunk.py` 的已有产物检查包含 9 个文件（含 `characters.json`, `speaker_map.json`, `multimodal_alignments.json`, `character_profiles.json`）；缓存命中时仍会对角色身份做收敛，并重写正式角色与 speaker 映射派生产物。

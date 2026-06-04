@@ -58,7 +58,7 @@ def load_memory(video_id) -> VideoMemory:
 | `vision.json` | VisionSummary | v4.1 MinuteChunk 回填画面摘要 |
 | `audio_prosody.json` | AudioProsody | v4.1 MinuteChunk 回填音频韵律 |
 | `multimodal_alignments.json` | MultimodalAlignment | v4.1 MinuteChunk 回填多模态对齐 |
-| `characters.json` | CharacterDeep → Character | 先尝试 CharacterDeep；Step 5 已过滤低证据临时角色 |
+| `characters.json` | CharacterDeep → Character | 先尝试 CharacterDeep；Step 5 已将明确身份的临时角色晋升为稳定 ID，并移除纯匿名人物 |
 | `speaker_map.json` | dict | speaker → character；Step 5 已同步 canonicalization |
 | `beats.json` | Beat | Shot → Beat |
 | `story_scenes.json` | StoryScene | Beat → StoryScene |

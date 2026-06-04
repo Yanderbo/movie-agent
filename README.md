@@ -168,9 +168,9 @@ video.mp4
 
 处理完成后，chunk 结果会按 shot 时间戳回填为传统散文件，兼容下游现有的 Beat、StoryScene、Chapter、Event 和 Memory 构建逻辑。
 
-角色回填采用保守策略：`characters_present` 只代表画面中真实可见且有足够视觉证据识别的人物；仅在台词、旁白或剧情中被提到的人物不会写入 `visible_characters`。回填时会同时检查 `local_shot_index` 和全局 `scene_index`，降低 LLM 把局部编号/全局编号混用导致的 shot 错位风险；如果模型漏掉某些 shot，会写入占位 `vision` / `ocr` / `audio` / `multimodal_alignment`，避免散文件断档。角色档案会保留 `appearance_changes` 历史，但“无”“无明显变化”“无法判断”等占位文本不会覆盖已有有效描述。
+角色回填采用保守策略：`characters_present` 只代表画面中真实可见且有足够视觉证据识别的人物；仅在台词、旁白或剧情中被提到的人物不会写入 `visible_characters`。无法匹配脸谱的人物只有在片中明确出现姓名、职位、称谓、关系或稳定剧情身份时才会作为临时身份关联，并通过 `identity_description` 尽量补全；完全匿名、没有身份描述的人物不会进入人物档案或角色出场记录。回填时会同时检查 `local_shot_index` 和全局 `scene_index`，降低 LLM 把局部编号/全局编号混用导致的 shot 错位风险；如果模型漏掉某些 shot，会写入占位 `vision` / `ocr` / `audio` / `multimodal_alignment`，避免散文件断档。
 
-保存 `characters.json` 前会对 `char_tmp_chunk_*` 做临时角色收敛：优先按出现场景、台词、可见/说话共现和档案描述合并到稳定 `char_XXX`，其次合并跨 chunk 临时身份；低证据临时角色不进入正式 `characters.json` / `speaker_map.json`，但仍保留在 `character_profiles.json` 和原始 transcript / alignment 记录中，便于排查。
+保存 `characters.json` 前会对 `char_tmp_chunk_*` 做临时角色收敛：有一致姓名/身份描述的临时身份会合并到已有稳定角色；无法匹配已有角色但获得明确身份描述的，会晋升为稳定 `char_inferred_XXXX`。没有姓名、职位、称谓、关系等身份描述的匿名人物会从人物档案、transcript 角色关联、alignment 和 `speaker_map.json` 中移除，但台词文本仍保留；收敛后的 `character_profiles.json` 也只保留稳定 ID。
 
 ---
 
@@ -254,7 +254,7 @@ SearchResult top-k
 | 模型 | 说明 |
 |------|------|
 | `CharacterGallery` | Step 4 的角色脸谱，保存代表脸路径、来源 shot/关键帧、聚类中心、出场镜头和角色层级 |
-| `CharacterProfile` | Step 5 的动态角色档案，随 chunk 更新名称、外观变化和关键行为 |
+| `CharacterProfile` | Step 5 的动态角色档案，随 chunk 更新名称、身份描述、外观变化和关键行为 |
 | `MinuteChunk` | 分钟级理解单元，记录 chunk 时间范围、shot 列表、原始理解结果和 suggested beats |
 | `VideoMeta` 压缩字段 | `compressed_path`、`is_compressed`、`original_height/fps`、`compressed_height/fps` |
 
@@ -386,10 +386,11 @@ python main.py understand --video-id xxx --resume
 
 - `understand --resume --video-id xxx` 依赖 `progress.json` 判断断点；如果进度文件缺失，当前代码不会自动从散文件推断完成步骤。
 - v4.1 通过 `_STEP_ALIASES` 将旧步骤映射到新链路的前置步骤：例如 `asr_windowed` / `vision` / `audio_analysis` / `speaker_bind` / `multimodal_align` 退到 `multi_keyframe`，`event_graph` / `character_arc` 退到 `chapter_detect`，`edit_signal` / `build_memory` / `indexer` 退到 `event_and_arc`，确保合并步骤完整重跑。
-- Step 6 会消费 Step 5 保存的 `MinuteChunk.suggested_beats` 作为软先验：先在本地把 chunk 内相对 index 转成全局 `scene_index`，再按约 30 个候选 Beat 分批送入 LLM。普通 chunk 内 prior 边界基本可信；相邻 chunk 的“前一 chunk 最后 1 个 prior + 后一 chunk 第 1 个 prior”会融合成 `Boundary Fused Prior`，在 prompt 中单独标注为重点判断区域。
+- Step 6 会消费 Step 5 保存的 `MinuteChunk.suggested_beats` 作为软先验：先在本地把 chunk 内相对 index 转成全局 `scene_index`，再按 20 个候选 Beat 分批送入 LLM。普通 chunk 内 prior 边界基本可信；相邻 chunk 的“前一 chunk 最后 1 个 prior + 后一 chunk 第 1 个 prior”会融合成 `Boundary Fused Prior`，在 prompt 中单独标注为重点判断区域。
 - Step 5 的 Gemini 响应会先经过增强 JSON 解析，支持未闭合代码围栏和 JSON 后附带说明文字；解析失败时会用相同调用再重试一次。两次都失败后才跳过该 chunk，并为未覆盖 shot 写入占位分析。
-- Step 5 会在保存正式 `characters.json` 前收敛 `char_tmp_chunk_*`：能合并到稳定角色或跨 chunk 临时角色的会统一 canonical ID；低证据临时角色只留在原始档案、台词和对齐记录中，不污染正式名册。缓存命中时也会执行同一收敛逻辑并重写派生产物。
-- Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验：只保留正式名册内 ID，`unknown_N` 只能作为局部文字描述，不写入 `Beat.characters`；名册为空时返回空角色列表。`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）；若缺少可用 Step 5 先验，则回退到按 30 个 shot 分段检测。
+- 底层 LLM API 请求异常、流式响应中断或空响应时会执行 3 次重试，重试前依次等待 5、10、20 秒。
+- Step 5 会在保存正式 `characters.json` 前收敛 `char_tmp_chunk_*`：明确身份会合并到已有角色或晋升为 `char_inferred_XXXX`；纯匿名临时人物不写入人物档案和角色关联。缓存命中时也会执行同一收敛逻辑并重写派生产物。
+- Step 6 `beat_detect.py` 会把 `characters` 列表转成"已知角色名册"注入 LLM prompt，并对返回的 `beat.characters` 做白名单校验：只保留正式名册内 ID，`unknown_N` 只能作为局部文字描述，不写入 `Beat.characters`；名册为空时返回空角色列表。`beat_index` 由全局自增计数器统一编号，不信任 LLM 返回值，防止跨段重复。续跑时缓存分支也走幂等的 `detect_beats()`（命中 `beats.json` 不调用 LLM，但仍回填 `shot.beat_index`）；若缺少可用 Step 5 先验，则回退到按 20 个 shot 分段检测。
 - Step 6/7/8（`beat_detect` / `story_scene_detect` / `chapter_detect`）统一通过 `_finalize_*` 规范化保证每一层都是「完整且不重叠的划分」：LLM 漏分的 shot / beat / story_scene 会被聚合为 `transition` 过渡单元补回，`beat_index` / `story_scene_index` / `chapter_index` 一律由本地计数器按时间重排为连续唯一值（不信任 LLM 返回的索引，避免重复/跳号污染下游按索引做 key 的 MemoryUnit 和信号映射）。因此结果文件中可能出现 `transition` 类型的兜底单元，属于预期行为。
 - Step 7/8 的 `characters` 一律从子层（beat / story_scene）聚合而来，不采信 LLM 返回的角色列表，从而把 Step 6 的角色白名单一致性贯穿到 StoryScene 与 Chapter。
 - Beat / StoryScene / Chapter 的 `duration` 统一为 `end_time - start_time`（墙钟跨度）；Step 7 对 beats 按 40 个一窗分段调用 LLM，避免长视频单次 prompt 过长导致尾部 beat 被截断丢失。

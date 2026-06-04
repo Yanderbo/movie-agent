@@ -46,11 +46,11 @@ CHUNK_UNDERSTAND_PROMPT = """你是一个专业的影视分析系统。请分析
 2. 每个 per_shot 对象必须同时包含 local_shot_index 和 scene_index；scene_index 必须使用镜头边界中给出的全局 scene_index。
 3. 每个镜头的 vision/audio 都要填写。即使镜头很短或画面较模糊，也要给出最合理的简短描述；确实无法辨认时写“无法判断”，不要留空字符串。
 4. ocr_texts 只有在画面没有文字时才可以为空数组。
-5. characters_present 只填写画面中真实可见、且有足够视觉证据识别的人物/实体；仅被台词、旁白、剧情提到，或只是和参考脸谱相似但看不清脸时，不要填入该角色。
+5. characters_present 只填写画面中真实可见、且有足够视觉证据识别的人物/实体；仅被台词、旁白、剧情提到，或只是和参考脸谱相似但看不清脸时，不要填入该角色。无法匹配已知角色时，只有片中明确提供姓名、职位、称谓、关系或稳定剧情身份的人物才使用 unknown_N 并同步写入 character_updates；完全匿名、没有身份描述的人物不要记录到 characters_present。
 
 A. **ASR 语音转录** — 逐句转录音频中的语音
    - start_time/end_time 必须标注相对于片段起始的时间戳，不要使用全片绝对时间戳
-   - 说话人用角色ID标注（如 char_000），无法匹配已知角色则用 "unknown_1", "unknown_2" 等临时编号区分不同人
+   - 说话人用角色ID标注（如 char_000）；无法匹配已知角色但片中有明确身份描述时，用 "unknown_1", "unknown_2" 等临时编号，并在 character_updates 补全身份；完全匿名且没有身份描述时统一写 "unknown"
    - type: dialogue / narration / voiceover
 
 B. **逐镜头画面分析** — 对每个镜头（按上方边界），分析：
@@ -62,7 +62,7 @@ B. **逐镜头画面分析** — 对每个镜头（按上方边界），分析�
    - shot_scale: 景别 (close_up/medium/long 等)
    - action_description: 动作描述
    - ocr_texts: 画面文字
-   - characters_present: 画面中可见且可识别的角色ID列表；不确定匹配哪个已知角色时使用 "unknown_1", "unknown_2"，不要为了填满而强行选择已知角色
+   - characters_present: 画面中可见且可识别的角色ID列表；不确定匹配哪个已知角色、但片中明确提供身份描述时使用 "unknown_1", "unknown_2" 并同步补全 character_updates；没有身份描述的匿名人物不要记录
 
 C. **逐镜头音频特征**
    - has_music, music_mood, has_sfx, sfx_tags
@@ -71,6 +71,8 @@ C. **逐镜头音频特征**
 
 D. **角色动态更新**
    - 已知角色的新信息：新称呼/别名、形象变化、关键行为
+   - 对无法匹配已知角色、但片中明确出现姓名、职位、称谓、关系或稳定剧情身份的人物，沿用同一个 unknown_N，在 new_names 和 identity_description 中尽量补全；unknown_N 仅作为内部关联编号，不要把它当人物名称
+   - 没有任何身份描述的匿名人物不要写入 character_updates，也不要仅凭外观或短暂出现创建角色档案
    - 新发现的非人类实体：名称和简述（动物/机器人等）
 
 E. **跨镜头分析**
@@ -99,7 +101,7 @@ F. **角色身份合并建议**（仅在你有充分证据时才填写）
     }}
   ],
   "character_updates": [
-    {{"character_id": "char_000", "new_names": [], "appearance_change": "", "key_action": ""}}
+    {{"character_id": "char_000", "new_names": [], "identity_description": "", "appearance_change": "", "key_action": ""}}
   ],
   "character_merge_suggestions": [],
   "cross_shot": {{
@@ -116,28 +118,30 @@ CHARACTER_SECTION_TEMPLATE = """== 已知角色脸谱 ==
 
 == 角色匹配规则 ==
 1. 以脸部特征（五官、脸型）为主要依据，同一人可能换装/换发型。
-2. 如果视频画面中的人物无法确定匹配哪个角色，标注为 "unknown_1", "unknown_2" 等临时编号，不要强行匹配。
-3. 如果出现非人类实体（动物/机器人等），在 character_updates 中报告。
+2. 如果人物无法确定匹配哪个已知角色，但片中明确提供姓名、职位、称谓、关系或稳定剧情身份，使用 "unknown_1", "unknown_2" 等临时内部编号，并在 character_updates 补全身份信息。
+3. 如果人物既无法匹配、片中也没有任何身份描述，不要记录为角色；说话人可统一标注为 "unknown"。
+4. 如果出现非人类实体（动物/机器人等），在 character_updates 中报告。
 
 == 已知角色档案 ==
 {profiles_text}"""
 
 PROFILE_ONLY_CHARACTER_SECTION_TEMPLATE = """== 角色信息 ==
 当前无参考脸谱图片，仅有文字档案。请结合以下档案信息识别画面中的人物。
-如果无法确定匹配哪个角色，标注为 "unknown_1", "unknown_2" 等临时编号。
+如果无法确定匹配哪个角色，只有片中明确提供姓名、职位、称谓、关系或稳定剧情身份时才使用 "unknown_1", "unknown_2" 等临时内部编号，并在 character_updates 补全身份。
 
 == 角色匹配规则 ==
 1. 以脸部特征（五官、脸型）为主要依据，同一人可能换装/换发型。
-2. 不确定时标注为 unknown，不要强行匹配。
-3. 如果出现非人类实体（动物/机器人等），在 character_updates 中报告。
+2. 完全匿名、没有身份描述的人物不要记录为角色；说话人可统一标注为 "unknown"。
+3. 不要强行匹配，也不要编造姓名、职位或关系。
+4. 如果出现非人类实体（动物/机器人等），在 character_updates 中报告。
 
 == 已知角色档案 ==
 {profiles_text}"""
 
 NO_CHARACTER_SECTION = """== 角色信息 ==
-尚无已知角色。请在分析中自行识别并命名画面中的人物。
-说话人用 "unknown_1", "unknown_2" 等临时标注。
-在 character_updates 中描述发现的人物外观。"""
+尚无已知角色。请优先从台词、字幕、OCR、称呼和剧情关系中识别人物的具体姓名、职位、称谓或稳定剧情身份。
+只有获得这类明确身份描述时，才用 "unknown_1", "unknown_2" 等临时内部编号关联说话人、characters_present 和 character_updates，并在 new_names / identity_description 中尽量补全。
+完全匿名、没有身份描述的人物无需记录为角色；其说话人统一标注为 "unknown"。不要仅凭外观或短暂出现创建人物档案。"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -424,6 +428,19 @@ def _init_profiles(galleries: list[CharacterGallery]) -> dict[str, CharacterProf
     return profiles
 
 
+def _combined_profile_description(profile: CharacterProfile) -> str:
+    """合并稳定身份描述与外观描述，避免身份信息被后续外观更新覆盖。"""
+    parts = []
+    for value in (
+        getattr(profile, "identity_description", ""),
+        getattr(profile, "description", ""),
+    ):
+        text = str(value or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "；".join(parts)
+
+
 def _build_gallery_records(galleries, profiles):
     """构建结构化 gallery 记录，替代旧的扁平 _collect_gallery_images。
 
@@ -449,8 +466,7 @@ def _build_gallery_records(galleries, profiles):
         desc = ""
         if profile:
             name = profile.names[0] if profile.names else g.character_id
-            # 优先用 description；为空时取最近一条 appearance_change
-            desc = profile.description or ""
+            desc = _combined_profile_description(profile)
             if not desc and profile.appearance_changes:
                 desc = profile.appearance_changes[-1].get("description", "")
 
@@ -512,8 +528,10 @@ def _build_prompt(chunk, chunk_shots, profiles, gallery_records):
     # 角色部分
     if gallery_records:
         profiles_lines = []
+        gallery_ids = set()
         for rec in gallery_records:
             cid = rec["character_id"]
+            gallery_ids.add(cid)
             name = rec["name"]
             desc = rec["description"] or "（暂无描述）"
             # 从 profiles 补充最近的 appearance_changes 和 key_actions
@@ -529,6 +547,13 @@ def _build_prompt(chunk, chunk_shots, profiles, gallery_records):
                     actions_str = "; ".join(a.get("action", "") for a in recent_actions)
                     extra += f" | 近期行为: {actions_str}"
             profiles_lines.append(f"- {cid} ({name}): {desc}{extra}")
+        # 没有脸谱但已获得明确姓名/职位等身份线索的角色，也要传给后续 chunk。
+        for cid, profile in profiles.items():
+            if cid in gallery_ids or profile.merged_into or not _profile_has_identity(profile):
+                continue
+            name = profile.names[0] if profile.names else profile.identity_description
+            desc = _combined_profile_description(profile) or "（暂无描述）"
+            profiles_lines.append(f"- {cid} ({name}): {desc}")
         char_section = CHARACTER_SECTION_TEMPLATE.format(
             profiles_text="\n".join(profiles_lines),
         )
@@ -536,12 +561,17 @@ def _build_prompt(chunk, chunk_shots, profiles, gallery_records):
         # 有 profiles 但没有 gallery（降级场景）— 使用专用模板
         profiles_lines = []
         for cid, p in profiles.items():
-            name = p.names[0] if p.names else cid
-            desc = p.description or "（暂无描述）"
+            if p.merged_into or (_is_temp_character_id(cid) and not _profile_has_identity(p)):
+                continue
+            name = p.names[0] if p.names else p.identity_description or cid
+            desc = _combined_profile_description(p) or "（暂无描述）"
             profiles_lines.append(f"- {cid} ({name}): {desc}")
-        char_section = PROFILE_ONLY_CHARACTER_SECTION_TEMPLATE.format(
-            profiles_text="\n".join(profiles_lines),
-        )
+        if profiles_lines:
+            char_section = PROFILE_ONLY_CHARACTER_SECTION_TEMPLATE.format(
+                profiles_text="\n".join(profiles_lines),
+            )
+        else:
+            char_section = NO_CHARACTER_SECTION
     else:
         char_section = NO_CHARACTER_SECTION
 
@@ -649,8 +679,10 @@ def _safe_text(value, default="") -> str:
 
 _PLACEHOLDER_TEXTS = {
     "无", "无变化", "无明显变化", "没有变化", "没有明显变化", "暂无",
-    "暂无描述", "无法判断", "无法辨认", "不确定", "未知", "none",
-    "null", "n/a", "na", "-", "--",
+    "暂无描述", "无法判断", "无法辨认", "不确定", "未知", "身份未知",
+    "身份不明", "不明身份人物", "匿名人物", "路人", "一名男子", "一名女子",
+    "男子", "女子", "unknown", "unknown person", "unidentified person",
+    "anonymous", "passerby", "none", "null", "n/a", "na", "-", "--",
 }
 
 
@@ -979,6 +1011,22 @@ def _backfill_chunk_result(result, chunk, chunk_shots, profiles, chunk_index=-1)
     return transcripts, ocr_results, vision_summaries, audio_prosodies, alignments
 
 
+_IDENTITY_DESCRIPTION_FIELDS = (
+    "identity_description",
+    "position",
+    "occupation",
+    "role",
+)
+
+
+def _extract_identity_description(update) -> str:
+    for field in _IDENTITY_DESCRIPTION_FIELDS:
+        text = _safe_text(update.get(field))
+        if text:
+            return text
+    return ""
+
+
 def _update_profiles(profiles, result, chunk_index):
     """根据 chunk 结果更新角色档案"""
     updates = result.get("character_updates", [])
@@ -1005,6 +1053,10 @@ def _update_profiles(profiles, result, chunk_index):
                 if n not in p.names:
                     p.names.append(n)
 
+            identity_desc = _extract_identity_description(update)
+            if identity_desc and not _is_placeholder_text(identity_desc):
+                p.identity_description = identity_desc
+
             change_desc = _safe_text(update.get("appearance_change", ""))
             if change_desc:
                 p.appearance_changes.append({
@@ -1027,10 +1079,14 @@ def _update_profiles(profiles, result, chunk_index):
                 n for n in _as_str_list(update.get("new_names", []))
                 if not _is_placeholder_text(n)
             ]
+            identity_desc = _extract_identity_description(update)
             change_desc = _safe_text(update.get("appearance_change", ""))
             profile = CharacterProfile(
                 character_id=cid,
                 names=new_names,
+                identity_description=(
+                    "" if _is_placeholder_text(identity_desc) else identity_desc
+                ),
                 description="" if _is_placeholder_text(change_desc) else change_desc,
                 tier="minor",
                 is_human=not cid.startswith("entity_"),
@@ -1106,9 +1162,6 @@ def _process_merge_suggestions(profiles, result, chunk_index):
 
 _MERGE_CONFIDENCE_THRESHOLD = 0.85
 _MERGE_MIN_CHUNK_REPORTS = 2
-_TEMP_FORMAL_MIN_CHUNKS = 2
-_TEMP_FORMAL_MIN_SCENES = 8
-_TEMP_FORMAL_MIN_DIALOGUES = 6
 
 
 def _apply_confirmed_merges(profiles, transcripts, alignments):
@@ -1233,8 +1286,8 @@ def _apply_confirmed_merges(profiles, transcripts, alignments):
 def _converge_temporary_characters(profiles, transcripts, alignments):
     """收敛 chunk 级临时角色，并给正式 characters.json 计算准入集合。
 
-    低证据 char_tmp_* 仍保留在原始 transcript/alignment/profile 产物中，
-    但不进入正式角色表和 speaker_map，避免污染下游角色名册。
+    获得明确姓名、职位、称谓、关系等身份线索的 char_tmp_* 会被提升为
+    稳定 char_inferred_*；完全匿名的临时人物会从人物档案和角色关联中移除。
     """
     evidence = _collect_character_evidence(profiles, transcripts, alignments)
     stable_ids = {
@@ -1248,7 +1301,6 @@ def _converge_temporary_characters(profiles, transcripts, alignments):
 
     mapping = {}
     link_details = []
-    accepted_temp_primaries = set()
 
     stable_by_signature = defaultdict(list)
     for cid in stable_ids:
@@ -1267,7 +1319,7 @@ def _converge_temporary_characters(profiles, transcripts, alignments):
             link_details.append({
                 "primary": target,
                 "duplicate": cid,
-                "reason": "临时角色与稳定角色存在一致的名称/描述线索",
+                "reason": "临时角色与稳定角色存在一致的名称/身份描述线索",
                 "confidence": 0.7,
                 "source": "temporary_character_convergence",
             })
@@ -1294,7 +1346,6 @@ def _converge_temporary_characters(profiles, transcripts, alignments):
                 cid,
             ),
         )
-        accepted_temp_primaries.add(primary)
         for cid in group:
             if cid == primary:
                 continue
@@ -1302,36 +1353,71 @@ def _converge_temporary_characters(profiles, transcripts, alignments):
             link_details.append({
                 "primary": primary,
                 "duplicate": cid,
-                "reason": "跨 chunk 临时角色存在一致的名称/描述线索",
+                "reason": "跨 chunk 临时角色存在一致的名称/身份描述线索",
                 "confidence": 0.65,
                 "source": "temporary_character_convergence",
             })
 
     if mapping:
         _apply_character_mapping(mapping, profiles, transcripts, alignments)
-        evidence = _collect_character_evidence(profiles, transcripts, alignments)
 
-    formal_ids = set()
-    for cid, p in profiles.items():
-        if p.merged_into:
-            continue
+    # 明确身份的临时人物提升为稳定 ID，避免正式人物表继续暴露 unknown 标记。
+    promotions = {}
+    inferred_index = 0
+    for cid in sorted(list(profiles)):
+        profile = profiles[cid]
         if (
-            cid in accepted_temp_primaries
-            or not _is_temp_character_id(cid)
-            or _temp_character_has_formal_evidence(cid, evidence.get(cid, {}))
+            not _is_temp_character_id(cid)
+            or profile.merged_into
+            or not _profile_has_identity(profile)
         ):
-            formal_ids.add(cid)
+            continue
+        while True:
+            target = f"char_inferred_{inferred_index:04d}"
+            inferred_index += 1
+            if target not in profiles:
+                break
+        profiles[target] = profile.model_copy(update={
+            "character_id": target,
+            "merged_into": "",
+        })
+        promotions[cid] = target
+        link_details.append({
+            "primary": target,
+            "duplicate": cid,
+            "reason": "临时角色获得明确姓名/职位等身份描述，提升为稳定角色",
+            "confidence": 0.8,
+            "source": "temporary_character_promotion",
+        })
 
-    skipped = [
-        cid for cid, p in profiles.items()
-        if _is_temp_character_id(cid) and not p.merged_into and cid not in formal_ids
-    ]
-    if skipped:
+    if promotions:
+        _apply_character_mapping(promotions, profiles, transcripts, alignments)
+        for detail in link_details:
+            primary = detail.get("primary")
+            detail["primary"] = promotions.get(primary, primary)
+
+    anonymous_ids = {
+        cid for cid, profile in profiles.items()
+        if _is_temp_character_id(cid)
+        and not _profile_has_identity(profile)
+    }
+    if anonymous_ids:
+        _drop_anonymous_temporary_characters(
+            anonymous_ids, profiles, transcripts, alignments
+        )
         logger.info(
-            f"低证据临时角色不写入正式角色表: {len(skipped)} 个 "
-            f"(示例: {skipped[:8]})"
+            f"匿名临时人物未写入人物档案/角色关联: {len(anonymous_ids)} 个 "
+            f"(示例: {sorted(anonymous_ids)[:8]})"
         )
 
+    # 所有临时身份此时都已完成映射、晋升或匿名清理，档案中只保留稳定 ID。
+    for cid in [cid for cid in profiles if _is_temp_character_id(cid)]:
+        profiles.pop(cid, None)
+
+    formal_ids = {
+        cid for cid, profile in profiles.items()
+        if not profile.merged_into and not _is_temp_character_id(cid)
+    }
     return link_details, formal_ids
 
 
@@ -1442,6 +1528,32 @@ def _apply_character_mapping(mapping, profiles, transcripts, alignments):
             profiles[dup].merged_into = primary
 
 
+def _drop_anonymous_temporary_characters(character_ids, profiles, transcripts, alignments):
+    """保留台词文本，但移除没有身份描述的匿名人物关联。"""
+    character_ids = set(character_ids)
+    for t in transcripts:
+        if t.character_id in character_ids:
+            t.character_id = None
+        if t.speaker in character_ids:
+            t.speaker = "unknown"
+
+    for al in alignments:
+        al.visible_characters = [
+            cid for cid in al.visible_characters if cid not in character_ids
+        ]
+        al.speaking_characters = [
+            cid for cid in al.speaking_characters if cid not in character_ids
+        ]
+        al.speaker_to_character = {
+            speaker: cid
+            for speaker, cid in al.speaker_to_character.items()
+            if cid not in character_ids
+        }
+
+    for cid in character_ids:
+        profiles.pop(cid, None)
+
+
 def _is_temp_character_id(cid: str) -> bool:
     return str(cid or "").startswith("char_tmp_")
 
@@ -1466,15 +1578,9 @@ def _profile_identity_signature(profile) -> str:
         if text and not text.startswith("unknown_") and not _is_placeholder_text(text):
             candidates.append(text)
 
-    desc = _safe_text(getattr(profile, "description", ""))
-    if desc and not desc.startswith("临时标注人物") and not _is_placeholder_text(desc):
-        candidates.append(desc)
-
-    for item in (getattr(profile, "appearance_changes", []) or [])[-2:]:
-        if isinstance(item, dict):
-            text = _safe_text(item.get("description", ""))
-            if text and not _is_placeholder_text(text):
-                candidates.append(text)
+    identity_desc = _safe_text(getattr(profile, "identity_description", ""))
+    if identity_desc and not _is_placeholder_text(identity_desc):
+        candidates.append(identity_desc)
 
     if not candidates:
         return ""
@@ -1483,12 +1589,8 @@ def _profile_identity_signature(profile) -> str:
     return "".join(ch for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")[:80]
 
 
-def _temp_character_has_formal_evidence(cid: str, evidence: dict) -> bool:
-    return (
-        len(evidence.get("chunks", set())) >= _TEMP_FORMAL_MIN_CHUNKS
-        or len(evidence.get("scenes", set())) >= _TEMP_FORMAL_MIN_SCENES
-        or evidence.get("dialogues", 0) >= _TEMP_FORMAL_MIN_DIALOGUES
-    )
+def _profile_has_identity(profile) -> bool:
+    return bool(_profile_identity_signature(profile))
 
 
 def _build_speaker_map(transcripts, formal_character_ids: set[str] | None = None) -> dict:
@@ -1679,8 +1781,8 @@ def _save_all_outputs(
         spans = [scene_time[i] for i in appearance if i in scene_time]
         chars.append(CharacterDeep(
             character_id=resolved_cid,
-            display_name=p.names[0] if p.names else cid,
-            description=p.description,
+            display_name=p.names[0] if p.names else p.identity_description or resolved_cid,
+            description=_combined_profile_description(p),
             role=None,
             appearance_scenes=appearance,
             total_screen_time=round(sum(e - s for s, e in spans), 1),

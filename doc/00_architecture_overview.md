@@ -137,7 +137,7 @@ v4.1 将 v3 的 `asr_windowed`、`vision`、`audio_analysis`、`character_deep`�
 | `speaker_map.json` | 从 speaker 标注直接派生的映射 |
 | `minute_chunks.json` | chunk 原始理解结果；`suggested_beats` 使用 chunk 内相对 index，Step 6 会先转成全局 `scene_index` 后作为软先验 |
 
-角色出场回填以视觉证据为准：`characters_present` 只表示画面中真实可见且可识别的人物，不能用台词/旁白/剧情提及来补角色。`minute_chunk.py` 在回填时会同时使用 `local_shot_index` 与全局 `scene_index` 做防御，避免局部编号和全局编号混用造成 shot 错位；角色档案会保留 `appearance_changes` 历史，但“无”“无明显变化”“无法判断”等占位文本不会覆盖已有有效描述。保存正式 `characters.json` 前还会收敛 `char_tmp_chunk_*`：能合并到稳定 `char_XXX` 或跨 chunk 临时身份的会 canonicalize，低证据临时角色只留在 profile / transcript / alignment 原始记录中，不进入下游正式名册。
+角色出场回填以视觉证据为准：`characters_present` 只表示画面中真实可见且可识别的人物，不能用台词/旁白/剧情提及来补角色。无法匹配已知角色时，只有片中明确出现姓名、职位、称谓、关系或稳定剧情身份的人物才会使用 `unknown_N` 做短期关联，并通过 `identity_description` 补全身份；完全匿名的人物不进入人物档案或角色出场记录。`minute_chunk.py` 在回填时会同时使用 `local_shot_index` 与全局 `scene_index` 做防御，避免局部编号和全局编号混用造成 shot 错位；保存正式 `characters.json` 前会把有明确身份的临时角色合并到已有稳定角色或晋升为 `char_inferred_XXXX`，并移除纯匿名人物的角色关联。
 
 ### 4. 层层聚合保持不变
 
@@ -149,7 +149,7 @@ Shot → Beat → StoryScene → Chapter → EventGraph
 
 每个层级仍可形成对应的 MemoryUnit，最终服务于检索、选材和 Reviewer Grounding。
 
-Beat Detect 会消费 Step 5 的 `MinuteChunk.suggested_beats` 作为软先验：普通 chunk 内 prior 边界基本可信；相邻 chunk 的“前一 chunk 最后 1 个 prior + 后一 chunk 第 1 个 prior”会融合成边界候选，并在 Step 6 prompt 中单独标注为重点判断区域。该阶段按约 30 个候选 Beat 分批调用 LLM，不一次性传全片。
+Beat Detect 会消费 Step 5 的 `MinuteChunk.suggested_beats` 作为软先验：普通 chunk 内 prior 边界基本可信；相邻 chunk 的“前一 chunk 最后 1 个 prior + 后一 chunk 第 1 个 prior”会融合成边界候选，并在 Step 6 prompt 中单独标注为重点判断区域。该阶段按 20 个候选 Beat 分批调用 LLM；没有先验时也按 20 个 shot 分段，不一次性传全片。
 
 EventGraph 在抽取事件时按 30 分钟分段，但输入优先使用 StoryScene / Beat 层级摘要，并对台词、画面和事件关系 prompt 做时间均匀采样，避免长视频只覆盖开头材料。
 
@@ -176,6 +176,7 @@ Director 不允许自造片段，每个 beat 级 EditClip 必须有 `evidence_re
 | 视频不需要压缩 | 直接使用原始视频作为 `storage_path` |
 | InsightFace 未安装 | `face_cluster` 返回空脸谱，MinuteChunk 自行识别角色 |
 | MinuteChunk 单个 chunk 解析失败 | 先尝试增强 JSON 解析；解析仍失败时用相同调用重试一次，仍失败则跳过该 chunk，后续为未覆盖 shot 补空 Vision/OCR/Audio |
+| LLM API 请求失败、流式响应中断或空响应 | 依次等待 5、10、20 秒，执行 3 次重试 |
 | FAISS 不可用 | 跳过 Embedding 检索层 |
 | Embedding API 不可用 | 跳过向量索引 |
 | Beat 检测 LLM 失败 | 有 Step 5 先验时按转换后的 prior 兜底，边界融合失败时保守保留原 tail/head prior；无先验时每 4 个 shot 一组默认分组 |

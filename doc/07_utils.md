@@ -50,6 +50,7 @@ def get_llm_client() -> LLMClient
 - 使用 `config.LLM_API_KEY`、`config.LLM_API_BASE`、`config.LLM_MODEL`
 - 所有请求通过 `requests.post()` 发送到 OpenAI 兼容接口
 - 超时由 `config.LLM_TIMEOUT`（默认300秒）控制
+- LLM 请求异常、流式响应中断或空响应时，首次调用后最多重试 3 次；三次重试前依次等待 5、10、20 秒，第三次重试失败后直接返回失败，不再额外等待
 
 ### `parse_json()` 的处理
 
