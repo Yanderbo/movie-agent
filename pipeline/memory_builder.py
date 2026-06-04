@@ -18,35 +18,11 @@ from models.schemas import (
     AudioProsody, MultimodalAlignment,
     MemoryUnit, BeatMemoryUnit, SceneMemoryUnit, ChapterMemoryUnit,
 )
+from prompt import ROLE_PROMPT_TEMPLATE
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
 logger = get_logger("MemoryBuilder")
-
-ROLE_PROMPT_TEMPLATE = """你是一个专业的影视分析师。请根据以下人物信息，判断每个人物在故事中的角色。
-
-=== 人物列表 ===
-{characters_info}
-
-可选角色：
-- male_lead: 男主角
-- female_lead: 女主角
-- villain: 反派
-- supporting: 配角
-- minor: 路人/群演
-
-请为每个人物指定一个角色。考虑出镜时长、台词量、事件参与度等因素。
-出镜最多且参与最多关键事件的通常是主角。
-
-输出 JSON 对象，key 为 character_id，value 为角色：
-```json
-{{
-  "char_000": "male_lead",
-  "char_001": "female_lead",
-  "char_002": "villain"
-}}
-```
-"""
 
 
 def build_memory_units(

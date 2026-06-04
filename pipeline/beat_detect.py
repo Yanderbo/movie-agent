@@ -16,6 +16,7 @@ import config
 from models.schemas import (
     Shot, Beat, TranscriptSegment, VisionSummary, Character, MinuteChunk,
 )
+from prompt import BEAT_PROMPT_TEMPLATE
 from utils import group_consecutive
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
@@ -23,60 +24,6 @@ from utils.logger import get_logger
 logger = get_logger("BeatDetect")
 
 BEAT_BATCH_SIZE = 20
-
-BEAT_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析以下镜头序列，将连续镜头按"叙事节拍"（Beat）分组。
-
-一个 Beat 是由若干连续镜头组成的叙事微单元，通常对应：
-- 一段完整的对话
-- 一个连续的动作序列
-- 一个情绪转折过程
-- 一段环境展示/空镜
-- 一个蒙太奇段落
-
-=== 镜头列表 ===
-{shots_info}
-
-=== Step 5 先验 Beat 候选（已转换为全局 shot index） ===
-{prior_info}
-
-=== 已知角色名册 ===
-（characters 字段只能填写以下角色 ID；画面中出现但不在名册内的人，不要写入 characters，可在 description 中描述，不要编造新的 char_ ID）
-{character_roster}
-
-请将这些镜头分组为若干 Beat，输出 JSON 数组。每个 Beat 包含：
-- beat_index: 从 {beat_offset} 开始编号
-- shot_indices: 包含的镜头索引列表（必须连续）
-- beat_type: 类型（setup / confrontation / resolution / transition / montage / dialogue / action / reveal）
-- description: 这个节拍讲了什么（一句话）
-- emotion: 主要情绪
-- intensity: 戏剧强度 (0.0 - 1.0)
-- characters: 涉及的人物 ID 列表
-
-规则：
-1. 相邻且叙事连贯的镜头归为同一 Beat
-2. 当场景/话题/情绪发生明显转换时，开启新 Beat
-3. 每个 Beat 通常包含 2-8 个镜头，但不强制
-4. 所有镜头都必须被分配到某个 Beat
-5. characters 字段只能填写"已知角色名册"中的 ID；无法对应名册的人不要写入 characters，只在 description 中描述，不要编造新的 char_ ID
-6. Step 5 先验是参考；普通 Prior Beat 来自单个 chunk 内部，边界基本可信，除非台词/画面明显冲突，不要过度重切
-7. Boundary Fused Prior 是相邻 chunk 的边界融合候选（前一个 chunk 最后 1 个 prior + 后一个 chunk 第 1 个 prior），只有这类候选需要重点判断是否合并或拆分
-8. 输出 shot_indices 必须使用上方 Shot 的全局索引，不要输出 chunk 内 local index
-
-只输出 JSON：
-```json
-[
-  {{
-    "beat_index": {beat_offset},
-    "shot_indices": [{example_shot_indices}],
-    "beat_type": "dialogue",
-    "description": "男女主角在咖啡厅讨论计划",
-    "emotion": "轻松",
-    "intensity": 0.3,
-    "characters": ["char_000", "char_001"]
-  }}
-]
-```
-"""
 
 
 def detect_beats(

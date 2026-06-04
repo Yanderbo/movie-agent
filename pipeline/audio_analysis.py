@@ -14,51 +14,11 @@ from pathlib import Path
 
 import config
 from models.schemas import Shot, AudioProsody, AudioSegment
+from prompt import AUDIO_PROMPT_TEMPLATE
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
 logger = get_logger("AudioAnalysis")
-
-AUDIO_PROMPT_TEMPLATE = """你是一个专业的影视音频分析师。请分析以下视频片段的音频特征。
-
-视频时间范围: {start:.1f}s - {end:.1f}s
-
-=== 该时段已有的台词信息 ===
-{transcript_info}
-
-=== 该时段已有的画面信息 ===
-{vision_info}
-
-请为该时间段内的每个镜头（shot）分析音频特征。镜头列表：
-{shots_info}
-
-对每个镜头，请判断：
-1. has_music: 是否有背景音乐
-2. music_mood: 音乐情绪（energetic/melancholic/tense/romantic/epic/calm，无音乐则为空）
-3. has_sfx: 是否有明显音效
-4. sfx_tags: 音效类型列表（explosion/door_slam/footsteps/rain/wind/car/gunshot 等）
-5. silence_ratio: 沉默/静音占比（0-1）
-6. speech_rate: 语速（slow/normal/fast，无语音则为空）
-7. volume_peak: 估计的音量峰值（0-1，高潮/爆炸=高，低语=低）
-8. speech_emotion: 语音情绪（calm/angry/sad/happy/fearful/surprised/neutral，无语音则为空）
-
-输出 JSON 数组，每个元素对应一个 shot，只输出 JSON：
-```json
-[
-  {{
-    "scene_index": 0,
-    "has_music": true,
-    "music_mood": "tense",
-    "has_sfx": false,
-    "sfx_tags": [],
-    "silence_ratio": 0.1,
-    "speech_rate": "fast",
-    "volume_peak": 0.7,
-    "speech_emotion": "angry"
-  }}
-]
-```
-"""
 
 
 def analyze_audio(

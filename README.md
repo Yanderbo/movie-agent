@@ -266,6 +266,7 @@ SearchResult top-k
 movie-agent/
 ├── main.py                  # CLI 主入口
 ├── config.py                # 全局配置
+├── prompt.py                # 全项目静态 Prompt 模板
 ├── requirements.txt         # 依赖
 │
 ├── models/
@@ -299,8 +300,7 @@ movie-agent/
 │
 ├── agents/
 │   ├── director.py          # Director Agent
-│   ├── reviewer.py          # Reviewer Agent
-│   └── prompts.py           # Prompt 模板
+│   └── reviewer.py          # Reviewer Agent
 │
 ├── render/
 │   ├── engine.py            # 渲染主流程

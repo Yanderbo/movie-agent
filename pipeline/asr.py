@@ -22,36 +22,12 @@ from pathlib import Path
 
 import config
 from models.schemas import Shot, TranscriptSegment
+from prompt import ASR_PROMPT
 from utils.llm_client import get_llm_client
 from utils.ffmpeg_utils import extract_audio_segment, get_audio_duration
 from utils.logger import get_logger
 
 logger = get_logger("ASR")
-
-ASR_PROMPT = """你是一个专业的语音识别系统。请仔细听这段音频，将其中所有语音内容转录为文字。
-
-要求：
-1. 输出 JSON 数组格式，每个元素代表一句话/一段话
-2. 每个元素包含以下字段：
-   - start_time: 开始时间（秒，保留1位小数）— 相对于本段音频开头
-   - end_time: 结束时间（秒，保留1位小数）— 相对于本段音频开头
-   - text: 转录的文字内容
-   - speaker: 说话人标识（如果能区分不同说话人，用 "speaker_1", "speaker_2" 等标识；无法区分则为 null）
-   - type: 语音类型（"dialogue" 表示角色对白, "narration" 表示旁白, "voiceover" 表示画外音; 无法区分则默认 "dialogue"）
-3. 按时间顺序排列
-4. 只输出 JSON，不要其他内容
-5. 如果某段时间没有语音，跳过即可
-6. 确保时间戳尽可能准确
-
-输出格式示例：
-```json
-[
-  {"start_time": 0.0, "end_time": 3.5, "text": "大家好，欢迎收看", "speaker": "speaker_1", "type": "dialogue"},
-  {"start_time": 4.2, "end_time": 8.1, "text": "今天我们来聊一个话题", "speaker": "speaker_1", "type": "dialogue"},
-  {"start_time": 10.0, "end_time": 14.5, "text": "在那个遥远的年代...", "speaker": null, "type": "narration"}
-]
-```
-"""
 
 
 def transcribe_audio(

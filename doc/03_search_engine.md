@@ -89,12 +89,14 @@ CLI 包装，加载 memory → 调用 search_memory → 序列化为 dict 返回
 
 1. 将 Layer 1 + Layer 2 的结果合并去重，取 top-20 候选
 2. 为每个候选构造摘要文本（台词 + 画面 + 事件）
-3. 构造 prompt：让 LLM 对每个候选打分 0-1，并给出理由
+3. 使用 `prompt.py` 中的 `SEARCH_RERANK_PROMPT_TEMPLATE`，让 LLM 对每个候选打分 0-1
 4. 解析 LLM 响应的 JSON 数组，更新分数
 5. 按新分数降序排列，取 top-k
 6. 对最终结果填充上下文（`context_before` / `context_after`）和 `memory_unit`
 
 **降级策略**：LLM 不可用时直接返回 Layer 2 的结果。
+
+Embedding 和 Reranker 的 API 输入输出契约见 [09_api_prompt_inventory.md](09_api_prompt_inventory.md)。
 
 ## 辅助函数
 

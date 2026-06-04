@@ -19,51 +19,12 @@ import json
 
 import config
 from models.schemas import Shot, Beat, StoryScene, Chapter
+from prompt import CHAPTER_PROMPT_TEMPLATE
 from utils import group_consecutive
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
 logger = get_logger("ChapterDetect")
-
-CHAPTER_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请将以下"故事场景"（StoryScene）序列聚合为"章节"（Chapter）。
-
-一个 Chapter 是一个完整的叙事大段落，通常对应：
-- 电影中的一个"幕"（Act）
-- 一个重要的情节阶段（如：序幕、铺垫、发展、高潮、结局）
-- 一个独立的叙事主题单元
-
-视频总时长: {duration:.0f}秒
-
-=== StoryScene 列表 ===
-{scenes_info}
-
-请将这些 StoryScene 分组为若干 Chapter。输出 JSON 数组：
-- title: 章节标题（简短有力）
-- story_scene_indices: 包含的 StoryScene 索引列表（必须连续）
-- description: 章节核心内容（一两句话）
-- chapter_type: 叙事类型（prologue / act_1 / act_2 / act_3 / climax_act / epilogue / flashback）
-- theme: 本章主题关键词
-- mood_progression: 情绪走势描述（如"从紧张到释然"）
-
-规则：
-1. 一个 Chapter 通常包含 2-5 个 StoryScene
-2. 叙事主题或情绪发生重大转变时，开启新 Chapter
-3. 所有 StoryScene 都必须被分配到某个 Chapter
-
-只输出 JSON：
-```json
-[
-  {{
-    "title": "命运的邂逅",
-    "story_scene_indices": [0, 1, 2],
-    "description": "男女主角在异国他乡意外相遇并开始合作",
-    "chapter_type": "act_1",
-    "theme": "相遇与信任建立",
-    "mood_progression": "从陌生到好奇"
-  }}
-]
-```
-"""
 
 
 def detect_chapters(

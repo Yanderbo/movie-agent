@@ -469,6 +469,8 @@ video.mp4
 | RecompSignal | ~3 | ~3 |
 | **总计** | **~257** | **~30-33 (↓87%)** |
 
+静态提示词统一维护在根目录 `prompt.py`。每个逻辑 API 调用点的调用粒度、输入载荷和输出契约见 [09_api_prompt_inventory.md](09_api_prompt_inventory.md)。
+
 ---
 
 ## 断点续跑与兼容

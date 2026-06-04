@@ -10,7 +10,7 @@ Reviewer Agent（重构版）
 import json
 
 from models.schemas import EditPlan, ReviewResult, VideoMemory
-from agents.prompts import REVIEWER_SYSTEM_PROMPT, REVIEWER_PROMPT_TEMPLATE
+from prompt import REVIEWER_PROMPT_TEMPLATE, REVIEWER_SYSTEM_PROMPT
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 

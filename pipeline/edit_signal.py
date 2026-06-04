@@ -14,53 +14,11 @@ from models.schemas import (
     Shot, Beat, StoryScene, Event, Character, VisionSummary,
     TranscriptSegment, EditSignal, NarrativeSignal, RecompositionSignal,
 )
+from prompt import NARRATIVE_PROMPT, RECOMP_PROMPT, SIGNAL_PROMPT_TEMPLATE
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
 logger = get_logger("EditSignal")
-
-SIGNAL_PROMPT_TEMPLATE = """你是一个专业的影视剪辑师。请为以下视频片段计算剪辑信号。
-
-=== 片段列表 ===
-{segments_info}
-
-请为每个片段评估以下 8 个信号（0.0 - 1.0 分）：
-
-1. hook_score: 作为视频开头/钩子的适合度（画面冲击力、悬念、吸引力）
-2. plot_importance: 对整体剧情的贡献度（核心剧情=高，过渡/日常=低）
-3. emotional_intensity: 情绪表达强度（强烈情绪=高，平静=低）
-4. visual_impact: 视觉冲击力（特殊构图/运镜/特效=高，普通对话=低）
-5. independence_score: 片段独立性（单独观看也能理解=高，需要上下文=低）
-6. continuity_dependency: 连续性依赖（必须与前后片段连看=高，可独立剪出=低）
-7. boundary_quality: 剪辑边界质量（开头/结尾有自然停顿=高，在句中/动作中=低）
-8. spoiler_level: 剧透程度（包含关键反转/结局=高，日常场景=低）
-
-同时建议每个片段适合的用途（可多选）：
-- hook: 适合作为开头钩子
-- trailer: 适合放入预告片
-- highlight: 适合作为精彩集锦
-- recap: 适合用于剧情回顾
-- climax_clip: 适合作为高潮片段
-- character_intro: 适合用于人物介绍
-
-输出 JSON 数组，只输出 JSON：
-```json
-[
-  {{
-    "unit_index": 0,
-    "hook_score": 0.8,
-    "plot_importance": 0.7,
-    "emotional_intensity": 0.9,
-    "visual_impact": 0.6,
-    "independence_score": 0.5,
-    "continuity_dependency": 0.4,
-    "boundary_quality": 0.7,
-    "spoiler_level": 0.3,
-    "suggested_usage": ["hook", "highlight"]
-  }}
-]
-```
-"""
 
 
 def _ceil_div(total: int, batch_size: int) -> int:
@@ -556,35 +514,6 @@ def _compute_signals_for_units(
 # NarrativeSignal 计算（v3 新增）
 # ═══════════════════════════════════════════════════════════════
 
-NARRATIVE_PROMPT = """你是一个专业的叙事结构分析师。请为以下视频片段评估叙事信号。
-
-=== 片段列表 ===
-{segments_info}
-
-为每个片段评估：
-1. arc_position: 在整体叙事弧中的位置 (0-1，开头=0，结尾=1)
-2. tension_level: 张力水平 (0-1)
-3. information_density: 信息密度 (0-1，新信息量/叙事推进度)
-4. character_focus: 主要聚焦的角色 character_id
-5. narrative_function: exposition/rising_action/climax/falling_action/resolution/transition/comic_relief
-6. theme_relevance: 与主题相关度 (0-1)
-
-输出 JSON 数组，只输出 JSON：
-```json
-[
-  {{
-    "unit_index": 0,
-    "arc_position": 0.2,
-    "tension_level": 0.3,
-    "information_density": 0.7,
-    "character_focus": "char_000",
-    "narrative_function": "exposition",
-    "theme_relevance": 0.6
-  }}
-]
-```
-"""
-
 
 def _compute_narrative_signals(
     client, video_dir, beats, story_scenes, events, meta_duration,
@@ -696,35 +625,6 @@ def _compute_narrative_signals(
 # ═══════════════════════════════════════════════════════════════
 # RecompositionSignal 计算（v3 新增）
 # ═══════════════════════════════════════════════════════════════
-
-RECOMP_PROMPT = """你是一个短视频内容二次创作专家。请为以下视频片段评估二次创作价值。
-
-=== 片段列表 ===
-{segments_info}
-
-为每个片段评估：
-1. meme_potential: 梗/传播潜力 (0-1)
-2. emotional_quotability: 情感引用潜力/"名场面"程度 (0-1)
-3. context_freedom: 脱离上下文仍有意义的程度 (0-1)
-4. remix_flexibility: 可重新组合的灵活度 (0-1)
-5. platform_fit: 平台适配（douyin/bilibili/youtube 分别 0-1）
-6. suggested_formats: 建议格式 (reaction/compilation/fancam/edit)
-
-输出 JSON 数组，只输出 JSON：
-```json
-[
-  {{
-    "unit_index": 0,
-    "meme_potential": 0.3,
-    "emotional_quotability": 0.8,
-    "context_freedom": 0.6,
-    "remix_flexibility": 0.5,
-    "platform_fit": {{"douyin": 0.7, "bilibili": 0.6, "youtube": 0.5}},
-    "suggested_formats": ["compilation", "edit"]
-  }}
-]
-```
-"""
 
 
 def _compute_recomposition_signals(

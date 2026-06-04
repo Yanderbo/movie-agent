@@ -1,6 +1,6 @@
 # Director Agent (director.py)
 
-> 文件：`agents/director.py`
+> 文件：`agents/director.py`、根目录 `prompt.py`
 > 职责：基于 VideoMemory、叙事层级和三类剪辑信号，生成 beat 级 EditPlan。
 
 ## 核心原则
@@ -71,6 +71,8 @@ DirectorCandidate(
 最终只把排序后的有限候选写入 prompt，避免 LLM 在 1000+ shot 中自由发散。
 
 ## Prompt 契约
+
+Director system prompt、方案模板和审核失败重试片段统一维护在根目录 `prompt.py`。
 
 Prompt 包含：
 

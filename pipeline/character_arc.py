@@ -18,59 +18,11 @@ from models.schemas import (
     CharacterDeep, CharacterArc, CharacterRelation,
     Event, Beat, TranscriptSegment,
 )
+from prompt import ARC_PROMPT_TEMPLATE
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
 logger = get_logger("CharacterArc")
-
-ARC_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请分析以下人物的角色弧线和人物间关系。
-
-=== 人物列表 ===
-{characters_info}
-
-=== 关键事件（时间顺序） ===
-{events_info}
-
-=== 人物间共现信息 ===
-{cooccurrence_info}
-
-请分析：
-
-一、角色弧线（每个主要人物一条）
-分析每个人物从开头到结尾的变化轨迹。
-
-二、人物关系（每对有互动的人物一条）
-分析人物间的关系类型和变化。
-
-输出 JSON 对象，只输出 JSON：
-```json
-{{
-  "arcs": [
-    {{
-      "character_id": "char_000",
-      "arc_type": "growth",
-      "arc_description": "从怯懦逐渐变得勇敢",
-      "key_moments": [0, 3, 7],
-      "emotion_trajectory": [
-        {{"time": 10.0, "emotion": "恐惧", "intensity": 0.8}},
-        {{"time": 60.0, "emotion": "决心", "intensity": 0.6}},
-        {{"time": 120.0, "emotion": "勇气", "intensity": 0.9}}
-      ]
-    }}
-  ],
-  "relations": [
-    {{
-      "character_a": "char_000",
-      "character_b": "char_001",
-      "relation_type": "romantic",
-      "description": "男女主角从相识到相爱",
-      "strength": 0.8,
-      "evolution": ["初识时互有好感", "经历考验后关系加深", "最终在一起"]
-    }}
-  ]
-}}
-```
-"""
 
 
 _PLACEHOLDER_TEXTS = {

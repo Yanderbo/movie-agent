@@ -21,127 +21,17 @@ from models.schemas import (
     TranscriptSegment, OCRResult, VisionSummary, AudioProsody,
     MultimodalAlignment,
 )
+from prompt import (
+    CHARACTER_SECTION_TEMPLATE,
+    CHUNK_UNDERSTAND_PROMPT,
+    NO_CHARACTER_SECTION,
+    PROFILE_ONLY_CHARACTER_SECTION_TEMPLATE,
+)
 from utils.llm_client import get_llm_client
 from utils.ffmpeg_utils import extract_video_segment
 from utils.logger import get_logger
 
 logger = get_logger("MinuteChunk")
-
-
-# ═══════════════════════════════════════════════════════════════
-# Prompt 模板
-# ═══════════════════════════════════════════════════════════════
-
-CHUNK_UNDERSTAND_PROMPT = """你是一个专业的影视分析系统。请分析这段视频片段（{start:.1f}s - {end:.1f}s），该片段包含 {n_shots} 个镜头。
-
-== 镜头边界 ==
-{shot_boundaries}
-
-{character_section}
-
-请完成以下分析，以 JSON 格式输出：
-
-== 强制覆盖要求 ==
-1. per_shot 必须输出 {n_shots} 个对象，逐一覆盖“镜头边界”中的每个 local_shot_index，不要只分析前几个镜头。
-2. 每个 per_shot 对象必须同时包含 local_shot_index 和 scene_index；scene_index 必须使用镜头边界中给出的全局 scene_index。
-3. 每个镜头的 vision/audio 都要填写。即使镜头很短或画面较模糊，也要给出最合理的简短描述；确实无法辨认时写“无法判断”，不要留空字符串。
-4. ocr_texts 只有在画面没有文字时才可以为空数组。
-5. characters_present 只填写画面中真实可见、且有足够视觉证据识别的人物/实体；仅被台词、旁白、剧情提到，或只是和参考脸谱相似但看不清脸时，不要填入该角色。无法匹配已知角色时，只有片中明确提供姓名、职位、称谓、关系或稳定剧情身份的人物才使用 unknown_N 并同步写入 character_updates；完全匿名、没有身份描述的人物不要记录到 characters_present。
-
-A. **ASR 语音转录** — 逐句转录音频中的语音
-   - start_time/end_time 必须标注相对于片段起始的时间戳，不要使用全片绝对时间戳
-   - 说话人用角色ID标注（如 char_000）；无法匹配已知角色但片中有明确身份描述时，用 "unknown_1", "unknown_2" 等临时编号，并在 character_updates 补全身份；完全匿名且没有身份描述时统一写 "unknown"
-   - type: dialogue / narration / voiceover
-
-B. **逐镜头画面分析** — 对每个镜头（按上方边界），分析：
-   - description: 画面描述
-   - objects: 检测到的物体
-   - mood: 情绪
-   - scene_type: 场景类型
-   - camera_motion: 镜头运动 (static/pan/tilt/zoom/tracking/handheld)
-   - shot_scale: 景别 (close_up/medium/long 等)
-   - action_description: 动作描述
-   - ocr_texts: 画面文字
-   - characters_present: 画面中可见且可识别的角色ID列表；不确定匹配哪个已知角色、但片中明确提供身份描述时使用 "unknown_1", "unknown_2" 并同步补全 character_updates；没有身份描述的匿名人物不要记录
-
-C. **逐镜头音频特征**
-   - has_music, music_mood, has_sfx, sfx_tags
-   - silence_ratio(0-1), speech_rate(slow/normal/fast)
-   - volume_peak(0-1), speech_emotion
-
-D. **角色动态更新**
-   - 已知角色的新信息：新称呼/别名、形象变化、关键行为
-   - 对无法匹配已知角色、但片中明确出现姓名、职位、称谓、关系或稳定剧情身份的人物，沿用同一个 unknown_N，在 new_names 和 identity_description 中尽量补全；unknown_N 仅作为内部关联编号，不要把它当人物名称
-   - 没有任何身份描述的匿名人物不要写入 character_updates，也不要仅凭外观或短暂出现创建角色档案
-   - 新发现的非人类实体：名称和简述（动物/机器人等）
-
-E. **跨镜头分析**
-   - narrative_continuity: 叙事脉络
-   - emotion_arc: 情绪变化
-   - suggested_beats: 建议的节拍分组（哪些连续镜头属于同一叙事节拍），用镜头索引表示
-
-F. **角色身份合并建议**（仅在你有充分证据时才填写）
-   - 如果你发现两个角色ID实际上是同一个人（同一演员），报告合并建议
-   - 需要脸部特征、声音、剧情连续性、称呼等多项证据一致才能确认
-   - 如果只是"看起来有点像"但不确定，不要报告
-
-输出 JSON（只输出JSON）：
-```json
-{{
-  "transcripts": [
-    {{"start_time": 0.0, "end_time": 3.5, "text": "...", "speaker": "char_000", "type": "dialogue"}}
-  ],
-  "per_shot": [
-    {{
-      "local_shot_index": 0,
-      "scene_index": {first_shot_index},
-      "vision": {{"description": "简要描述该镜头画面", "objects": [], "mood": "无法判断", "scene_type": "无法判断", "camera_motion": "static", "shot_scale": "无法判断", "action_description": "简要描述该镜头动作", "ocr_texts": []}},
-      "audio": {{"has_music": false, "music_mood": "无法判断", "has_sfx": false, "sfx_tags": [], "silence_ratio": 0, "speech_rate": "normal", "volume_peak": 0, "speech_emotion": "neutral"}},
-      "characters_present": []
-    }}
-  ],
-  "character_updates": [
-    {{"character_id": "char_000", "new_names": [], "identity_description": "", "appearance_change": "", "key_action": ""}}
-  ],
-  "character_merge_suggestions": [],
-  "cross_shot": {{
-    "narrative_continuity": "",
-    "emotion_arc": "",
-    "suggested_beats": [[0, 1, 2], [3, 4]]
-  }}
-}}
-```"""
-
-CHARACTER_SECTION_TEMPLATE = """== 已知角色脸谱 ==
-下方附件中，每张参考脸谱前都标注了对应的角色ID、序号和来源时间。
-请根据脸部五官特征（而非服装或发型）匹配角色身份。
-
-== 角色匹配规则 ==
-1. 以脸部特征（五官、脸型）为主要依据，同一人可能换装/换发型。
-2. 如果人物无法确定匹配哪个已知角色，但片中明确提供姓名、职位、称谓、关系或稳定剧情身份，使用 "unknown_1", "unknown_2" 等临时内部编号，并在 character_updates 补全身份信息。
-3. 如果人物既无法匹配、片中也没有任何身份描述，不要记录为角色；说话人可统一标注为 "unknown"。
-4. 如果出现非人类实体（动物/机器人等），在 character_updates 中报告。
-
-== 已知角色档案 ==
-{profiles_text}"""
-
-PROFILE_ONLY_CHARACTER_SECTION_TEMPLATE = """== 角色信息 ==
-当前无参考脸谱图片，仅有文字档案。请结合以下档案信息识别画面中的人物。
-如果无法确定匹配哪个角色，只有片中明确提供姓名、职位、称谓、关系或稳定剧情身份时才使用 "unknown_1", "unknown_2" 等临时内部编号，并在 character_updates 补全身份。
-
-== 角色匹配规则 ==
-1. 以脸部特征（五官、脸型）为主要依据，同一人可能换装/换发型。
-2. 完全匿名、没有身份描述的人物不要记录为角色；说话人可统一标注为 "unknown"。
-3. 不要强行匹配，也不要编造姓名、职位或关系。
-4. 如果出现非人类实体（动物/机器人等），在 character_updates 中报告。
-
-== 已知角色档案 ==
-{profiles_text}"""
-
-NO_CHARACTER_SECTION = """== 角色信息 ==
-尚无已知角色。请优先从台词、字幕、OCR、称呼和剧情关系中识别人物的具体姓名、职位、称谓或稳定剧情身份。
-只有获得这类明确身份描述时，才用 "unknown_1", "unknown_2" 等临时内部编号关联说话人、characters_present 和 character_updates，并在 new_names / identity_description 中尽量补全。
-完全匿名、没有身份描述的人物无需记录为角色；其说话人统一标注为 "unknown"。不要仅凭外观或短暂出现创建人物档案。"""
 
 
 # ═══════════════════════════════════════════════════════════════

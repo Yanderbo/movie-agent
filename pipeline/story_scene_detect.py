@@ -18,6 +18,7 @@ import time
 
 import config
 from models.schemas import Shot, Beat, StoryScene
+from prompt import SCENE_PROMPT_TEMPLATE
 from utils import group_consecutive
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
@@ -26,40 +27,6 @@ logger = get_logger("StorySceneDetect")
 
 # 单次送入 LLM 的最大 beat 数量，超过则分段（防止长视频 prompt 截断）
 SEGMENT_SIZE = 40
-
-SCENE_PROMPT_TEMPLATE = """你是一个专业的影视叙事分析师。请将以下"剧情节拍"（Beat）序列聚合为"故事场景"（StoryScene）。
-
-一个 StoryScene 是由若干连续 Beat 组成的完整叙事场景，通常对应：
-- 同一个地点/环境中发生的一系列事件
-- 一段完整的情节单元（开始 → 发展 → 结束）
-- 一个戏剧冲突的完整过程
-
-=== Beat 列表 ===
-{beats_info}
-
-请将这些 Beat 分组为若干 StoryScene，输出 JSON 数组。每个 StoryScene 包含：
-- beat_indices: 包含的 Beat 索引列表（必须连续）
-- location: 场景地点/环境描述
-- description: 这个场景的核心内容（一两句话）
-- plot_function: 叙事功能（setup / inciting_incident / rising / climax / falling / resolution / epilogue）
-
-规则：
-1. 地点或情境发生大变化时，开启新 StoryScene
-2. 一个 StoryScene 通常包含 2-6 个 Beat
-3. 所有 Beat 都必须被分配到某个 StoryScene
-
-只输出 JSON：
-```json
-[
-  {{
-    "beat_indices": [0, 1, 2],
-    "location": "咖啡厅",
-    "description": "男女主角在咖啡厅重逢并讨论过去的误会",
-    "plot_function": "inciting_incident"
-  }}
-]
-```
-"""
 
 
 def detect_story_scenes(

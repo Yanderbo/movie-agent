@@ -15,7 +15,11 @@ from datetime import datetime
 from typing import Any
 
 import config
-from agents.prompts import DIRECTOR_PROMPT_TEMPLATE, DIRECTOR_SYSTEM_PROMPT
+from prompt import (
+    DIRECTOR_PROMPT_TEMPLATE,
+    DIRECTOR_RETRY_FEEDBACK_TEMPLATE,
+    DIRECTOR_SYSTEM_PROMPT,
+)
 from agents.reviewer import review_plan
 from memory.search import search_memory
 from memory.store import load_memory
@@ -145,11 +149,9 @@ def run_director(
                 f"❌ EditPlan 审核未通过: {review_result.feedback}\n"
                 f"   问题: {review_result.issues}"
             )
-            director_prompt += (
-                "\n\n=== 上次方案的审核反馈 ===\n"
-                f"未通过原因: {review_result.feedback}\n"
-                f"具体问题: {'; '.join(review_result.issues)}\n"
-                "请只从候选 candidate_id 中重新选择，并修正上述问题。"
+            director_prompt += DIRECTOR_RETRY_FEEDBACK_TEMPLATE.format(
+                feedback=review_result.feedback,
+                issues="; ".join(review_result.issues),
             )
         except Exception as e:
             logger.error(f"EditPlan 生成失败: {e}")

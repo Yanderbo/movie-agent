@@ -16,6 +16,7 @@ from models.schemas import (
     TranscriptSegment, VisionSummary, Character, Event, EventEdge, EventGraph,
     Shot, Beat, StoryScene,
 )
+from prompt import EDGE_PROMPT_TEMPLATE, EVENT_PROMPT_TEMPLATE
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
@@ -26,92 +27,6 @@ EVENT_VISION_SAMPLE_LIMIT = 90
 EVENT_BEAT_SAMPLE_LIMIT = 80
 EVENT_STORY_SCENE_SAMPLE_LIMIT = 50
 EVENT_EDGE_SAMPLE_LIMIT = 60
-
-EVENT_PROMPT_TEMPLATE = """你是一个专业的视频内容分析师。基于以下视频内容信息，提取关键事件。
-
-视频总时长: {duration:.1f} 秒
-当前分析段: {segment_start:.1f}s - {segment_end:.1f}s
-
-=== 叙事层级摘要（优先参考） ===
-{hierarchy_text}
-
-=== 台词（按时间均匀采样） ===
-{transcripts_text}
-
-=== 画面摘要（按时间均匀采样） ===
-{vision_text}
-
-=== 已识别人物 ===
-{characters_text}
-
-请提取视频中的关键事件，每个事件代表一个有意义的叙事单元。
-
-要求：
-1. 事件按时间顺序排列
-2. 每个事件覆盖一段连续时间，start_time/end_time 必须使用全片绝对时间，并落在当前分析段内
-3. 事件类型包括：开场、对话、冲突、转折、高潮、结局、日常、回忆、独白、追逐、浪漫、搞笑、悲伤、悬疑
-4. importance 用 1-10 评分，高潮和转折事件分数更高
-5. 标注涉及的人物 ID
-6. 描述每个事件的核心内容
-7. evidence: 列出支撑该事件判断的证据来源（如 "transcript:台词内容", "vision:画面描述", "audio:音效/音乐"）
-8. confidence: 该事件抽取的置信度 0-1
-
-输出 JSON 数组，只输出 JSON：
-```json
-[
-  {{
-    "event_index": 0,
-    "start_time": 0.0,
-    "end_time": 30.0,
-    "event_type": "开场",
-    "description": "事件描述",
-    "characters": ["char_000", "char_001"],
-    "emotion": "平静",
-    "importance": 5,
-    "evidence": ["transcript:角色A说了xxx", "vision:画面中出现了xxx"],
-    "confidence": 0.85
-  }}
-]
-```
-"""
-
-EDGE_PROMPT_TEMPLATE = """你是一个专业的叙事分析师。请分析以下事件之间的关系。
-
-=== 事件列表 ===
-{events_text}
-
-请分析事件之间的因果关系、铺垫关系、反转关系、冲突升级、结果关系和平行关系。
-
-关系类型说明：
-- cause: A 导致了 B（因果）
-- foreshadow: A 为 B 埋下了伏笔（铺垫）
-- reversal: B 是 A 的反转/意外
-- escalation: B 是 A 的冲突升级
-- resolution: B 是 A 的解决/结果
-- parallel: A 和 B 是平行/对照的情节线
-
-同时为每条关系提供：
-- evidence: 支撑该关系的证据（引用具体的台词或画面）
-- confidence: 关系推断的置信度 0-1
-- relation_basis: 关系推断的依据说明
-
-输出 JSON 数组，每个元素描述一条关系边。只关注重要的关系，不要过度连接。
-只输出 JSON：
-```json
-[
-  {{
-    "source_event": 0,
-    "target_event": 2,
-    "relation_type": "cause",
-    "description": "因为A发生了，所以导致了C",
-    "strength": 0.8,
-    "evidence": ["事件0中角色说了xxx", "事件2中画面出现了xxx"],
-    "confidence": 0.75,
-    "relation_basis": "角色A在事件0中的决定直接导致了事件2的冲突"
-  }}
-]
-```
-"""
 
 
 def extract_events(

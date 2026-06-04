@@ -1,6 +1,6 @@
 # Reviewer Agent (reviewer.py)
 
-> 文件：`agents/reviewer.py`
+> 文件：`agents/reviewer.py`、根目录 `prompt.py`
 > 职责：审核 EditPlan 质量，结合规则校验、Grounding 校验和 LLM 审核
 
 ## 总体流程

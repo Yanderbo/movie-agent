@@ -16,6 +16,7 @@ import numpy as np
 
 import config
 from models.schemas import Shot, Character, CharacterDeep
+from prompt import CHARACTER_DESCRIPTION_PROMPT, CHARACTER_FACE_DETECT_PROMPT
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
@@ -207,21 +208,12 @@ def _detect_faces_with_gemini(scenes: list[Shot]) -> list[dict]:
 
     sample_scenes = valid_scenes[::max(1, len(valid_scenes) // 20)]  # 最多取20帧
 
-    prompt = """请分析这张图片中出现的人物。
-对每个人物，描述其外观特征（性别、大致年龄、发型、服装等）。
-
-输出 JSON 数组，每个元素代表一个人物：
-```json
-[
-  {"person_id": 1, "description": "外观描述", "position": "画面位置（左/中/右）"}
-]
-```
-如果画面中没有人物，返回空数组 []。"""
-
     for scene, kf_path in sample_scenes:
         try:
             response = client.chat_with_media(
-                prompt=prompt, media_path=kf_path, temperature=0.2
+                prompt=CHARACTER_FACE_DETECT_PROMPT,
+                media_path=kf_path,
+                temperature=0.2,
             )
             parsed = client.parse_json(response)
             if parsed and isinstance(parsed, list):
@@ -372,18 +364,11 @@ def _describe_character(client, thumbnail_path: str) -> str:
     if not thumbnail_path or not Path(thumbnail_path).exists():
         return ""
 
-    prompt = """请简要描述这个人物的外观特征：
-- 性别
-- 大致年龄
-- 发型和发色
-- 服装
-- 显著特征
-
-用一段话简洁描述，不超过50字。"""
-
     try:
         response = client.chat_with_media(
-            prompt=prompt, media_path=thumbnail_path, temperature=0.3
+            prompt=CHARACTER_DESCRIPTION_PROMPT,
+            media_path=thumbnail_path,
+            temperature=0.3,
         )
         return response.strip()[:200]
     except Exception as e:

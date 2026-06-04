@@ -10,11 +10,12 @@
 | [01_pipeline_understand.md](01_pipeline_understand.md) | `understand.py` + v4.1 understand 子模块 | 理解流水线 10 步详解、MinuteChunk、叙事层级、数据流、断点续跑 |
 | [02_models_schemas.md](02_models_schemas.md) | `schemas.py` | 所有 Pydantic 数据模型定义（含 v4.1 新增：VideoMeta 压缩字段、CharacterGallery、CharacterProfile、MinuteChunk） |
 | [03_search_engine.md](03_search_engine.md) | `search.py` | 三层漏斗检索详解（Embedding + 关键词 + LLM Reranker） |
-| [04_director_agent.md](04_director_agent.md) | `director.py` + `prompts.py` | Director Agent beat 级候选规划、证据填充、Prompt 设计 |
+| [04_director_agent.md](04_director_agent.md) | `director.py` + `prompt.py` | Director Agent beat 级候选规划、证据填充、Prompt 设计 |
 | [05_reviewer_agent.md](05_reviewer_agent.md) | `reviewer.py` | Reviewer Agent 三层校验（规则 + Grounding + LLM）、评分逻辑 |
 | [06_render_engine.md](06_render_engine.md) | `engine.py` + `validator.py` + `ffmpeg_ops.py` | 渲染 5 步流水线、FFmpeg 操作封装 |
 | [07_utils.md](07_utils.md) | `llm_client.py` + `ffmpeg_utils.py` + `logger.py` | LLM 客户端、FFmpeg 工具、日志系统 |
 | [08_store_cli_config.md](08_store_cli_config.md) | `store.py` + `main.py` + `config.py` | 存储层、命令行接口、v4.1 配置、目录结构 |
+| [09_api_prompt_inventory.md](09_api_prompt_inventory.md) | `prompt.py` + 所有 API 调用方 | HTTP 端点、每个逻辑调用点的输入输出、Prompt 管理约定 |
 
 ---
 

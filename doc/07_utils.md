@@ -39,6 +39,7 @@ groups = group_consecutive(uncovered_shots, lambda s: s.scene_index)
 | `chat(prompt, system_prompt, temperature)` | 纯文本对话 | 事件抽取、角色判定、Reranker |
 | `chat_with_media(prompt, media_path, temperature)` | 单个音频/视频文件 + 文本 | ASR（音频）、人物描述（图片） |
 | `chat_with_images(prompt, image_paths, temperature)` | 多张图片 + 文本 | 批量画面分析 |
+| `chat_with_labeled_media(content_parts, ...)` | 文字与多媒体交错输入 | MinuteChunk 视频片段 + 带角色标签的脸谱 |
 | `parse_json(response)` | 从 LLM 响应中提取 JSON | 所有需要结构化输出的场景 |
 
 ### 关键实现
@@ -63,11 +64,12 @@ def get_llm_client() -> LLMClient
 
 ### Embedding API
 
-```python
-def get_embedding(text, model=None) -> list[float]
-```
+当前没有 `utils.llm_client.get_embedding()` 公共函数。Embedding 请求由两个调用点直接发送到同一 API 的 `/embeddings` 端点：
 
-调用同一 API 的 `/embeddings` 端点，生成文本向量。用于 `indexer.py` 和 `search.py`。
+- `pipeline/indexer.py::_generate_embeddings()`：每批最多 20 条文本，生成索引向量。
+- `memory/search.py::_get_query_embedding()`：每次搜索生成一个查询向量。
+
+静态提示词统一维护在根目录 `prompt.py`；完整 API 调用输入输出清单见 [09_api_prompt_inventory.md](09_api_prompt_inventory.md)。
 
 ---
 

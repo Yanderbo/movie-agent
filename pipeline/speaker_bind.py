@@ -16,33 +16,11 @@ from pathlib import Path
 
 import config
 from models.schemas import TranscriptSegment, Character, Scene
+from prompt import BIND_PROMPT_TEMPLATE
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
 logger = get_logger("SpeakerBind")
-
-BIND_PROMPT_TEMPLATE = """你是一个专业的视频分析师。请根据以下信息，判断音频中的说话人与画面中的人物的对应关系。
-
-=== 说话人信息 ===
-{speakers_info}
-
-=== 人物信息 ===
-{characters_info}
-
-=== 共现统计 ===
-{cooccurrence_info}
-
-请为每个说话人指定最可能对应的人物。如果无法确定，设为 null。
-
-输出 JSON 对象，key 为说话人 ID，value 为人物 ID 或 null：
-```json
-{{
-  "speaker_1": "char_000",
-  "speaker_2": "char_001",
-  "speaker_3": null
-}}
-```
-"""
 
 
 def bind_speakers_to_characters(

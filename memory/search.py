@@ -16,6 +16,7 @@ from pathlib import Path
 
 import config
 from models.schemas import VideoMemory, SearchResult, MemoryUnit, Scene
+from prompt import SEARCH_RERANK_PROMPT_TEMPLATE
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
@@ -385,21 +386,10 @@ def _llm_rerank(
 
     summaries_text = "\n".join(candidate_summaries)
 
-    prompt = f"""请评估以下视频片段与查询的相关性，并重新排序。
-
-查询: "{query}"
-
-候选片段:
-{summaries_text}
-
-请返回 JSON 数组，按相关性从高到低排序。每个元素包含:
-- index: 候选片段的编号（方括号中的数字）
-- relevance_score: 相关性分数 (0.0 - 1.0)
-
-只返回 relevance_score > 0.2 的片段。只输出 JSON：
-```json
-[{{"index": 0, "relevance_score": 0.9}}]
-```"""
+    prompt = SEARCH_RERANK_PROMPT_TEMPLATE.format(
+        query=query,
+        summaries_text=summaries_text,
+    )
 
     try:
         response = client.chat(prompt=prompt, temperature=0.2)

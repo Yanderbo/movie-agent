@@ -16,94 +16,11 @@ from pathlib import Path
 
 import config
 from models.schemas import Shot, OCRResult, VisionSummary
+from prompt import BATCH_VISION_PROMPT, VISION_PROMPT_MULTI, VISION_PROMPT_SINGLE
 from utils.llm_client import get_llm_client
 from utils.logger import get_logger
 
 logger = get_logger("Vision")
-
-# ── 单帧 prompt（兼容旧模式）──
-VISION_PROMPT_SINGLE = """你是一个专业的视频画面分析系统。请仔细观察这张视频截图，完成以下两项任务：
-
-任务一：OCR 文字识别
-识别画面中出现的所有文字内容（包括字幕、标题、标牌、屏幕文字等）。
-
-任务二：画面摘要
-对画面进行详细分析。
-
-请以 JSON 格式输出，只输出 JSON，不要其他内容：
-```json
-{
-  "ocr_texts": ["画面中的文字1", "画面中的文字2"],
-  "description": "详细的画面描述，包含场景、人物动作、构图、光线等",
-  "objects": ["检测到的物体1", "物体2"],
-  "mood": "画面传达的情绪（如：紧张、温馨、悲伤、欢快、平静、激昂等）",
-  "scene_type": "场景类型（如：对话、动作、空镜、过渡、特写、全景、追逐等）",
-  "props": ["关键道具1", "道具2"]
-}
-```
-"""
-
-# ── 多帧 prompt（v2 核心）──
-VISION_PROMPT_MULTI = """你是一个专业的视频画面分析系统。以下是同一个镜头（shot）内按时间顺序排列的多帧截图。
-请综合分析这些帧，理解镜头内发生了什么。
-
-请完成以下分析：
-1. OCR：识别所有帧中出现的文字
-2. 综合画面描述：描述这个镜头内的场景和核心内容
-3. 动作/变化描述：通过对比各帧，描述镜头内发生的动作、运动和变化
-4. 表情变化：如有人物，描述其表情在帧间的变化
-5. 物体 & 关键道具
-6. 情绪 & 场景类型
-7. 镜头运动：分析镜头的运动方式（static/pan_left/pan_right/tilt_up/tilt_down/zoom_in/zoom_out/tracking/crane/handheld）
-8. 人物互动：如有多人，描述人物间的互动方式（对话、肢体接触、对峙、合作等）
-9. 景别：判断镜头的景别（extreme_close_up/close_up/medium_close/medium/medium_long/long/extreme_long）
-
-请以 JSON 格式输出，只输出 JSON：
-```json
-{
-  "ocr_texts": ["文字1", "文字2"],
-  "description": "综合画面描述",
-  "action_description": "动作/变化描述（从第1帧到最后1帧发生了什么）",
-  "frame_descriptions": ["第1帧描述", "第2帧描述", "..."],
-  "expression_changes": "人物表情变化描述（无人物则为空）",
-  "objects": ["物体1", "物体2"],
-  "props": ["关键道具1"],
-  "mood": "整体情绪",
-  "scene_type": "场景类型",
-  "camera_motion": "镜头运动方式",
-  "interaction_description": "人物互动描述（无互动则为空）",
-  "shot_scale": "景别"
-}
-```
-"""
-
-# ── 批量多 shot 的 prompt ──
-BATCH_VISION_PROMPT = """你是一个专业的视频画面分析系统。以下是同一个视频中多个镜头的关键帧截图。
-请为每张图片分别进行分析。
-
-对每张图片，请分析：
-1. OCR：画面中出现的文字
-2. 画面描述：详细描述场景内容
-3. 检测到的物体
-4. 画面情绪
-5. 场景类型
-6. 关键道具
-
-请以 JSON 数组格式输出，数组中每个元素对应一张图片（按顺序），只输出 JSON：
-```json
-[
-  {
-    "ocr_texts": ["文字1"],
-    "description": "画面描述",
-    "objects": ["物体1"],
-    "mood": "情绪",
-    "scene_type": "场景类型",
-    "props": ["道具1"]
-  },
-  ...
-]
-```
-"""
 
 
 def analyze_keyframes(
